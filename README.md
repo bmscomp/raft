@@ -58,12 +58,19 @@ Pre-Vote:  Follower → PreCandidate(same term) → if majority → Candidate
 
 ## Advanced Features
 
-| Feature | Messages | Status |
-|---------|----------|--------|
-| **Log Compaction** | `InstallSnapshotRequest/Response` | ✓ Messages defined |
-| **Leadership Transfer** | `TransferLeadershipRequest` | ✓ Messages defined |
-| **Linearizable Reads** | `ReadIndexRequest/Response` | ✓ Messages defined |
-| **Membership Changes** | `AddServerRequest/Response`, `RemoveServerRequest/Response` | ✓ Messages defined |
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **Learner Nodes** | Non-voting members for log replication and catch-up | ✅ Implemented |
+| **Witness Nodes** | Voting tie-breakers with minimal storage | ✅ Implemented |
+| **Parallel Append** | Concurrent replication to multiple followers | ✅ Implemented |
+| **Batching** | Batch multiple commands into single log append | ✅ Implemented |
+| **Pipelining** | Send AppendEntries without waiting for response | ✅ Implemented |
+| **Linearizable Reads (ReadIndex)** | Strong consistency reads via commit index | ✅ Implemented |
+| **Leadership Transfer** | Graceful leader handoff to target node | ✅ Implemented |
+| **Lease-based Reads** | Fast local reads with bounded staleness | ✅ Implemented |
+| **Joint Consensus** | Safe membership changes with dual-quorum | ✅ Implemented |
+| **Log Compaction** | `InstallSnapshotRequest/Response` | Messages defined |
+| **Membership Changes** | `AddServerRequest/Response`, `RemoveServerRequest/Response` | Messages defined |
 
 ---
 
@@ -82,8 +89,24 @@ Pure effects produced by state transitions:
 | `TakeSnapshot` | Trigger log compaction |
 | `BecomeLeader` | Initialize leader state |
 | `TransferLeadership` | Graceful handoff |
+| `TimeoutNow` | Immediate election trigger |
 | `ResetElectionTimer` | Randomized timeout |
 | `ResetHeartbeatTimer` | Heartbeat scheduling |
+| **Parallel Replication** | |
+| `ParallelReplicate` | Replicate to multiple followers concurrently |
+| **Batching** | |
+| `BatchAppend` | Batch multiple entries with batch ID |
+| `BatchComplete` | Notify batch completion |
+| **Pipelining** | |
+| `PipelinedSend` | Send with sequence number |
+| `TrackInflight` | Track in-flight requests |
+| **Linearizable Reads** | |
+| `ReadIndexReady` | Return commit index for read |
+| `ReadIndexRejected` | Reject with leader hint |
+| `ConfirmLeadership` | Confirm with heartbeat quorum |
+| **Lease-based Reads** | |
+| `ExtendLease` | Extend leader lease |
+| `LeaseReadReady` | Immediate lease read |
 
 ---
 
@@ -162,7 +185,7 @@ val transition = RaftLogic.onMessage(state, msg, config, lastLogIndex, lastLogTe
 
 ```bash
 sbt compile                         # Build
-sbt test                            # All 153 tests
+sbt test                            # All 274 tests
 sbt "testOnly *LogicSpec"           # Unit tests
 sbt "testOnly *IntegrationSpec"     # Cluster tests
 ```
