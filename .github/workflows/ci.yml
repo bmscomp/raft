@@ -24,7 +24,9 @@ jobs:
         with:
           java-version: ${{ matrix.java }}
           distribution: 'temurin'
-          cache: 'sbt'
+      
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
       
       - name: Compile
         run: sbt compile
@@ -49,7 +51,9 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
-          cache: 'sbt'
+      
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
       
       - name: Run tests with coverage
         run: sbt clean coverage test coverageReport
