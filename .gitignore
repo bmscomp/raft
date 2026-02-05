@@ -1,0 +1,26 @@
+# Scala/SBT
+target/
+project/target/
+project/project/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.metals/
+.bloop/
+.bsp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test outputs
+test-output/
+
+# Local config
+.env
+.env.local
