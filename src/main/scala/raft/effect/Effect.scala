@@ -74,4 +74,28 @@ enum Effect:
   
   /** Track in-flight pipelined requests for a follower. */
   case TrackInflight(followerId: NodeId, sequenceNum: Long, lastIndex: Long)
+  
+  // === LINEARIZABLE READS ===
+  
+  /** ReadIndex request accepted - client can read after commitIndex reaches readIndex. */
+  case ReadIndexReady(requestId: String, readIndex: Long)
+  
+  /** ReadIndex request rejected - not leader or quorum not confirmed. */
+  case ReadIndexRejected(requestId: String, leaderHint: Option[NodeId])
+  
+  /** Confirm leadership with heartbeat round for ReadIndex. */
+  case ConfirmLeadership(requestId: String, pendingReadIndex: Long)
+  
+  // === LEADERSHIP TRANSFER ===
+  
+  /** Request target node to start election immediately. */
+  case TimeoutNow(target: NodeId)
+  
+  // === LEASE-BASED READS ===
+  
+  /** Extend leader lease after successful heartbeat quorum. */
+  case ExtendLease(until: Long)
+  
+  /** Lease read accepted - client can read immediately. */
+  case LeaseReadReady(requestId: String)
 
