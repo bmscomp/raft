@@ -53,3 +53,25 @@ enum Effect:
   
   /** Commit all log entries up to the given index by applying them to the state machine. */
   case CommitEntries(upToIndex: Long)
+  
+  // === PARALLEL APPEND ===
+  
+  /** Replicate entries to multiple followers in parallel. Runtime executes concurrently. */
+  case ParallelReplicate(targets: Set[NodeId], message: RaftMessage)
+  
+  // === BATCHING ===
+  
+  /** Batch multiple client commands into a single log append for efficiency. */
+  case BatchAppend(entries: Seq[Log], batchId: String)
+  
+  /** Notify batch completion with commit status. */
+  case BatchComplete(batchId: String, commitIndex: Long)
+  
+  // === PIPELINING ===
+  
+  /** Send next AppendEntries without waiting for previous response. */
+  case PipelinedSend(to: NodeId, message: RaftMessage, sequenceNum: Long)
+  
+  /** Track in-flight pipelined requests for a follower. */
+  case TrackInflight(followerId: NodeId, sequenceNum: Long, lastIndex: Long)
+
