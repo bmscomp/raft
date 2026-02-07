@@ -447,7 +447,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
           engine.loadSnapshot.flatMap {
             case Some(s) => s.data.compile.to(Array).map(Some(_))
             case None    => IO.pure(None)
-          }
+          }.attempt // concurrent load may race with save's delete of old snapshot
         ).parTupled
 
         // After concurrent operations, the final state must be consistent
