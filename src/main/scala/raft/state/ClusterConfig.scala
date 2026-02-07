@@ -48,6 +48,11 @@ case class ClusterConfig(
     members: Map[NodeId, NodeRole] = Map.empty,
     jointConfig: Option[Map[NodeId, NodeRole]] = None
 ):
+  require(
+    members.values.exists(r => r == NodeRole.Voter || r == NodeRole.Witness),
+    "Cluster configuration must have at least one voter"
+  )
+
   /** All voting-eligible members (Voter + Witness roles).
     *
     * @return
@@ -116,22 +121,29 @@ case class ClusterConfig(
         copy(members = members.updated(nodeId, NodeRole.Voter))
       case _ => this
 
-  /** Begin a joint consensus transition by merging the new configuration with
-    * the current one.
+  /** Begin a joint consensus transition by switching to the new configuration
+    * while preserving the old one in `jointConfig`.
     *
     * During joint consensus, quorum decisions require majorities in ''both''
     * the old (preserved in `jointConfig`) and the new (active in `members`)
     * configurations.
     *
     * @param newConfig
-    *   the new member-role mappings to merge in
+    *   the new member-role mappings to switch to
     * @return
     *   an updated configuration in joint consensus mode
+    * @throws IllegalArgumentException
+    *   if newConfig is empty or contains no voters
     * @see
     *   [[completeJointConsensus]] to finalize the transition
     */
   def beginJointConsensus(newConfig: Map[NodeId, NodeRole]): ClusterConfig =
-    copy(members = members ++ newConfig, jointConfig = Some(members))
+    require(newConfig.nonEmpty, "New configuration cannot be empty")
+    require(
+      newConfig.values.exists(_ != NodeRole.Learner),
+      "New configuration must have at least one voter"
+    )
+    copy(members = newConfig, jointConfig = Some(members))
 
   /** Complete the joint consensus transition, dropping the old configuration.
     *
@@ -144,6 +156,32 @@ case class ClusterConfig(
     */
   def completeJointConsensus: ClusterConfig =
     copy(jointConfig = None)
+
+  /** Abort a joint consensus transition, reverting to the old configuration.
+    *
+    * This is useful if the transition fails or times out before being
+    * committed.
+    *
+    * @return
+    *   the original configuration before the transition started
+    */
+  def abortJointConsensus: ClusterConfig =
+    jointConfig match
+      case Some(oldConfig) => copy(members = oldConfig, jointConfig = None)
+      case None            => this
+
+  /** Check if a node is a voting member (Voter or Witness). */
+  def isVoter(nodeId: NodeId): Boolean =
+    members
+      .get(nodeId)
+      .exists(r => r == NodeRole.Voter || r == NodeRole.Witness)
+
+  /** Check if a node is a Learner. */
+  def isLearner(nodeId: NodeId): Boolean =
+    members.get(nodeId).contains(NodeRole.Learner)
+
+  /** Check if a node is part of the cluster in any role. */
+  def contains(nodeId: NodeId): Boolean = members.contains(nodeId)
 
   /** The number of votes required for a majority among current voters.
     *
