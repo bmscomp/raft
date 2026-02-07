@@ -1,4 +1,4 @@
-# Chapter 16: End-to-End Integration with RaftNode
+# Chapter 17: End-to-End Integration with RaftNode
 
 *The previous chapters built your understanding from pure functions to complete applications. This chapter shows how to wire everything together using `RaftNode[F, M]` — the library's ready-made runtime that combines the pure protocol logic with real SPI implementations into a running Raft cluster.*
 
@@ -224,4 +224,4 @@ For WAN deployments, consider:
 
 ---
 
-*Next: [Chapter 17 — Property-Based Testing](17-property-based-testing.md) shows how to express Raft's safety invariants as ScalaCheck properties and verify them with random message schedules.*
+*Next: [Chapter 18 — Property-Based Testing](18-property-based-testing.md) shows how to express Raft's safety invariants as ScalaCheck properties and verify them with random message schedules.*

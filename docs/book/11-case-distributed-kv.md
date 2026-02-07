@@ -1,4 +1,4 @@
-# Chapter 10: Case Study — Distributed Key-Value Store
+# Chapter 11: Case Study — Distributed Key-Value Store
 
 *The most common application of consensus is a replicated data store that survives server failures and serves consistent reads. This case study builds a complete distributed key-value store from scratch, step by step — from defining the command protocol through linearizable reads and snapshot-based recovery. By the end, you'll have a pattern you can apply to any stateful distributed system.*
 
@@ -295,4 +295,4 @@ The example creates a complete in-memory cluster, sends multiple PUT/GET/DELETE 
 
 ---
 
-*Next: [Chapter 11 — Case Study: Distributed Lock Service](11-case-distributed-lock.md) builds a mutual exclusion service with TTL-based leases — a different kind of state machine that manages ephemeral state.*
+*Next: [Chapter 12 — Case Study: Distributed Lock Service](12-case-distributed-lock.md) builds a mutual exclusion service with TTL-based leases — a different kind of state machine that manages ephemeral state.*

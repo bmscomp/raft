@@ -57,6 +57,7 @@ Whether you're learning about distributed consensus for the first time or design
 |---|---------|-------------------|
 | 8 | [Getting Started](08-getting-started.md) | Setup, first election in 15 lines, the effect interpreter loop, testing without infrastructure |
 | 9 | [Log Replication in Practice](09-log-replication-practice.md) | Entry lifecycle, conflict resolution search-back, commit index advancement, batching, pipelining, parallel replication |
+| 10 | [Performance vs. Safety](10-performance-vs-safety.md) | Batching, pipelining, parallel replication, ReadIndex, lease reads, Pre-Vote — safety analysis, configuration profiles, and tradeoff map |
 
 ### Part IV — Case Studies
 
@@ -64,10 +65,10 @@ Whether you're learning about distributed consensus for the first time or design
 
 | # | Chapter | What You'll Build |
 |---|---------|-------------------|
-| 10 | [Distributed Key-Value Store](10-case-distributed-kv.md) | Replicated data store with linearizable reads (three strategies compared), snapshot recovery |
-| 11 | [Distributed Lock Service](11-case-distributed-lock.md) | Mutual exclusion with TTL leases, reentrant acquisition, automatic expiration, split-brain prevention |
-| 12 | [Replicated Counter](12-case-distributed-counter.md) | Full 3-node cluster simulation with in-memory networking, end-to-end election → replication → commit |
-| 13 | [Distributed Transactions](13-case-distributed-transactions.md) | Multi-key atomic operations with optimistic concurrency control, CAS-based conflict detection, serializable isolation |
+| 11 | [Distributed Key-Value Store](11-case-distributed-kv.md) | Replicated data store with linearizable reads (three strategies compared), snapshot recovery |
+| 12 | [Distributed Lock Service](12-case-distributed-lock.md) | Mutual exclusion with TTL leases, reentrant acquisition, automatic expiration, split-brain prevention |
+| 13 | [Replicated Counter](13-case-distributed-counter.md) | Full 3-node cluster simulation with in-memory networking, end-to-end election → replication → commit |
+| 14 | [Distributed Transactions](14-case-distributed-transactions.md) | Multi-key atomic operations with optimistic concurrency control, CAS-based conflict detection, serializable isolation |
 
 ### Part V — The Ecosystem
 
@@ -75,7 +76,7 @@ Whether you're learning about distributed consensus for the first time or design
 
 | # | Chapter | What You'll Learn |
 |---|---------|-------------------|
-| 14 | [State of the Art](14-state-of-the-art.md) | Survey of 7 major Raft libraries (etcd/raft, HashiCorp Raft, tikv/raft-rs, OpenRaft, SOFAJRaft, MicroRaft), feature matrix, architectural spectrum, decision guide |
+| 15 | [State of the Art](15-state-of-the-art.md) | Survey of 7 major Raft libraries (etcd/raft, HashiCorp Raft, tikv/raft-rs, OpenRaft, SOFAJRaft, MicroRaft), feature matrix, architectural spectrum, decision guide |
 
 ### Part VI — Operations & Testing
 
@@ -83,10 +84,10 @@ Whether you're learning about distributed consensus for the first time or design
 
 | # | Chapter | What You'll Learn |
 |---|---------|-------------------|
-| 15 | [Troubleshooting & Operational Pitfalls](15-troubleshooting.md) | Frequent leader changes, stalled writes, split-brain diagnosis, term inflation, slow followers, diagnostic checklist |
-| 16 | [End-to-End Integration](16-end-to-end-integration.md) | Wiring `RaftNode` with production SPIs, event loop architecture, SPI implementation guidance, deployment topology |
-| 17 | [Property-Based Testing](17-property-based-testing.md) | Five Raft safety invariants as ScalaCheck properties, random event generation, shrinking, deterministic reproduction |
-| 18 | [Jepsen-Style Verification](18-jepsen-verification.md) | Jepsen methodology, fault injection, linearizability checking, real-world results, designing for Jepsen |
+| 16 | [Troubleshooting & Operational Pitfalls](16-troubleshooting.md) | Frequent leader changes, stalled writes, split-brain diagnosis, term inflation, slow followers, diagnostic checklist |
+| 17 | [End-to-End Integration](17-end-to-end-integration.md) | Wiring `RaftNode` with production SPIs, event loop architecture, SPI implementation guidance, deployment topology |
+| 18 | [Property-Based Testing](18-property-based-testing.md) | Five Raft safety invariants as ScalaCheck properties, random event generation, shrinking, deterministic reproduction |
+| 19 | [Jepsen-Style Verification](19-jepsen-verification.md) | Jepsen methodology, fault injection, linearizability checking, real-world results, designing for Jepsen |
 
 ### Part VII — Scaling
 
@@ -94,7 +95,7 @@ Whether you're learning about distributed consensus for the first time or design
 
 | # | Chapter | What You'll Learn |
 |---|---------|-------------------|
-| 19 | [Multi-Raft Group Design](19-multi-raft-groups.md) | Partitioning strategies, cross-group transactions, leader balancing, transport multiplexing, resource sharing |
+| 20 | [Multi-Raft Group Design](20-multi-raft-groups.md) | Partitioning strategies, cross-group transactions, leader balancing, transport multiplexing, resource sharing |
 
 ### Appendices
 

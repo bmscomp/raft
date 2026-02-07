@@ -1,4 +1,4 @@
-# Chapter 14: State of the Art — Raft Libraries Compared
+# Chapter 15: State of the Art — Raft Libraries Compared
 
 *The Raft ecosystem is rich with implementations across Go, Rust, Java, and now Scala. This chapter surveys the major libraries, compares their architectures and feature sets, and helps you choose the right one for your use case. The differences are not just about language — they reflect fundamentally different design philosophies about where the boundary should sit between the library's responsibility and yours.*
 
@@ -337,5 +337,5 @@ The Raft ecosystem offers strong options for every language and architectural pr
 
 ---
 
-*This concludes Part V. Continue to [Chapter 15 — Troubleshooting & Operational Pitfalls](15-troubleshooting.md) for production diagnostics and common failure mode solutions, or jump to [Appendix A — Quick Reference](appendix-a-quick-reference.md) for a one-page lookup of all library types and APIs.*
+*This concludes Part V. Continue to [Chapter 16 — Troubleshooting & Operational Pitfalls](16-troubleshooting.md) for production diagnostics and common failure mode solutions, or jump to [Appendix A — Quick Reference](appendix-a-quick-reference.md) for a one-page lookup of all library types and APIs.*
 
