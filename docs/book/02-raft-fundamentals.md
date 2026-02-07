@@ -93,6 +93,31 @@ The election process has four steps:
 3. It **votes for itself** (and persists this vote to stable storage).
 4. It **sends `RequestVote` RPCs** to all other nodes in the cluster.
 
+The following diagram shows the complete election sequence for a 3-node cluster:
+
+```mermaid
+sequenceDiagram
+    participant N1 as Node-1 (Follower)
+    participant N2 as Node-2 (Follower)
+    participant N3 as Node-3 (Follower)
+
+    Note over N1: Election timeout fires
+    N1->>N1: Increment term to 1, vote for self
+    N1-->>N2: RequestVote(term=1, candidateId=N1)
+    N1-->>N3: RequestVote(term=1, candidateId=N1)
+
+    N2->>N1: VoteGranted(term=1)
+    Note over N1: 2/3 votes = majority
+    N1->>N1: Become Leader
+
+    N3->>N1: VoteGranted(term=1)
+    Note over N3: Vote arrives after win — harmless
+
+    N1-->>N2: AppendEntries(heartbeat)
+    N1-->>N3: AppendEntries(heartbeat)
+    Note over N1,N3: Leader authority established
+```
+
 ```scala
 import raft.state.*
 import raft.state.NodeState.*
@@ -234,6 +259,33 @@ Leader sends to Follower:
   │    entries        = [{idx=4, term=2, "SET x=3"}] │
   │    leaderCommit   = 3   (leader's commit index)  │
   └──────────────────────────────────────────────────┘
+```
+
+The full replication cycle looks like this:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader (Node-1)
+    participant F1 as Follower (Node-2)
+    participant F2 as Follower (Node-3)
+
+    C->>L: Write("SET x=3")
+    L->>L: Append to local log (index=4, term=2)
+
+    par Parallel replication
+        L-->>F1: AppendEntries(prevIdx=3, entries=[4])
+        L-->>F2: AppendEntries(prevIdx=3, entries=[4])
+    end
+
+    F1->>F1: Consistency check passes
+    F1->>L: Success(matchIndex=4)
+    Note over L: 2/3 replicated = majority
+    L->>L: Advance commitIndex to 4
+    L->>C: Write acknowledged
+
+    F2->>F2: Consistency check passes
+    F2->>L: Success(matchIndex=4)
 ```
 
 **The consistency check**: before accepting new entries, the follower verifies that it has an entry at `prevLogIndex` with term `prevLogTerm`. This is like a **hash chain** — the leader is asserting "I believe your log matches mine through index 3, and specifically that the entry at index 3 was created in term 1". If the follower agrees, it knows the logs are consistent up to that point and can safely append the new entries.

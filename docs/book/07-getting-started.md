@@ -120,6 +120,27 @@ That's it. **A complete Raft leader election in 15 lines of pure Scala.** No moc
 
 The step-by-step walkthrough above manually fed events and collected effects. A real application automates this with an **event loop** — a continuous cycle that receives events (from the network and timers), processes them through `RaftLogic.onMessage`, and executes the resulting effects:
 
+```mermaid
+flowchart LR
+    subgraph Sources["Event Sources"]
+        N[Network Messages]
+        ET[Election Timer]
+        HT[Heartbeat Timer]
+    end
+
+    M["FS2 merge\n(concurrent)"] --> P["RaftLogic.onMessage\n(sequential)"]
+    N --> M
+    ET --> M
+    HT --> M
+
+    P --> E["Effect Interpreter\n(pattern match)"]
+    E --> Send["SendMessage"]
+    E --> Persist["PersistHardState"]
+    E --> Append["AppendLogs"]
+    E --> Commit["CommitEntries"]
+    E --> Timer["ResetTimer"]
+```
+
 ```scala
 import cats.effect.IO
 import cats.syntax.all.*

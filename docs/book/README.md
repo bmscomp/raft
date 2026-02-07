@@ -17,6 +17,8 @@ The approach is deliberately layered:
 - **Part III** gets you building — from a first election in 15 lines of code to a production-ready event loop with batching, pipelining, and parallel replication.
 - **Part IV** applies everything to real-world distributed systems — a KV store, a lock service, a replicated counter, and a transactional engine with serializable isolation.
 - **Part V** puts the library in context by surveying the major Raft implementations across Go, Rust, Java, and Scala.
+- **Part VI** covers operational concerns — troubleshooting production clusters, end-to-end integration, and property-based safety testing.
+- **Part VII** looks ahead to scaling beyond a single Raft group with Multi-Raft architectures.
 
 Whether you're learning about distributed consensus for the first time or designing a production system that needs strong consistency guarantees, this book gives you both the *why* and the *how*.
 
@@ -73,6 +75,30 @@ Whether you're learning about distributed consensus for the first time or design
 | # | Chapter | What You'll Learn |
 |---|---------|-------------------|
 | 13 | [State of the Art](13-state-of-the-art.md) | Survey of 7 major Raft libraries (etcd/raft, HashiCorp Raft, tikv/raft-rs, OpenRaft, SOFAJRaft, MicroRaft), feature matrix, architectural spectrum, decision guide |
+
+### Part VI — Operations & Testing
+
+*Taking your Raft cluster from prototype to production: diagnostics, integration, and formal verification.*
+
+| # | Chapter | What You'll Learn |
+|---|---------|-------------------|
+| 14 | [Troubleshooting & Operational Pitfalls](14-troubleshooting.md) | Frequent leader changes, stalled writes, split-brain diagnosis, term inflation, slow followers, diagnostic checklist |
+| 15 | [End-to-End Integration](15-end-to-end-integration.md) | Wiring `RaftNode` with production SPIs, event loop architecture, SPI implementation guidance, deployment topology |
+| 16 | [Property-Based Testing](16-property-based-testing.md) | Five Raft safety invariants as ScalaCheck properties, random event generation, shrinking, deterministic reproduction |
+
+### Part VII — Scaling
+
+*Designing beyond a single Raft group for larger datasets and higher throughput.*
+
+| # | Chapter | What You'll Learn |
+|---|---------|-------------------|
+| 17 | [Multi-Raft Group Design](17-multi-raft-groups.md) | Partitioning strategies, cross-group transactions, leader balancing, transport multiplexing, resource sharing |
+
+### Appendices
+
+| | Appendix | Contents |
+|---|---------|----------|
+| A | [Quick Reference](appendix-a-quick-reference.md) | All types, effects, messages, configuration parameters, and SPI interfaces at a glance |
 
 ---
 

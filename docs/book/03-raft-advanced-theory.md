@@ -115,20 +115,23 @@ The Raft paper (§6) describes **joint consensus** as the safe solution. The key
 
 The transition goes through three phases:
 
-```
-Phase 1: C_old              → Normal operation with old members
-    │
-    ▼  Leader appends C_old,new entry to the log
-    │
-Phase 2: C_old,new          → DUAL quorum required:
-    │                           • Majority of old config AND
-    │                           • Majority of new config
-    ▼  C_old,new committed → Leader appends C_new entry
-    │
-Phase 3: C_new              → Normal operation with new members
+```mermaid
+stateDiagram-v2
+    [*] --> C_old: Normal operation
+    C_old --> C_old_new: Leader appends joint config entry
+    C_old_new --> C_new: Joint entry committed, leader appends new config
+    C_new --> [*]: Transition complete
+
+    C_old_new --> C_old: Abort (if not yet committed)
+
+    note right of C_old_new
+        Dual quorum required:
+        majority of C_old AND
+        majority of C_new
+    end note
 ```
 
-During Phase 2, **every decision** — elections, log commits, membership changes — requires agreement from a majority of the old configuration AND a majority of the new configuration. This is the critical safety property: since any majority of the old config overlaps with any majority of the new config (through the nodes that appear in both), it's impossible for two independent leaders to be elected.
+In more detail:
 
 ### Walking Through the Mechanics
 
@@ -197,6 +200,32 @@ The ReadIndex protocol avoids putting reads into the log while still guaranteein
 
 **Cost**: one heartbeat round-trip per read (or per batch of reads — you can batch multiple reads behind a single heartbeat confirmation).
 
+The complete ReadIndex sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F1 as Follower-1
+    participant F2 as Follower-2
+
+    C->>L: Read(x)
+    L->>L: Record readIndex = commitIndex
+
+    par Leadership confirmation
+        L-->>F1: Heartbeat
+        L-->>F2: Heartbeat
+    end
+
+    F1->>L: HeartbeatResponse
+    Note over L: Majority confirmed (self + F1)
+    L->>L: Wait until applied >= readIndex
+    L->>C: Read result: x = "value"
+
+    F2->>L: HeartbeatResponse
+    Note over F2: Late response, already confirmed
+```
+
 > **Note — ReadIndex and Followers:** A variation of ReadIndex allows **followers** to serve linearizable reads. The follower asks the leader for the current commit index, the leader confirms its leadership via heartbeat, and then the follower waits until it has applied entries through that index before serving the read. This distributes read load across the cluster. etcd implements this as "serializable reads" at followers.
 
 ### Approach 3: Lease-Based Reads (Zero RTT, Requires Clock Assumptions)
@@ -221,6 +250,24 @@ The idea: when the leader receives heartbeat acknowledgments from a majority, it
 | **Log reads** | Full replication RTT | None | Conservative deployments |
 | **ReadIndex** | One heartbeat RTT | None | etcd, most Raft implementations |
 | **Lease-based** | Zero extra RTT | Bounded clock skew | CockroachDB, TiKV |
+
+The lease timeline:
+
+```mermaid
+gantt
+    title Leader Lease Timeline
+    dateFormat X
+    axisFormat %s
+
+    section Leader
+    heartbeat ACKs received     :milestone, 0, 0
+    Lease valid (serve reads)   :active, 0, 8
+    Lease expired (use ReadIndex) :crit, 8, 10
+
+    section Clock Budget
+    electionTimeout             :0, 10
+    maxClockSkew margin         :8, 10
+```
 
 > **Note — Clock Skew in Practice:** In a well-configured data center with NTP, clock skew is typically under 10ms. With PTP (Precision Time Protocol) or dedicated time hardware (like Google's TrueTime), it can be under 1ms. For most deployments, lease-based reads with a conservative maxClockSkew setting are safe and provide a significant latency improvement for read-heavy workloads. However, if you're running on unreliable infrastructure (multi-cloud, edge computing), prefer ReadIndex.
 

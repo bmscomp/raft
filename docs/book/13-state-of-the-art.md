@@ -337,4 +337,5 @@ The Raft ecosystem offers strong options for every language and architectural pr
 
 ---
 
-*This concludes the book. You should now have both the theoretical foundation and practical implementation skills to build reliable, fault-tolerant distributed systems with Raft. The algorithm is elegant, the implementations are mature, and the patterns are proven — what you build on top of them is up to you.*
+*This concludes Part V. Continue to [Chapter 14 — Troubleshooting & Operational Pitfalls](14-troubleshooting.md) for production diagnostics and common failure mode solutions, or jump to [Appendix A — Quick Reference](appendix-a-quick-reference.md) for a one-page lookup of all library types and APIs.*
+

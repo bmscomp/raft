@@ -61,7 +61,7 @@ The key insight: Raft's log already provides **total ordering**. Every log entry
 │    │ if all checks pass → apply all operations → Committed    │
 │    │ if any check fails → reject entire txn → ConflictDetected│
 │    │ if decode error → Aborted                                │ 
-└──────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────┘
 ```
 
 This design is often called **OCC** (Optimistic Concurrency Control). The "optimistic" part means: the client prepares the transaction based on its view of the state, submits it, and hopes no conflicting transaction committed in the meantime. If a conflict is detected at apply time, the transaction is rejected and the client retries. This is in contrast to **pessimistic** concurrency control (locking), which prevents conflicts by blocking concurrent access.

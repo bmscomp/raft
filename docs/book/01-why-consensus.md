@@ -155,6 +155,52 @@ As Ongaro and Ousterhout wrote in the Raft paper:
 >
 > — Diego Ongaro & John Ousterhout, *"In Search of an Understandable Consensus Algorithm"*, USENIX ATC 2014
 
+#### Paxos vs Raft: A Side-by-Side Comparison
+
+To make the complexity difference concrete, here is how each algorithm handles a single value proposal:
+
+| Aspect | Paxos (Single-Decree) | Raft |
+|--------|----------------------|------|
+| **Phases** | Two phases: Prepare → Accept | Single phase: AppendEntries (leader already established) |
+| **Leader role** | Any proposer can propose at any time; no stable leader required | Strict leader — all proposals go through one node |
+| **Proposal numbering** | Each proposer picks a globally unique proposal number; proposers compete | Terms are monotonically increasing; only one leader per term |
+| **Learning a value** | Proposer must discover previously accepted values during Prepare; may adopt them | Leader's log is authoritative; followers overwrite conflicts |
+| **Log gaps** | Multi-Paxos can have holes — slot *k+1* decided before slot *k* | Logs are sequential with no gaps (Log Matching Property, see [Chapter 2](02-raft-fundamentals.md)) |
+| **Membership changes** | Not specified in the original paper; each implementation invents its own | Joint consensus — a formally specified two-phase transition (see [Chapter 3](03-raft-advanced-theory.md)) |
+| **Understandability** | Ongaro's study: 25th percentile score | Ongaro's study: 67th percentile score |
+
+```mermaid
+sequenceDiagram
+    participant P as Proposer
+    participant A1 as Acceptor-1
+    participant A2 as Acceptor-2
+    participant A3 as Acceptor-3
+
+    rect rgb(255, 240, 240)
+    Note over P,A3: Paxos: Two phases per value
+    P->>A1: Prepare(n=1)
+    P->>A2: Prepare(n=1)
+    P->>A3: Prepare(n=1)
+    A1->>P: Promise(n=1, no prior)
+    A2->>P: Promise(n=1, no prior)
+    P->>A1: Accept(n=1, v="x")
+    P->>A2: Accept(n=1, v="x")
+    A1->>P: Accepted
+    A2->>P: Accepted
+    end
+
+    rect rgb(240, 255, 240)
+    Note over P,A3: Raft: One phase (leader pre-established)
+    P->>A1: AppendEntries(entries=["x"])
+    P->>A2: AppendEntries(entries=["x"])
+    A1->>P: Success
+    A2->>P: Success
+    Note over P: Committed (majority)
+    end
+```
+
+The difference is even starker at the implementation level. A correct Paxos implementation must handle proposer conflicts (two proposers racing with different proposal numbers), value adoption (a proposer discovering that a different value was already accepted at a slot), and liveness failures (dueling proposers that keep preempting each other — the "livelock" problem). Raft's strong leader eliminates all of these by construction.
+
 ### Viewstamped Replication (1988)
 
 Brian Oki and Barbara Liskov published the Viewstamped Replication (VR) protocol in 1988 — technically predating Paxos. VR uses a **primary-backup architecture** with view changes (a mechanism for replacing a failed primary). It shares many structural similarities with Raft: both have a distinguished leader, both use a monotonically increasing epoch number (Raft calls them "terms", VR calls them "views"), and both require a majority for commits.
