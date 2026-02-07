@@ -454,4 +454,4 @@ This library's pure functional design gives you an unusual advantage: the same `
 
 ---
 
-*Next: [Appendix A — Quick Reference](appendix-a-quick-reference.md) provides a one-page lookup for all types, effects, messages, and configuration parameters in the library.*
+*Next: [Chapter 21 — Multi-Raft Group Design](21-multi-raft-groups.md) discusses how to scale beyond a single Raft group by partitioning data across multiple independent consensus groups.*
