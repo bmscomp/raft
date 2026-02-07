@@ -22,6 +22,7 @@ import cats.syntax.all.*
   *   - Empty snapshot handling
   *   - Chunk boundary correctness
   *   - Final chunk `done` flag
+  *   - Pipelined transfer with bounded concurrency
   */
 class SnapshotTransferSpec extends AnyFlatSpec with Matchers:
 
@@ -81,7 +82,7 @@ class SnapshotTransferSpec extends AnyFlatSpec with Matchers:
       transport <- IO(new RecordingTransport)
       chunkSize = 10
       transfer = new SnapshotTransfer[IO](chunkSize, transport, logger)
-      data = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" // 26 bytes → 3 chunks (10, 10, 6)
+      data = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" // 26 bytes -> 3 chunks (10, 10, 6)
       snapshot = Snapshot[IO](
         lastIncludedIndex = 200,
         lastIncludedTerm = 8,
@@ -150,7 +151,7 @@ class SnapshotTransferSpec extends AnyFlatSpec with Matchers:
       transport <- IO(new RecordingTransport)
       chunkSize = 5
       transfer = new SnapshotTransfer[IO](chunkSize, transport, logger)
-      data = "ABCDEFGHIJ" // 10 bytes → 2 chunks of exactly 5
+      data = "ABCDEFGHIJ" // 10 bytes -> 2 chunks of exactly 5
       snapshot = Snapshot[IO](
         lastIncludedIndex = 10,
         lastIncludedTerm = 1,
@@ -202,6 +203,118 @@ class SnapshotTransferSpec extends AnyFlatSpec with Matchers:
           case _ => fail("Expected InstallSnapshotRequest")
       }
     }
+
+    test.unsafeRunSync()
+  }
+
+  it should "send pipelined chunks with correct total count" in {
+    val test = for
+      transport <- IO(new RecordingTransport)
+      transfer = new SnapshotTransfer[IO](5, transport, logger, maxInFlight = 2)
+      data = "ABCDEFGHIJKLMNO" // 15 bytes -> 3 chunks of 5
+      snapshot = Snapshot[IO](
+        lastIncludedIndex = 50,
+        lastIncludedTerm = 3,
+        data = Stream.emits(data.getBytes).covary[IO]
+      )
+      totalChunks <- transfer.sendSnapshotPipelined(
+        leaderId,
+        followerId,
+        snapshot
+      )
+    yield
+      totalChunks shouldBe 3
+      val msgs = transport.sentMessages
+      msgs.size shouldBe 3
+      msgs.foreach { case (to, msg) =>
+        to shouldBe followerId
+        msg shouldBe a[InstallSnapshotRequest]
+      }
+      val doneChunks = msgs.collect {
+        case (_, req: InstallSnapshotRequest) if req.done => req
+      }
+      doneChunks.size shouldBe 1
+
+    test.unsafeRunSync()
+  }
+
+  it should "respect maxInFlight bound during pipelined transfer" in {
+    import scala.concurrent.duration.*
+
+    val test = for
+      maxConcurrentRef <- Ref.of[IO, Int](0)
+      currentRef <- Ref.of[IO, Int](0)
+      sentRef <- Ref.of[IO, Vector[(NodeId, RaftMessage)]](Vector.empty)
+
+      transport = new RaftTransport[IO]:
+        def send(to: NodeId, msg: RaftMessage): IO[Unit] =
+          for
+            _ <- currentRef.update(_ + 1)
+            current <- currentRef.get
+            _ <- maxConcurrentRef.update(max => math.max(max, current))
+            _ <- IO.sleep(10.millis)
+            _ <- sentRef.update(_ :+ (to, msg))
+            _ <- currentRef.update(_ - 1)
+          yield ()
+        def broadcast(msg: RaftMessage): IO[Unit] = IO.unit
+        def receive: Stream[IO, (NodeId, RaftMessage)] = Stream.empty
+        def localAddress: IO[String] = IO.pure("localhost:0")
+        def sendBatch(to: NodeId, msgs: Seq[RaftMessage]): IO[Unit] =
+          msgs.toList.traverse_(msg => send(to, msg))
+        def shutdown: IO[Unit] = IO.unit
+
+      maxInFlight = 2
+      transfer = new SnapshotTransfer[IO](
+        chunkSize = 10,
+        transport = transport,
+        logger = logger,
+        maxInFlight = maxInFlight
+      )
+      data = new Array[Byte](100) // 10 chunks of 10 bytes
+      snapshot = Snapshot[IO](
+        lastIncludedIndex = 100,
+        lastIncludedTerm = 5,
+        data = Stream.emits(data).covary[IO]
+      )
+      totalChunks <- transfer.sendSnapshotPipelined(
+        leaderId,
+        followerId,
+        snapshot
+      )
+      maxConcurrent <- maxConcurrentRef.get
+      sent <- sentRef.get
+    yield
+      totalChunks shouldBe 10
+      sent.size shouldBe 10
+      maxConcurrent should be <= maxInFlight
+
+    test.unsafeRunSync()
+  }
+
+  it should "handle empty snapshot in pipelined mode" in {
+    val test = for
+      transport <- IO(new RecordingTransport)
+      transfer = new SnapshotTransfer[IO](
+        1024,
+        transport,
+        logger,
+        maxInFlight = 4
+      )
+      snapshot = Snapshot[IO](
+        lastIncludedIndex = 50,
+        lastIncludedTerm = 3,
+        data = Stream.empty.covary[IO]
+      )
+      chunks <- transfer.sendSnapshotPipelined(leaderId, followerId, snapshot)
+    yield
+      chunks shouldBe 1
+      val msgs = transport.sentMessages
+      msgs.size shouldBe 1
+      msgs.head._2 match
+        case req: InstallSnapshotRequest =>
+          req.done shouldBe true
+          req.data shouldBe empty
+        case _ => fail("Expected InstallSnapshotRequest")
 
     test.unsafeRunSync()
   }

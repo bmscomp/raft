@@ -1,8 +1,10 @@
 package raft.compaction
 
 import cats.effect.Async
+import cats.effect.syntax.concurrent.*
 import cats.syntax.all.*
 import org.typelevel.log4cats.Logger
+import raft.message.RaftMessage
 import raft.message.RaftMessage.InstallSnapshotRequest
 import raft.state.{NodeId, Snapshot}
 import raft.spi.RaftTransport
@@ -17,6 +19,10 @@ import scala.concurrent.duration.*
   * `InstallSnapshot` RPC. This class splits the snapshot data into fixed-size
   * chunks and sends them as a sequence of [[InstallSnapshotRequest]] messages.
   *
+  * Back-pressure is controlled by the `maxInFlight` parameter: at most
+  * `maxInFlight` chunk sends are in progress concurrently. This prevents
+  * overwhelming slow followers while still allowing pipelined transfers.
+  *
   * @tparam F
   *   the effect type (e.g., `IO`)
   * @param chunkSize
@@ -27,18 +33,22 @@ import scala.concurrent.duration.*
   *   structured logger
   * @param chunkTimeout
   *   maximum time to wait for each chunk send before failing
+  * @param maxInFlight
+  *   maximum number of concurrent in-flight chunk sends (default: 4)
   */
 class SnapshotTransfer[F[_]: Async](
     chunkSize: Int,
     transport: RaftTransport[F],
     logger: Logger[F],
-    chunkTimeout: FiniteDuration = 30.seconds
+    chunkTimeout: FiniteDuration = 30.seconds,
+    maxInFlight: Int = 4
 ):
 
   /** Send a complete snapshot to a follower in chunks.
     *
     * Each chunk is sent as a separate `InstallSnapshotRequest`. The final chunk
-    * is marked with `done = true`.
+    * is marked with `done = true`. At most [[maxInFlight]] chunks are in
+    * transit concurrently.
     *
     * @param leaderId
     *   the sending leader's node id
@@ -116,3 +126,78 @@ class SnapshotTransfer[F[_]: Async](
       }
 
     go(chunks, 0, 0L).stream.compile.lastOrError
+
+  /** Send a snapshot using pipelined chunk sends with bounded concurrency.
+    *
+    * Unlike [[sendSnapshot]], this method pre-segments the entire snapshot
+    * stream into chunks and sends up to [[maxInFlight]] in parallel. This is
+    * faster for large snapshots over high-latency networks but requires the
+    * receiver to handle out-of-order delivery (offset-based reassembly).
+    *
+    * @param leaderId
+    *   the sending leader's node id
+    * @param target
+    *   the receiving follower's node id
+    * @param snapshot
+    *   the snapshot to transfer
+    * @return
+    *   the total number of chunks sent
+    */
+  def sendSnapshotPipelined(
+      leaderId: NodeId,
+      target: NodeId,
+      snapshot: Snapshot[F]
+  ): F[Int] =
+    snapshot.data
+      .chunkN(chunkSize)
+      .compile
+      .toVector
+      .flatMap { allChunks =>
+        if allChunks.isEmpty then
+          val req = InstallSnapshotRequest(
+            term = snapshot.lastIncludedTerm,
+            leaderId = leaderId,
+            lastIncludedIndex = snapshot.lastIncludedIndex,
+            lastIncludedTerm = snapshot.lastIncludedTerm,
+            offset = 0,
+            data = Array.emptyByteArray,
+            done = true
+          )
+          logger.debug(s"Sending empty snapshot to ${target.value}") >>
+            transport.send(target, req).as(1)
+        else
+          var currentOffset = 0L
+          val requests = allChunks.zipWithIndex.map { case (chunk, idx) =>
+            val off = currentOffset
+            val isDone = idx == allChunks.size - 1
+            val req = InstallSnapshotRequest(
+              term = snapshot.lastIncludedTerm,
+              leaderId = leaderId,
+              lastIncludedIndex = snapshot.lastIncludedIndex,
+              lastIncludedTerm = snapshot.lastIncludedTerm,
+              offset = off,
+              data = chunk.toArray,
+              done = isDone
+            )
+            currentOffset += chunk.size
+            (req: RaftMessage, off, isDone)
+          }
+
+          requests
+            .parTraverseN(maxInFlight) { case (req, off, isDone) =>
+              logger.debug(
+                s"Pipelined chunk to ${target.value} (offset=$off, done=$isDone)"
+              ) >> Async[F]
+                .timeoutTo(
+                  transport.send(target, req),
+                  chunkTimeout,
+                  Async[F].raiseError(
+                    new java.util.concurrent.TimeoutException(
+                      s"Pipelined snapshot chunk to ${target.value} timed out after $chunkTimeout"
+                    )
+                  )
+                )
+                .as(1)
+            }
+            .map(_.size)
+      }

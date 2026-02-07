@@ -94,6 +94,35 @@ class WalIndex:
       Some(Location(segmentIds(slot), fileOffsets(slot)))
     else None
 
+  /** Look up the segment ID for a log entry without heap allocation.
+    *
+    * On the hot path (replication, reads), this avoids the `Option[Location]`
+    * boxing that [[get]] incurs.
+    *
+    * @param logIndex
+    *   the Raft log index to find
+    * @return
+    *   the segment ID if present, or `-1` if the index is not in the index
+    */
+  def getSegmentId(logIndex: Long): Int =
+    val slot = (logIndex - baseIndex).toInt
+    if slot >= 0 && slot < slots && occupied.get(slot) then segmentIds(slot)
+    else -1
+
+  /** Look up the file offset for a log entry without heap allocation.
+    *
+    * Companion to [[getSegmentId]] for allocation-free lookups.
+    *
+    * @param logIndex
+    *   the Raft log index to find
+    * @return
+    *   the byte offset within the segment, or `-1L` if not found
+    */
+  def getFileOffset(logIndex: Long): Long =
+    val slot = (logIndex - baseIndex).toInt
+    if slot >= 0 && slot < slots && occupied.get(slot) then fileOffsets(slot)
+    else -1L
+
   /** The highest log index in the index, or 0 if empty. */
   def lastIndex: Long = lastIdx
 

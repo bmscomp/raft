@@ -91,30 +91,33 @@ class MmapWalEngine[F[_]: Async] private (
 
   def readEntry(index: LogIndex): F[Option[Log]] =
     walIndex.get.flatMap { idx =>
-      idx.get(index.value) match
-        case Some(loc) =>
-          findSegment(loc.segmentId).flatMap {
-            case Some(seg) =>
-              F.delay(Some(seg.readEntryUnchecked(loc.fileOffset)))
-            case None => F.pure(None)
-          }
-        case None => F.pure(None)
+      val segId = idx.getSegmentId(index.value)
+      if segId == -1 then F.pure(None)
+      else
+        val offset = idx.getFileOffset(index.value)
+        findSegment(segId).flatMap {
+          case Some(seg) =>
+            F.delay(Some(seg.readEntryUnchecked(offset)))
+          case None => F.pure(None)
+        }
     }
 
   def readRange(start: LogIndex, end: LogIndex): F[Vector[Log]] =
     walIndex.get.flatMap { idx =>
       val locations = (start.value to end.value).flatMap { i =>
-        idx.get(i).map(loc => (i, loc))
+        val segId = idx.getSegmentId(i)
+        if segId == -1 then None
+        else Some((i, segId, idx.getFileOffset(i)))
       }
       if locations.isEmpty then F.pure(Vector.empty)
       else
-        val bySegment = locations.groupBy(_._2.segmentId)
+        val bySegment = locations.groupBy(_._2)
         bySegment.toVector
           .flatTraverse { case (segId, locs) =>
             findSegment(segId).map {
               case Some(seg) =>
-                locs.map { case (_, loc) =>
-                  seg.readEntryUnchecked(loc.fileOffset)
+                locs.map { case (_, _, offset) =>
+                  seg.readEntryUnchecked(offset)
                 }.toVector
               case None => Vector.empty
             }
