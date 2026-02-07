@@ -63,6 +63,7 @@ class InMemLogStore[F[_]: Async] private (
     * @return
     *   the first entry's index, or 0 if the log is empty
     */
+  @deprecated("Use lastIndex from LogReader instead", "0.2.0")
   def firstIndex: F[Long] =
     logs.get.map(_.headOption.map(_.index).getOrElse(0L))
 
@@ -73,6 +74,7 @@ class InMemLogStore[F[_]: Async] private (
     * @return
     *   `Some(log)` if found, `None` otherwise
     */
+  @deprecated("Use get(LogIndex) from LogReader instead", "0.2.0")
   def getLog(index: Long): F[Option[Log]] =
     get(LogIndex.unsafeFrom(index))
 
@@ -85,15 +87,20 @@ class InMemLogStore[F[_]: Async] private (
     * @return
     *   the matching log entries
     */
+  @deprecated(
+    "Use getRange(LogIndex, LogIndex) from LogReader instead",
+    "0.2.0"
+  )
   def getLogs(fromIndex: Long, toIndex: Long): F[Seq[Log]] =
     getRange(LogIndex.unsafeFrom(fromIndex), LogIndex.unsafeFrom(toIndex))
-      .asInstanceOf[F[Seq[Log]]]
+      .map(_.toSeq)
 
   /** Append entries using the legacy API.
     *
     * @param newLogs
     *   the entries to append
     */
+  @deprecated("Use append(Seq[Log]) from LogWriter instead", "0.2.0")
   def appendLogs(newLogs: Seq[Log]): F[Unit] =
     append(newLogs)
 
@@ -137,6 +144,7 @@ class InMemStableStore[F[_]: Async] private (
     * @return
     *   the current term value
     */
+  @deprecated("Use currentTerm from StableStore instead", "0.2.0")
   def getCurrentTerm: F[Long] = termRef.get.map(_.value)
 
   /** Get the voted-for candidate (legacy API alias).
@@ -144,6 +152,7 @@ class InMemStableStore[F[_]: Async] private (
     * @return
     *   the voted-for node, if any
     */
+  @deprecated("Use votedFor from StableStore instead", "0.2.0")
   def getVotedFor: F[Option[NodeId]] = votedFor
 
 /** Companion for [[InMemStableStore]] providing a factory method. */

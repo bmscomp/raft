@@ -84,9 +84,9 @@ class PreVoteProtocolSpec extends AnyFlatSpec with Matchers:
   }
 
   "Pre-vote to real election transition" should "start real election after majority pre-votes" in {
-    // Note: handleVoteResponse uses synthetic NodeId("voter") for pre-vote tracking.
+    // handleVoteResponse generates unique voter IDs via an atomic counter.
     // In a 3-node cluster, PreCandidate starts with self in the set ({n1}).
-    // One granted pre-vote adds "voter" → {n1, "voter"} size 2 > 3/2 = true.
+    // One granted pre-vote adds a unique ID → {n1, voter-N} size 2 > 3/2 = true.
     val preCandidate: NodeState =
       PreCandidate(term = 5, preVotesReceived = Set(n1))
 

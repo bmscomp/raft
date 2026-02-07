@@ -374,19 +374,14 @@ object DistributedCounterExample extends IOApp.Simple:
       log1 <- node1.getLog
       _ <- IO.println(s"\n   Leader log: ${log1.size} entries")
 
-      // Step 6: Show state machine (after simulated commit)
+      // Step 6: Show state machine state
       _ <- IO.println(
-        "\nStep 6: Simulating commit and state machine application..."
+        "\nStep 6: Showing state machine state..."
       )
 
-      // For demo, manually trigger commit
-      _ <- node1.processMessage(
-        nodeIds(0),
-        ElectionTimeout
-      ) // triggers internal state update
-
-      // In production, this happens automatically via replication
-      // Here we manually apply logs to show the concept
+      // In production, replication and commit advancement happen automatically.
+      // The leader replicates entries to followers, and once a majority confirms,
+      // entries are committed and applied to the state machine.
       value1 <- node1.getStateMachineValue
       applied1 <- node1.getAppliedLog
 

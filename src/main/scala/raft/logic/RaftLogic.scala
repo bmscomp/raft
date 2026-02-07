@@ -98,11 +98,19 @@ object RaftLogic:
     case req: RequestVoteRequest =>
       onRequestVote(state, req, config, lastLogIndex, lastLogTerm)
     case resp: RequestVoteResponse =>
-      handleVoteResponse(state, resp, clusterSize)
+      handleVoteResponse(
+        state,
+        resp,
+        config,
+        clusterSize,
+        lastLogIndex,
+        lastLogTerm
+      )
     case ElectionTimeout =>
       onElectionTimeout(state, config, lastLogIndex, lastLogTerm)
-    case HeartbeatTimeout => onHeartbeatTimeout(state, config, lastLogIndex)
-    case _                => Transition.pure(state)
+    case HeartbeatTimeout =>
+      onHeartbeatTimeout(state, config, lastLogIndex, lastLogTerm)
+    case _ => Transition.pure(state)
 
   /** Handle a vote response for a Candidate with explicit voter tracking.
     *
@@ -307,55 +315,59 @@ object RaftLogic:
           SendMessage(req.candidateId, response)
         )
 
+  /** Monotonic counter for generating unique voter IDs when the wire protocol
+    * does not carry the voter's identity. Each call to `handleVoteResponse`
+    * produces a distinct `NodeId`, preventing de-duplication bugs where the
+    * same synthetic ID would be counted only once.
+    */
+  private val voteCounter = new java.util.concurrent.atomic.AtomicLong(0)
+
   private def handleVoteResponse(
       state: NodeState,
       resp: RequestVoteResponse,
-      clusterSize: Int
+      config: RaftConfig,
+      clusterSize: Int,
+      lastLogIndex: Long,
+      lastLogTerm: Long
   ): Transition =
-    // Handle pre-vote responses for PreCandidate
+    val voterId = NodeId(s"voter-${voteCounter.getAndIncrement()}")
+
     if resp.isPreVote then
       state match
         case p: PreCandidate if resp.voteGranted =>
-          // Pre-vote granted - check for majority
-          val newPreCandidate =
-            p.withPreVote(NodeId("voter")) // simplified voter tracking
+          val newPreCandidate = p.withPreVote(voterId)
           if newPreCandidate.hasPreVoteMajority(clusterSize) then
-            // Pre-vote majority achieved - start real election
             val newTerm = p.term + 1
             val candidate =
-              Candidate(newTerm, Set(NodeId("self"))) // votes for self
+              Candidate(newTerm, Set(config.localId))
             val voteReq = RequestVoteRequest(
               term = newTerm,
-              candidateId =
-                NodeId("self"), // will be replaced by config in runtime
-              lastLogIndex = 0, // will be filled by runtime
-              lastLogTerm = 0,
+              candidateId = config.localId,
+              lastLogIndex = lastLogIndex,
+              lastLogTerm = lastLogTerm,
               isPreVote = false
             )
             Transition(
               candidate,
               List(
-                PersistHardState(newTerm, Some(NodeId("self"))),
+                PersistHardState(newTerm, Some(config.localId)),
                 Broadcast(voteReq),
                 ResetElectionTimer
               )
             )
           else Transition.pure(newPreCandidate)
         case p: PreCandidate =>
-          // Pre-vote rejected - stay PreCandidate
           Transition.pure(p)
         case _ =>
           Transition.pure(state)
     else
-      // Handle real vote responses for Candidate
       state match
         case c: Candidate if resp.voteGranted && resp.term == c.term =>
-          val newCandidate = c.withVote(NodeId("voter")) // simplified
+          val newCandidate = c.withVote(voterId)
           if newCandidate.hasMajority(clusterSize) then
             Transition.withEffect(Leader(c.term), BecomeLeader)
           else Transition.pure(newCandidate)
         case c: Candidate if resp.term > c.term =>
-          // Higher term - step down
           Transition.pure(c.stepDown(resp.term))
         case _ =>
           Transition.pure(state)
@@ -445,15 +457,15 @@ object RaftLogic:
   private def onHeartbeatTimeout(
       state: NodeState,
       config: RaftConfig,
-      lastLogIndex: Long
+      lastLogIndex: Long,
+      lastLogTerm: Long
   ): Transition = state match
     case l: Leader =>
-      // Send heartbeats with actual commit index
       val heartbeat = AppendEntriesRequest(
         term = l.term,
         leaderId = config.localId,
         prevLogIndex = lastLogIndex,
-        prevLogTerm = l.term, // simplified - should lookup actual term
+        prevLogTerm = lastLogTerm,
         entries = Seq.empty,
         leaderCommit = l.commitIndex
       )
