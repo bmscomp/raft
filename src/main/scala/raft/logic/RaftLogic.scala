@@ -271,6 +271,15 @@ object RaftLogic:
       lastLogIndex: Long,
       lastLogTerm: Long
   ): Transition[Nothing] =
+    // Reject stale-term vote requests immediately (Raft §5.1)
+    if req.term < state.term && !req.isPreVote then
+      val response =
+        RequestVoteResponse(state.term, voteGranted = false, req.isPreVote)
+      return Transition.withEffect(
+        state,
+        SendMessage(req.candidateId, response)
+      )
+
     // Check if we should step down
     val currentState =
       if req.term > state.term then state.stepDown(req.term) else state
