@@ -1,11 +1,20 @@
 package raft.state
 
-/** Snapshot metadata and state for log compaction.
+/** Snapshot metadata and state for log compaction (§7).
   *
-  * A snapshot captures the replicated state machine at a specific log index,
-  * allowing all preceding log entries to be discarded. This bounds the storage
-  * required for the replicated log and speeds up recovery for new or lagging
-  * nodes.
+  * In a long-running Raft cluster the replicated log grows without bound. Log
+  * compaction (§7) solves this by periodically capturing a snapshot of the
+  * state machine and discarding all log entries up to that point.
+  *
+  * The `lastIncludedIndex` and `lastIncludedTerm` fields serve as a bookmark:
+  * they record the point at which the snapshot was taken so that the node can
+  * resume log replication from the correct position. When a follower is so far
+  * behind that the leader no longer has the required log entries, the leader
+  * sends an `InstallSnapshot` RPC instead of `AppendEntries`.
+  *
+  * The optional `config` captures the cluster membership at snapshot time,
+  * ensuring that membership changes (§6) are not lost when log entries are
+  * compacted away.
   *
   * @param lastIncludedIndex
   *   the index of the last log entry included in this snapshot
@@ -28,12 +37,14 @@ case class Snapshot(
     config: Option[ClusterConfig] = None
 )
 
-/** Accumulator for a snapshot being installed incrementally via InstallSnapshot
-  * RPC.
+/** Accumulator for a snapshot being installed incrementally via
+  * `InstallSnapshot` RPC (§7).
   *
-  * The leader transfers snapshots in chunks. This class buffers received chunks
-  * until all data has arrived, at which point [[toSnapshot]] produces the
-  * complete [[Snapshot]].
+  * State machine snapshots can be large (gigabytes for a database). The Raft
+  * paper specifies chunk-based transfer so that snapshot installation does not
+  * block the leader's event loop for an extended period. Each chunk is appended
+  * to this accumulator; once all chunks arrive, [[toSnapshot]] assembles the
+  * final [[Snapshot]].
   *
   * @param lastIncludedIndex
   *   the index of the last log entry in the snapshot

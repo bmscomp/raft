@@ -4,13 +4,21 @@ import scala.util.control.NoStackTrace
 
 /** Type-safe Term representation using Scala 3 opaque types.
   *
-  * A ''Term'' is a monotonically increasing logical clock that identifies
-  * leader epochs in the RAFT protocol. Each election increments the term, and
-  * every RPC carries a term so that stale leaders can be detected.
+  * In the Raft paper (§5.1), a ''term'' acts as a logical clock that partitions
+  * time into epochs of leadership. Terms serve the same role as Lamport
+  * timestamps in general distributed systems: they impose a partial order on
+  * events so that stale information can be detected without synchronized
+  * physical clocks.
   *
-  * Terms must always be non-negative. The opaque type alias provides
-  * compile-time safety with zero runtime overhead, preventing accidental mixing
-  * with raw `Long` values or invalid arithmetic.
+  * Every RPC carries the sender's current term. When a node receives a message
+  * with a higher term, it immediately steps down to Follower and adopts the new
+  * term — this is the mechanism that resolves split-brain situations and
+  * ensures at most one leader per term (Election Safety Property, §5.2).
+  *
+  * This library models `Term` as a Scala 3 opaque type over `Long`. The opaque
+  * type ensures compile-time safety (a `Term` cannot be accidentally mixed with
+  * a `Long` log index or a message count) while incurring zero runtime boxing
+  * cost — the JVM sees a primitive `long` at the bytecode level.
   *
   * @see
   *   [[LogIndex]] for the companion positional type in the log
@@ -19,8 +27,12 @@ import scala.util.control.NoStackTrace
   */
 opaque type Term = Long
 
-/** Companion for [[Term]] providing constructors, ordering, and extension
-  * methods.
+/** Companion for [[Term]] providing safe constructors, ordering, and arithmetic
+  * extensions.
+  *
+  * The `apply` constructor validates non-negativity (terms start at 0 before
+  * any election), while `unsafeFrom` skips validation for trusted sources such
+  * as on-disk stable storage.
   */
 object Term:
   /** The initial term before any election has occurred. */
@@ -90,9 +102,16 @@ case class InvalidTerm(value: Long)
 
 /** Type-safe LogIndex representation using Scala 3 opaque types.
   *
-  * A ''LogIndex'' is the 1-based position of an entry in the RAFT replicated
-  * log. Index 0 is a sentinel meaning "empty log" (no entries). The first real
-  * entry is always at index 1.
+  * In Raft (§5.3), every log entry is uniquely identified by its ''(index,
+  * term)'' pair. The Log Matching Property guarantees that if two logs contain
+  * an entry with the same index and term, then the logs are identical in all
+  * preceding entries. This invariant is the foundation of Raft's consistency
+  * guarantee.
+  *
+  * Indices are 1-based: the first real entry is at index 1, and index 0 is a
+  * sentinel meaning "empty log". This convention simplifies the
+  * `prevLogIndex = 0` case in `AppendEntries`, where an empty-log follower
+  * always accepts entries without a log matching check.
   *
   * Like [[Term]], this opaque type prevents accidental misuse of raw `Long`
   * values while incurring no runtime boxing cost.

@@ -10,12 +10,17 @@ import raft.spi.RaftTransport
 
 /** In-memory [[RaftTransport]] implementation for testing.
   *
-  * Routes messages through in-process `Queue`s, providing instant delivery
-  * without any network I/O. Each node gets its own `InMemTransport`, and peers
-  * are wired together via [[registerPeer]] or the
-  * [[InMemTransport.createCluster]] factory.
+  * This transport creates a '''simulated network''' by routing messages through
+  * in-process `Queue`s. Delivery is instant and reliable (no packet loss, no
+  * reordering), which makes tests deterministic and avoids the flakiness of
+  * real network I/O.
   *
-  * Messages sent to unregistered peers are silently dropped.
+  * Each node gets its own `InMemTransport` instance. Peers are wired together
+  * via [[registerPeer]], or the [[InMemTransport.createCluster]] factory can
+  * set up a fully connected mesh for multi-node integration tests.
+  *
+  * Messages sent to unregistered peers are silently dropped, which allows tests
+  * to simulate network partitions by simply not registering certain peers.
   *
   * @tparam F
   *   the effect type (requires `Async`)

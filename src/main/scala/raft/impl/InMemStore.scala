@@ -7,11 +7,16 @@ import raft.spi.{LogStore, LogReader, LogWriter, StableStore}
 
 /** In-memory [[LogStore]] implementation for testing and prototyping.
   *
-  * Stores all log entries in a `Ref[F, Vector[Log]]`, providing atomic
-  * read/write operations without any persistence. Data is lost on restart.
-  *
-  * Implements the full [[LogReader]] / [[LogWriter]] / [[LogStore]] hierarchy,
-  * plus legacy compatibility methods for older API consumers.
+  * Production Raft deployments require durable log storage so that committed
+  * entries survive crashes (§5.2). This implementation intentionally sacrifices
+  * that durability guarantee by storing entries in a `Ref[F, Vector[Log]]`,
+  * making it ideal for:
+  *   - '''Unit tests''' — fast, in-process, repeatable tests against the
+  *     [[raft.logic.RaftLogic]] layer without disk I/O
+  *   - '''Prototyping''' — quickly standing up a multi-node cluster to explore
+  *     API design and message flows
+  *   - '''Property-based testing''' — generating large numbers of random
+  *     scenarios without worrying about cleanup
   *
   * @tparam F
   *   the effect type (requires `Async`)

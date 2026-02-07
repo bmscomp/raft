@@ -5,9 +5,17 @@ import scala.concurrent.duration.FiniteDuration
 
 /** Timer service for scheduling RAFT election and heartbeat timeouts.
   *
-  * Provides cancellable timer scheduling and randomized timeout generation.
-  * Election timeouts use jitter to prevent multiple nodes from starting
-  * elections simultaneously (split votes).
+  * Timers are the ''liveness mechanism'' of Raft (§5.2). Without timers the
+  * system would be purely safety-driven and could stall indefinitely after a
+  * leader failure. Election timeouts detect leader crashes, and heartbeat
+  * timeouts ensure the leader maintains authority.
+  *
+  * Election timeouts are randomized within a configurable range to prevent
+  * '''split votes''' — a situation where multiple followers time out
+  * simultaneously, all become candidates, and split the vote so no one wins.
+  * Randomization ensures that, with high probability, only one follower times
+  * out first and wins the election. The paper (§9.3) recommends a jitter of
+  * 0–50% of the base timeout.
   *
   * @tparam F
   *   the effect type (e.g., `IO`)

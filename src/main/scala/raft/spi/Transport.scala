@@ -7,13 +7,22 @@ import raft.message.{RaftMessage, SimpleMessageCodec, MessageCodec, CodecError}
 
 /** Service Provider Interface for raw network transport between RAFT nodes.
   *
-  * Users implement this trait to integrate their preferred networking layer
-  * (Netty, gRPC, Akka HTTP, etc.) with the RAFT consensus engine. The transport
-  * operates on a generic wire format `Wire` and is codec-agnostic — message
-  * serialization is handled by [[MessageCodec]] or [[SimpleMessageCodec]].
+  * This trait is the cornerstone of the library's '''SPI (Service Provider
+  * Interface) architecture'''. The library owns the consensus logic
+  * ([[raft.logic.RaftLogic]]) but delegates all infrastructure concerns —
+  * networking, storage, serialization, and timers — to user-provided
+  * implementations. This inversion of control makes the library portable across
+  * network stacks (Netty, gRPC, HTTP, Unix sockets) without any compile-time
+  * dependency on a specific I/O library.
   *
-  * Use [[Transport.withCodec]] or [[Transport.withEffectfulCodec]] to obtain a
-  * [[RaftTransport]] that works directly with [[RaftMessage]] types.
+  * The transport is layered in two tiers:
+  *   - '''Transport[F, Wire]''' — raw wire-format transport, codec-agnostic
+  *   - '''RaftTransport[F]''' — message-typed transport, produced by wrapping a
+  *     `Transport` with a [[MessageCodec]] via [[Transport.withCodec]]
+  *
+  * This layering allows the same transport implementation to be reused with
+  * different serialization formats (JSON, Protobuf, Avro) simply by swapping
+  * the codec.
   *
   * @tparam F
   *   the effect type (e.g., `IO`)

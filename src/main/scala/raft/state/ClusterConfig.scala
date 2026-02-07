@@ -2,9 +2,11 @@ package raft.state
 
 /** Role a node can play within the RAFT cluster.
   *
-  * Roles determine whether a node participates in voting, log replication, or
-  * both. They are used during dynamic membership changes to safely transition
-  * nodes between responsibilities.
+  * Beyond the basic Voter role from the Raft paper, this library introduces
+  * Learner and Witness roles for operational flexibility. Roles determine
+  * whether a node participates in voting, log replication, or both. They are
+  * used during dynamic membership changes (§6) to safely transition nodes
+  * between responsibilities.
   *
   * @see
   *   [[ClusterConfig]] for cluster-level role management
@@ -27,22 +29,31 @@ enum NodeRole:
     */
   case Witness
 
-/** Cluster configuration for dynamic membership management.
+/** Cluster configuration for dynamic membership management (§6).
   *
-  * Tracks the current set of cluster members and their roles. Supports the
-  * ''joint consensus'' protocol for safe membership transitions, where quorums
-  * must be achieved in ''both'' the old and new configurations simultaneously
-  * during the transition period.
+  * One of Raft's key practical requirements is the ability to change cluster
+  * membership without downtime. Naive approaches risk split-brain: if the
+  * cluster switches directly from configuration C_old to C_new, there exists a
+  * window where two disjoint majorities could elect separate leaders.
+  *
+  * Raft solves this with ''joint consensus'' (§6): the cluster transitions
+  * through an intermediate configuration C_old,new that requires agreement from
+  * majorities of ''both'' the old and new configurations. This eliminates the
+  * split-brain window at the cost of one extra replication round.
+  *
+  * In this library, `beginJointConsensus` enters the joint state,
+  * `completeJointConsensus` commits the new configuration, and
+  * `abortJointConsensus` rolls back to the old one if the change fails.
   *
   * @param members
-  *   current cluster members mapped to their roles
+  *   the current cluster membership map (node ID → role)
   * @param jointConfig
-  *   during a joint consensus transition, holds the old configuration; `None`
-  *   when operating under a single stable configuration
+  *   if in joint consensus, the old configuration being transitioned away from
+  * @param pendingConfig
+  *   if in joint consensus, the new configuration being transitioned to
   * @see
-  *   [[NodeRole]] for the possible roles a node can hold
-  * @see
-  *   [[raft.message.RaftMessage.AddServerRequest]] for membership change RPCs
+  *   [[raft.message.RaftMessage.AddServerRequest]] for the membership change
+  *   RPCs
   */
 case class ClusterConfig(
     members: Map[NodeId, NodeRole] = Map.empty,

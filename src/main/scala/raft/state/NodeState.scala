@@ -27,17 +27,33 @@ object NodeId:
 
 /** Sealed enumeration representing the possible states of a RAFT node.
   *
-  * Each state is immutable and encapsulates all role-specific data needed for
-  * consensus operations. The RAFT protocol defines four roles that a node can
-  * assume during its lifecycle:
+  * Raft (§5.1) defines a strict role lifecycle that every node follows:
+  * {{{Follower → PreCandidate → Candidate → Leader → (step-down) → Follower}}}
   *
-  *   1. '''Follower''' — passive; accepts log entries and grants votes
-  *   2. '''PreCandidate''' — running a pre-vote election (optional, prevents
-  *      disruption)
-  *   3. '''Candidate''' — actively seeking votes to become leader
-  *   4. '''Leader''' — authoritative; replicates log entries to followers
+  * At any given moment a node is in exactly one of these roles, and every role
+  * transition is driven by a protocol event (election timeout, vote majority,
+  * higher-term message). This design ensures the '''Election Safety''' property
+  * (§5.2): at most one leader can be elected in any given term.
   *
-  * Pattern matching is exhaustive due to the sealed `enum` nature.
+  * The four roles are:
+  *   - '''Follower''' — the default, passive state. Accepts log entries from
+  *     the leader and grants votes to candidates. A node starts as Follower and
+  *     steps down to Follower whenever it discovers a higher term.
+  *   - '''PreCandidate''' — an optional optimization (§9.6, Pre-Vote) that
+  *     prevents partitioned nodes from disrupting a stable cluster by
+  *     incrementing their term. The PreCandidate asks peers whether they
+  *     ''would'' vote before committing to a real election.
+  *   - '''Candidate''' — a node actively seeking leadership. Increments its
+  *     term, votes for itself, and solicits votes from all peers. Becomes
+  *     Leader upon receiving a majority.
+  *   - '''Leader''' — the authoritative node that manages replication. Sends
+  *     heartbeats, accepts client commands, and tracks per-follower `nextIndex`
+  *     / `matchIndex` for log synchronization.
+  *
+  * Each variant is immutable, carrying only the data relevant to its role. This
+  * purity is central to the library's design: [[raft.logic.RaftLogic]] computes
+  * transitions as pure functions `(NodeState, Message) → Transition`, making
+  * the consensus logic fully deterministic and testable.
   *
   * @see
   *   [[raft.logic.RaftLogic]] for the pure state transition functions
@@ -45,12 +61,20 @@ object NodeId:
   *   [[raft.effect.Transition]] for the state + effects result type
   */
 enum NodeState:
-  /** Follower state: passive node that accepts log entries from the leader and
-    * grants votes to candidates. Resets its election timer on each heartbeat
-    * received from the current leader.
+  /** Follower state — the default role in the Raft protocol (§5.2).
+    *
+    * A node begins as Follower and returns to this state whenever it discovers
+    * a higher term from any peer. Followers are purely passive: they respond to
+    * RPCs but never initiate communication. They accept `AppendEntries` from
+    * the current leader and grant `RequestVote` to candidates with up-to-date
+    * logs.
+    *
+    * The Follower resets its election timer on every valid heartbeat. If the
+    * timer expires without hearing from a leader, the node transitions to
+    * PreCandidate (or Candidate if pre-vote is disabled).
     *
     * @param term
-    *   the current term this follower is in
+    *   the current term this follower has observed
     * @param votedFor
     *   the candidate this follower voted for in the current term, if any
     * @param leaderId
@@ -62,10 +86,18 @@ enum NodeState:
       leaderId: Option[NodeId] = None
   )
 
-  /** PreCandidate state: node running a pre-vote election to check if it can
-    * win before starting a real election. Does NOT increment the term, which
-    * prevents network-partitioned nodes from disrupting stable clusters with
-    * ever-increasing terms.
+  /** PreCandidate state — the Pre-Vote optimization (§9.6, Ongaro thesis).
+    *
+    * Without Pre-Vote, a node isolated by a network partition will repeatedly
+    * time out, increment its term, and start elections nobody can win. When the
+    * partition heals, its inflated term forces the legitimate leader to step
+    * down — a disruptive and unnecessary leadership change.
+    *
+    * Pre-Vote solves this by adding a speculative round: the PreCandidate asks
+    * ''"would you vote for me?"'' without incrementing its term. Only if a
+    * majority says yes does the node proceed to a real election. A partitioned
+    * node will never get a pre-vote majority and therefore never disrupts the
+    * cluster.
     *
     * @param term
     *   the current term (not incremented during pre-vote)
@@ -77,13 +109,22 @@ enum NodeState:
       preVotesReceived: ImmutableSet[NodeId] = ImmutableSet.empty
   )
 
-  /** Candidate state: node actively running an election to become the leader.
-    * Increments the term, votes for itself, and broadcasts `RequestVoteRequest`
-    * to all peers. Accumulates votes until a majority is reached or the
-    * election times out.
+  /** Candidate state — a node actively seeking leadership (§5.2).
+    *
+    * Upon entering this state the node increments its term, votes for itself,
+    * and broadcasts `RequestVoteRequest` to all peers. The Candidate wins the
+    * election if it receives votes from a majority of the cluster (ensuring the
+    * Election Safety Property: at most one leader per term).
+    *
+    * Three outcomes end a Candidate's election:
+    *   1. ''Win'' — majority votes received → become Leader
+    *   1. ''Lose'' — receives `AppendEntries` from a leader with `≥ term` →
+    *      step down to Follower
+    *   1. ''Timeout'' — no majority within the election timeout → start a new
+    *      election with an incremented term
     *
     * @param term
-    *   the election term (incremented from previous term)
+    *   the election term (incremented from the previous term)
     * @param votesReceived
     *   set of node IDs that granted a vote
     */
@@ -92,16 +133,28 @@ enum NodeState:
       votesReceived: ImmutableSet[NodeId] = ImmutableSet.empty
   )
 
-  /** Leader state: authoritative node that replicates log entries to followers.
-    * Maintains per-follower replication progress (`nextIndex`, `matchIndex`)
-    * and tracks the highest committed log index.
+  /** Leader state — the authoritative node managing the cluster (§5.3).
+    *
+    * Upon election the Leader initializes `nextIndex` for every follower to
+    * `lastLogIndex + 1` and `matchIndex` to 0 (the "optimistic start"). It then
+    * sends heartbeats at a fixed interval to prevent election timeouts, and
+    * replicates client commands via `AppendEntries` RPCs.
+    *
+    * The Leader advances `commitIndex` when an entry has been replicated to a
+    * majority ''and'' the entry's term equals the Leader's current term (the
+    * ''Leader Completeness Property'', §5.4). This term check prevents the
+    * scenario illustrated in Figure 8 of the Raft paper, where a leader commits
+    * entries from a previous term that could be overwritten.
+    *
+    * The Leader never deletes or overwrites entries in its own log — it only
+    * appends. It is the single source of truth for the replicated log.
     *
     * @param term
-    *   the term in which this node became leader
+    *   the term in which this node was elected leader
     * @param nextIndex
-    *   for each follower, the next log index to send
+    *   per-follower map: next log index to send to each follower
     * @param matchIndex
-    *   for each follower, the highest log index known to be replicated
+    *   per-follower map: highest log index known to be replicated
     * @param commitIndex
     *   the highest log entry index known to be committed
     */
@@ -114,6 +167,11 @@ enum NodeState:
 
 /** Companion for [[NodeState]] providing extension methods for state
   * transitions and role-specific operations.
+  *
+  * State-specific operations (vote counting, majority detection, index
+  * initialization) are implemented as extension methods rather than being
+  * embedded in the enum variants. This keeps the data classes minimal and moves
+  * logic closer to the call site in [[raft.logic.RaftLogic]].
   *
   * @see
   *   [[raft.logic.RaftLogic]] for the functions that produce these transitions

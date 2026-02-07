@@ -9,10 +9,15 @@ import raft.spi.{TimerService, TimerServiceFactory}
 
 /** Default [[TimerService]] implementation backed by Cats Effect.
   *
-  * Provides cancellable timer scheduling via `Fiber` and randomized election
-  * timeouts with 0–50% jitter to prevent split-vote scenarios.
+  * This implementation uses Cats Effect `Fiber`s for cancellable timer
+  * scheduling. When a heartbeat arrives from the leader, the runtime cancels
+  * the outstanding election timer Fiber and starts a new one, effectively
+  * resetting the timeout. This is more efficient than `sleep` + `cancel` loops
+  * because Fiber cancellation is cooperative and non-blocking.
   *
-  * Thread-safety is guaranteed by the `Async` effect type.
+  * Randomized election timeouts use 0–50% jitter (as recommended in §9.3 of the
+  * Raft thesis) to prevent split votes. The jitter is generated using a Cats
+  * Effect `Random` instance for reproducibility in tests.
   *
   * @tparam F
   *   the effect type (requires `Async`)

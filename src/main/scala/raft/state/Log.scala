@@ -3,7 +3,10 @@ package raft.state
 /** Types of log entries in the RAFT log.
   *
   * Each entry in the replicated log is tagged with a type that determines how
-  * the runtime processes it upon commitment.
+  * the runtime processes it upon commitment. The type system distinguishes
+  * between client commands (the primary payload), internal no-op entries used
+  * for leader commitment, and configuration change entries for dynamic
+  * membership (§6).
   *
   * @see
   *   [[Log]] for the entry structure that carries this type
@@ -15,8 +18,17 @@ enum LogType:
   /** A no-op entry appended by a new leader to commit entries from previous
     * terms.
     *
-    * The RAFT protocol requires a leader to commit at least one entry from its
-    * own term before it can safely determine which entries are committed.
+    * Raft's commitment rule (§5.4.2) states that a leader can only commit
+    * entries from its ''own'' term using the majority-replication criterion.
+    * Entries from previous terms are committed indirectly — once the leader's
+    * own entry at a higher index is committed, all preceding entries are
+    * implicitly committed. A freshly elected leader therefore appends a NoOp to
+    * its log immediately, ensuring it can advance `commitIndex` as soon as the
+    * NoOp is replicated to a majority.
+    *
+    * Without NoOp, a leader with no incoming client requests would be unable to
+    * commit entries from earlier terms, which is the scenario depicted in
+    * Figure 8 of the Raft paper.
     */
   case NoOp
 
@@ -29,9 +41,22 @@ enum LogType:
 
 /** A single entry in the RAFT replicated log.
   *
-  * Log entries are the fundamental unit of replication in RAFT. Each entry is
-  * uniquely identified by its `(index, term)` pair and carries either a client
-  * command, a no-op, or a configuration change.
+  * The replicated log is Raft's central data structure (§5.3). It provides two
+  * critical guarantees known as the '''Log Matching Property''':
+  *
+  *   1. If two entries in different logs have the same index and term, they
+  *      store the same command — because a leader creates at most one entry per
+  *      index per term.
+  *   1. If two entries in different logs have the same index and term, then the
+  *      logs are identical in all preceding entries — enforced by the
+  *      `prevLogIndex` / `prevLogTerm` consistency check in `AppendEntries`.
+  *
+  * Together these properties ensure that committed entries are durable and
+  * consistent across all nodes — the foundation of Raft's safety guarantees.
+  *
+  * Each entry carries serialized `data` that the [[raft.spi.StateMachine]]
+  * decodes and applies upon commitment. Entries are applied in strict index
+  * order, providing deterministic state machine replication.
   *
   * @param index
   *   position in the log (1-indexed; 0 means empty)

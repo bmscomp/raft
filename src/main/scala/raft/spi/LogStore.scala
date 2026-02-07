@@ -6,10 +6,15 @@ import raft.state.{Log, LogIndex, Term}
 
 /** Read-only view of the RAFT log.
   *
-  * Separated from write operations to support:
-  *   - Read replicas and follower-only nodes
-  *   - Testing with mock readers
-  *   - Fine-grained access control
+  * The Raft safety proof (§5.2, Figure 2) requires that the log is
+  * ''persistent'': entries that have been written to disk must survive process
+  * crashes and restarts. This trait provides the read side of that contract.
+  *
+  * The `LogReader` / `LogWriter` split follows the Command-Query Separation
+  * principle: read operations are side-effect-free, which allows the library to
+  * call them freely for index lookups, term checks, and range scans without
+  * worrying about unintended mutations. This separation also enables read-only
+  * replicas that receive a `LogReader` but no `LogWriter`.
   *
   * @tparam F
   *   the effect type (e.g., `IO`)

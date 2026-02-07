@@ -6,8 +6,19 @@ import raft.state.NodeState
   *
   * Every function in [[raft.logic.RaftLogic]] returns a `Transition`, pairing
   * the new [[NodeState]] with a list of [[Effect]]s that the runtime must
-  * execute. This ensures that state changes and their resulting side effects
-  * are atomic from the perspective of the pure consensus logic.
+  * execute. This pattern is analogous to the '''Writer monad''' in functional
+  * programming: the pure logic ''writes'' effects to a list alongside the
+  * state, and the runtime ''reads'' and executes them.
+  *
+  * The `(state, effects)` pair is atomic from the perspective of the
+  * [[raft.logic.RaftLogic]] layer — both the state change and all effects
+  * belong to a single logical step. The runtime is then responsible for
+  * executing effects in the correct order (persistence before messaging, for
+  * instance).
+  *
+  * This design also has similarities to '''event sourcing''': the effect list
+  * is a log of events that, when executed, synchronize the real world with the
+  * pure state.
   *
   * @param state
   *   the new node state after the transition

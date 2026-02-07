@@ -2,10 +2,20 @@ package raft.state
 
 /** Volatile state tracked by every RAFT node (not persisted to stable storage).
   *
-  * This state is re-initialized upon restart and is maintained in-memory only.
-  * It tracks the commit and application progress of log entries, which allows
-  * the runtime to determine which committed entries still need to be applied to
-  * the state machine.
+  * The Raft paper (§5.2, Figure 2) distinguishes between ''persistent'' state
+  * (term, votedFor, log — which must survive crashes for safety) and
+  * ''volatile'' state (commitIndex, lastApplied — which can be safely
+  * reconstructed after a restart).
+  *
+  * After a crash, `commitIndex` is reset to 0. The node recovers the true
+  * commit index by receiving `AppendEntries` from the current leader, whose
+  * `leaderCommit` field conveys the cluster-wide commit progress. This is safe
+  * because committed entries are, by definition, stored on a majority and can
+  * never be lost.
+  *
+  * The invariant `lastApplied ≤ commitIndex` always holds, and both values are
+  * monotonically increasing. The gap between them represents entries that are
+  * committed but not yet applied to the state machine.
   *
   * @param commitIndex
   *   the highest log entry index known to be committed (replicated to a

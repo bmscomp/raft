@@ -4,18 +4,21 @@ import raft.state.{NodeId, Log, ClusterConfig}
 
 /** Sealed hierarchy of all RAFT RPC messages and internal timeout events.
   *
-  * Every network interaction and timer event in the protocol is represented as
-  * a case of this enum, guaranteeing exhaustive pattern matching in
-  * [[raft.logic.RaftLogic.onMessage]].
+  * The Raft protocol (§5) defines just two core RPCs — `AppendEntries` and
+  * `RequestVote` — which are sufficient for basic consensus. This minimal
+  * design is one of Raft's key contributions: unlike Paxos, which requires
+  * understanding the interplay of multiple protocol phases, Raft's message set
+  * is small enough to reason about exhaustively.
   *
-  * Messages are grouped into:
-  *   - '''AppendEntries''' — log replication and heartbeats
-  *   - '''RequestVote''' — leader election (including pre-vote)
-  *   - '''InstallSnapshot''' — log compaction transfer
-  *   - '''Leadership Transfer''' — graceful leader handoff
-  *   - '''ReadIndex''' — linearizable read protocol
-  *   - '''Membership Changes''' — dynamic cluster reconfiguration
-  *   - '''Internal Events''' — election and heartbeat timeouts
+  * This library extends the core set with additional messages for production
+  * features: `InstallSnapshot` (§7) for log compaction, `TransferLeadership`
+  * for graceful leader handoff, `ReadIndex` for linearizable reads, and
+  * `AddServer`/`RemoveServer` for dynamic membership changes (§6).
+  *
+  * Internal timeout events (`ElectionTimeout`, `HeartbeatTimeout`) are modeled
+  * as messages rather than external callbacks, so the entire protocol can be
+  * driven through a single `onMessage` dispatcher with exhaustive pattern
+  * matching.
   *
   * @see
   *   [[raft.logic.RaftLogic]] for the pure transition functions that handle
@@ -25,9 +28,17 @@ import raft.state.{NodeId, Log, ClusterConfig}
   */
 enum RaftMessage:
 
-  /** Request from the leader to append log entries to a follower's log.
+  /** Request from the leader to append log entries to a follower's log (§5.3).
     *
-    * Also serves as a heartbeat when `entries` is empty.
+    * This is Raft's most versatile RPC: it serves a dual purpose as both the
+    * '''log replication''' mechanism and the '''heartbeat''' signal. When
+    * `entries` is empty, the RPC acts as a heartbeat that resets the follower's
+    * election timer and conveys the leader's `commitIndex`. When `entries` is
+    * non-empty, it replicates new log entries to the follower.
+    *
+    * The `prevLogIndex` / `prevLogTerm` pair implements the '''consistency
+    * check''' (§5.3): the follower only accepts entries if it has a matching
+    * entry at the given position, ensuring the Log Matching Property.
     *
     * @param term
     *   the leader's current term

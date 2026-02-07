@@ -4,13 +4,22 @@ import raft.state.Log
 
 /** Service Provider Interface for the replicated state machine.
   *
-  * Users implement this trait to define what happens when committed log entries
-  * are applied. The state machine is the ''consumer'' of the RAFT replicated
-  * log: once an entry is committed (replicated to a majority), it is applied to
-  * this state machine in log order.
+  * The '''replicated state machine''' approach (§1) is the fundamental idea
+  * underlying Raft: if a collection of servers all begin in the same initial
+  * state and apply the same deterministic sequence of commands, they will
+  * arrive at the same final state and produce the same outputs. Raft's job is
+  * to ensure that every server applies the same commands in the same order.
   *
-  * Implementations must be deterministic — given the same sequence of log
-  * entries, every node must produce the same state.
+  * Users implement this trait to define ''what'' the cluster manages — a
+  * key-value store, a lock service, a counter, or any domain-specific service.
+  * The state machine is the ''consumer'' of the replicated log: once an entry
+  * is committed (replicated to a majority, §5.3), it is applied to this state
+  * machine in strict log index order.
+  *
+  * '''Determinism is critical.''' Given the same sequence of log entries, every
+  * node must produce the same state. Non-deterministic operations (wall-clock
+  * reads, random values) must be captured in the log entry at proposal time,
+  * not at apply time.
   *
   * @tparam F
   *   the effect type (e.g., `IO`)

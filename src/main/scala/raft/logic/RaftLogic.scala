@@ -10,13 +10,28 @@ import raft.effect.Effect.*
 /** Pure RAFT state transition functions — the deterministic core of the
   * consensus engine.
   *
-  * All functions in this object are pure: they take the current [[NodeState]]
-  * and an incoming [[RaftMessage]], and return a [[Transition]] containing the
-  * new state and a list of [[Effect]]s for the runtime to execute. No I/O is
-  * performed — effects are pure data descriptions.
+  * This object embodies the library's central design principle: '''Functional
+  * Core / Imperative Shell'''. All consensus logic is implemented as pure
+  * functions with no I/O, no mutable state, and no side effects. Each function
+  * takes the current [[NodeState]] and an incoming [[RaftMessage]], and returns
+  * a [[Transition]] containing the new state and a list of [[Effect]]s for the
+  * runtime to execute.
   *
-  * This separation makes the consensus logic fully deterministic and testable:
-  * tests assert on the returned state and effect list without any mocking.
+  * This pure-functional approach yields three concrete benefits:
+  *   1. '''Deterministic testing''' — tests assert on the returned state and
+  *      effect list without mocking clocks, networks, or disks.
+  *   1. '''Formal reasoning''' — the transition functions map directly to the
+  *      Raft TLA+ specification (§5, Figure 2), making it straightforward to
+  *      verify correctness against the paper.
+  *   1. '''Portability''' — the logic is independent of any effect system,
+  *      runtime, or I/O library. Only the runtime shell ([[raft.RaftNode]])
+  *      depends on Cats Effect.
+  *
+  * The key protocol handlers implement the Raft paper's core RPCs:
+  *   - `onAppendEntries` — log replication and heartbeats (§5.3)
+  *   - `onRequestVote` — leader election with optional pre-vote (§5.2, §9.6)
+  *   - `onElectionTimeout` — election initiation (§5.2)
+  *   - `onHeartbeatTimeout` — periodic heartbeat broadcast (§5.2)
   *
   * {{{
   * val follower = NodeState.Follower(term = 1)

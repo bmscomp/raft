@@ -4,13 +4,16 @@ import raft.state.NodeId
 
 /** Observability hook for RAFT protocol events.
   *
-  * Implement this trait to collect metrics from the RAFT consensus engine. Each
-  * callback corresponds to a significant protocol event (elections,
-  * replication, commits, etc.). All methods receive the local node's ID for
-  * correlation in multi-node deployments.
+  * Observability is an '''orthogonal concern''' in this library — the consensus
+  * logic ([[raft.logic.RaftLogic]]) and the runtime ([[raft.RaftNode]])
+  * function correctly regardless of whether metrics are being collected. This
+  * trait provides opt-in hooks for the events that matter most for operational
+  * insight: leadership changes, elections, replication progress, and failures.
   *
-  * A no-op implementation is provided via [[RaftMetrics.noop]] for environments
-  * where metrics collection is not needed.
+  * The '''no-op default''' pattern ([[RaftMetrics.noop]]) ensures that users
+  * pay zero overhead when metrics are not needed. In production,
+  * implementations can forward events to Prometheus, OpenTelemetry, Micrometer,
+  * or any observability backend.
   *
   * @tparam F
   *   the effect type (e.g., `IO`)

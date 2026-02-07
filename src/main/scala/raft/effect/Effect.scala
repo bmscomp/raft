@@ -7,17 +7,23 @@ import scala.concurrent.duration.FiniteDuration
 
 /** Sealed hierarchy of side effects produced by pure RAFT state transitions.
   *
-  * Effects are pure data structures — ''descriptions'' of actions that the
-  * runtime ([[raft.RaftNode]]) interprets and executes. This separation keeps
-  * the consensus logic ([[raft.logic.RaftLogic]]) completely free of I/O,
-  * making it deterministically testable by asserting on the returned
-  * `List[Effect]`.
+  * Effects are the bridge between the pure consensus core and the real world.
+  * Instead of performing I/O directly, [[raft.logic.RaftLogic]] returns a list
+  * of `Effect` values — pure data that ''describes'' what should happen. The
+  * runtime ([[raft.RaftNode]]) then interprets each effect, executing the
+  * actual I/O (network sends, disk writes, timer resets).
+  *
+  * This '''reified effect pattern''' is analogous to a free monad or the Writer
+  * monad pattern: the logic ''writes'' effects to a list, and the runtime
+  * ''reads'' them and acts. The key benefit is testability: unit tests can
+  * inspect the returned `List[Effect]` without mocking any infrastructure.
   *
   * Effects are grouped into categories:
   *   - '''Messaging''' — send/broadcast/pipelining of RPC messages
-  *   - '''Persistence''' — hard-state writes and log mutations
-  *   - '''State Machine''' — applying committed entries and snapshotting
-  *   - '''Timers''' — resetting election and heartbeat timers
+  *   - '''Persistence''' — hard-state writes and log mutations (§5.2
+  *     durability)
+  *   - '''State Machine''' — applying committed entries and snapshotting (§5.3)
+  *   - '''Timers''' — resetting election and heartbeat timers (§5.2)
   *   - '''Leadership''' — leader initialization, transfer, and commit tracking
   *   - '''Linearizable Reads''' — ReadIndex and lease-based read protocols
   *

@@ -7,17 +7,17 @@ import raft.state.{NodeId, Log, LogType}
 
 /** JSON-based [[SimpleMessageCodec]] implementation for the RAFT wire protocol.
   *
-  * Uses a compact, hand-rolled JSON format suitable for debugging and
-  * interoperability. Each message is serialized as a single JSON object with a
-  * `"type"` discriminator field and a protocol version field `"v"` for forward
-  * compatibility.
+  * This codec is intentionally '''hand-rolled''' (no circe, spray-json, or
+  * other JSON library dependency) to keep the library's dependency footprint
+  * minimal. Users who prefer a different serialization format can provide their
+  * own [[SimpleMessageCodec]] or [[MessageCodec]] implementation.
   *
-  * Binary data (log entry payloads, snapshot chunks) is encoded as Base64
+  * Each message is serialized as a single JSON object with a `"type"`
+  * discriminator field and a protocol version field `"v"`. The version field
+  * enables '''forward compatibility''': a receiver can detect and reject
+  * messages from a newer protocol version rather than silently misinterpreting
+  * them. Binary data (log entry payloads, snapshot chunks) is encoded as Base64
   * strings.
-  *
-  * Implements [[SimpleMessageCodec]] with typed [[CodecError]] error hierarchy,
-  * and can be lifted into an effectful [[MessageCodec]] via
-  * [[MessageCodec.fromSimple]].
   *
   * @see
   *   [[MessageCodec.fromSimple]] for lifting into an effectful context

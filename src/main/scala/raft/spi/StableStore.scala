@@ -6,9 +6,19 @@ import raft.state.{NodeId, Term}
 
 /** Stable storage for RAFT hard state (current term and voted-for candidate).
   *
-  * This state ''must be durable'' — it must survive process crashes and
-  * restarts. The RAFT safety proof depends on the guarantee that a node never
-  * forgets its current term or the candidate it voted for.
+  * The Raft paper (§5.2, Figure 2) identifies two values that must be persisted
+  * to stable storage before a node responds to any RPC:
+  *   - '''currentTerm''' — the latest term this node has seen
+  *   - '''votedFor''' — the candidate this node voted for in the current term
+  *
+  * These two values are the minimum '''hard state''' required for safety. If a
+  * node forgets its `currentTerm`, it might regress to a stale term and violate
+  * the Election Safety property. If it forgets `votedFor`, it might grant a
+  * second vote in the same term, allowing two leaders to be elected.
+  *
+  * The "persist before responding" invariant is critical: the node must `fsync`
+  * the hard state to disk ''before'' sending any RPC response, ensuring that
+  * the state survives an immediate crash.
   *
   * @tparam F
   *   the effect type (e.g., `IO`)

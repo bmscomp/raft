@@ -6,12 +6,21 @@ import scala.util.control.NoStackTrace
 
 /** Effectful message codec for encoding and decoding RAFT protocol messages.
   *
-  * Implementations convert between [[RaftMessage]] instances and a wire format
-  * (e.g., JSON strings, Protobuf bytes). The effect type `F[_]` allows codecs
-  * to perform asynchronous or fallible operations during encoding/decoding.
+  * Wire-format agnosticism is a first-class design principle in this library.
+  * The consensus logic ([[raft.logic.RaftLogic]]) works exclusively with
+  * [[RaftMessage]] types; serialization to and from a wire format is an
+  * orthogonal concern delegated to codec implementations. This means the same
+  * Raft cluster can speak JSON, Protobuf, Avro, or any custom format simply by
+  * swapping the codec — no changes to the consensus logic are needed.
   *
-  * The library is wire-format agnostic — users choose the serialization
-  * strategy by providing an appropriate codec to the transport layer.
+  * The codec layer offers two abstractions:
+  *   - '''MessageCodec[F, Wire]''' (this trait) — effectful codecs that can
+  *     perform async I/O or fail within an effect type `F`.
+  *   - '''SimpleMessageCodec[Wire]''' — synchronous codecs that return
+  *     `Either[CodecError, _]`, useful for simple in-memory formats.
+  *
+  * Synchronous codecs can be lifted into any effect type via
+  * [[MessageCodec.fromSimple]], bridging the two abstractions.
   *
   * @tparam F
   *   the effect type (e.g., `IO`, `Either[CodecError, *]`)

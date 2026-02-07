@@ -20,16 +20,25 @@ import raft.effect.Effect as Eff
 import raft.logic.RaftLogic
 import raft.spi.*
 
-/** Event-driven RAFT node runtime.
+/** Event-driven RAFT node runtime — the '''Imperative Shell''' of the
+  * Functional Core / Imperative Shell architecture.
   *
-  * Orchestrates the full lifecycle of a RAFT consensus participant: initializes
-  * from stable storage, runs an event loop that processes incoming messages and
-  * timer events, delegates to [[raft.logic.RaftLogic]] for pure state
-  * transitions, and executes the resulting [[raft.effect.Effect]]s
-  * (persistence, messaging, etc.).
+  * While [[raft.logic.RaftLogic]] contains the pure, deterministic consensus
+  * logic (the ''Functional Core''), this runtime is the ''Imperative Shell''
+  * that connects the pure logic to the real world. It manages the event loop,
+  * reads from stable storage, processes incoming messages, and interprets the
+  * [[raft.effect.Effect]]s produced by the logic layer.
   *
-  * The runtime is fully reactive — no tick-based polling. It reacts only to
-  * network messages and timer callbacks.
+  * The runtime follows a reactive architecture — no tick-based polling. Two
+  * concurrent FS2 streams drive the node:
+  *   1. '''Message stream''' — receives `AppendEntries`, `RequestVote`, and
+  *      other RPCs from peers via the transport layer.
+  *   1. '''Timer stream''' — fires election and heartbeat timeouts at
+  *      configured intervals.
+  *
+  * Both streams feed into a single `processMessage` function that calls
+  * `RaftLogic.onMessage`, collects the resulting `Transition`, atomically
+  * updates the node state, and executes the returned effects in order.
   *
   * @tparam F
   *   the effect type (e.g., `IO`)
