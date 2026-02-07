@@ -21,7 +21,7 @@ class StorageBackedAdaptersSpec
       ]
   ): IO[Unit] =
     val tmpDir = Files.createTempDirectory("raft-adapter-test-")
-    MmapWalEngine.open(tmpDir).flatMap { engine =>
+    MmapWalEngine.open[IO](tmpDir).flatMap { engine =>
       val logStore = StorageBackedLogStore(engine)
       val stableStore = StorageBackedStableStore(engine)
       test(logStore, stableStore).guarantee(

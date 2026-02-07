@@ -14,7 +14,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
       (tmpDir, IO(deleteRecursive(tmpDir)))
     }.flatMap { case (tmpDir, cleanup) =>
       MmapWalEngine
-        .open(tmpDir)
+        .open[IO](tmpDir)
         .map(engine => (engine: StorageEngine[IO], engine.close *> cleanup))
     }
 
@@ -28,7 +28,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-recovery-"))
         // Write entries
-        engine1 <- MmapWalEngine.open(tmpDir)
+        engine1 <- MmapWalEngine.open[IO](tmpDir)
         entries = (1L to 20L).map(i =>
           raft.state.Log.command(i, 1L, s"cmd-$i".getBytes("UTF-8"))
         )
@@ -42,7 +42,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         _ <- engine1.close
 
         // Reopen and verify
-        engine2 <- MmapWalEngine.open(tmpDir)
+        engine2 <- MmapWalEngine.open[IO](tmpDir)
         lastIdx <- engine2.lastLogIndex
         entry1 <- engine2.readEntry(raft.state.LogIndex.unsafeFrom(1))
         entry20 <- engine2.readEntry(raft.state.LogIndex.unsafeFrom(20))
@@ -63,7 +63,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should detect CRC corruption" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-crc-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
         _ <- engine.appendEntries(
           Seq(
             raft.state.Log.command(1, 1L, "test-data".getBytes("UTF-8"))
@@ -81,7 +81,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         }
 
         // Reopen should succeed (index is rebuilt)
-        result <- MmapWalEngine.open(tmpDir).attempt
+        result <- MmapWalEngine.open[IO](tmpDir).attempt
         _ <- IO(deleteRecursive(tmpDir))
       yield
         // The corrupted entry should cause a CRC error during replay
@@ -93,7 +93,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should handle segment with multiple entries after reopen" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-multi-"))
-        engine1 <- MmapWalEngine.open(tmpDir)
+        engine1 <- MmapWalEngine.open[IO](tmpDir)
         // Write entries one at a time to test incremental append
         _ <- engine1.appendEntries(
           Seq(raft.state.Log.command(1, 1L, "a".getBytes))
@@ -106,7 +106,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         )
         _ <- engine1.close
 
-        engine2 <- MmapWalEngine.open(tmpDir)
+        engine2 <- MmapWalEngine.open[IO](tmpDir)
         lastIdx <- engine2.lastLogIndex
         range <- engine2.readRange(
           raft.state.LogIndex.unsafeFrom(1),
@@ -124,7 +124,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should handle hard state with no vote" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-novote-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
         _ <- engine.writeHardState(
           raft.storage.HardState(raft.state.Term.unsafeFrom(7L), None)
         )
@@ -140,7 +140,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should handle truncate-then-append (log conflict resolution)" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-conflict-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
         // Leader writes entries 1-10 in term 1
         _ <- engine.appendEntries(
           (1L to 10L).map(i =>
@@ -172,7 +172,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should persist and load snapshots with data integrity" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-snap-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
         snapshotData = "state-machine-snapshot-v1".getBytes("UTF-8")
         snapshot = raft.state.Snapshot[IO](
           lastIncludedIndex = 500L,
@@ -183,7 +183,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         _ <- engine.close
 
         // Reopen and verify snapshot survives
-        engine2 <- MmapWalEngine.open(tmpDir)
+        engine2 <- MmapWalEngine.open[IO](tmpDir)
         loaded <- engine2.loadSnapshot
         loadedData <- loaded
           .map(_.data.compile.to(Array))
@@ -201,7 +201,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should work with Resource-based lifecycle" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-resource-"))
-        _ <- MmapWalEngine.resource(tmpDir).use { engine =>
+        _ <- MmapWalEngine.resource[IO](tmpDir).use { engine =>
           for
             _ <- engine.appendEntries(
               (1L to 5L)
@@ -216,7 +216,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
           yield ()
         }
         // Resource should have closed the engine — reopen to verify data
-        engine2 <- MmapWalEngine.open(tmpDir)
+        engine2 <- MmapWalEngine.open[IO](tmpDir)
         last <- engine2.lastLogIndex
         hs <- engine2.readHardState
         _ <- engine2.close
@@ -231,19 +231,19 @@ class MmapWalEngineSpec extends StorageEngineSpec:
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-cycles-"))
         // Cycle 1: write entries 1-5
-        e1 <- MmapWalEngine.open(tmpDir)
+        e1 <- MmapWalEngine.open[IO](tmpDir)
         _ <- e1.appendEntries(
           (1L to 5L).map(i => raft.state.Log.command(i, 1L, s"c1-$i".getBytes))
         )
         _ <- e1.close
         // Cycle 2: write entries 6-10
-        e2 <- MmapWalEngine.open(tmpDir)
+        e2 <- MmapWalEngine.open[IO](tmpDir)
         _ <- e2.appendEntries(
           (6L to 10L).map(i => raft.state.Log.command(i, 2L, s"c2-$i".getBytes))
         )
         _ <- e2.close
         // Cycle 3: write entries 11-15
-        e3 <- MmapWalEngine.open(tmpDir)
+        e3 <- MmapWalEngine.open[IO](tmpDir)
         _ <- e3.appendEntries(
           (11L to 15L).map(i =>
             raft.state.Log.command(i, 3L, s"c3-$i".getBytes)
@@ -251,7 +251,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         )
         _ <- e3.close
         // Cycle 4: verify everything
-        e4 <- MmapWalEngine.open(tmpDir)
+        e4 <- MmapWalEngine.open[IO](tmpDir)
         last <- e4.lastLogIndex
         entry1 <- e4.readEntry(raft.state.LogIndex.unsafeFrom(1))
         entry10 <- e4.readEntry(raft.state.LogIndex.unsafeFrom(10))
@@ -269,7 +269,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should append after clear" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-clear-append-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
         _ <- engine.appendEntries(
           (1L to 5L).map(i => raft.state.Log.command(i, 1L, s"old-$i".getBytes))
         )
@@ -293,7 +293,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should handle truncate-all as clear" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-truncateall-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
         _ <- engine.appendEntries(
           (1L to 5L).map(i => raft.state.Log.command(i, 1L, "data".getBytes))
         )
@@ -311,7 +311,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should delete fully obsolete segments on discardBefore" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-compact-del-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
 
         // 1. Initial segment (1..5)
         _ <- engine.appendEntries(
@@ -352,7 +352,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should overwrite snapshot and clean up old files" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-snap-gc-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
 
         snap1 = raft.state.Snapshot[IO](
           lastIncludedIndex = 100L,
@@ -398,7 +398,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
     "should not leave .tmp files after successful snapshot save" in {
       val test = for
         tmpDir <- IO(Files.createTempDirectory("raft-wal-snap-tmp-"))
-        engine <- MmapWalEngine.open(tmpDir)
+        engine <- MmapWalEngine.open[IO](tmpDir)
         snap = raft.state.Snapshot[IO](
           lastIncludedIndex = 50L,
           lastIncludedTerm = 2L,

@@ -1,6 +1,6 @@
 package raft.storage.mmap
 
-import cats.effect.{IO, Ref, Resource}
+import cats.effect.{Async, Ref, Resource}
 import cats.syntax.all.*
 import java.nio.file.{Files as JFiles, Path as JPath}
 import scala.jdk.CollectionConverters.*
@@ -37,71 +37,76 @@ import raft.storage.{HardState, StorageEngine, StorageEngineFactory}
   *     └── snapshot-042000.bin
   * }}}
   *
+  * @tparam F
+  *   the effect type (e.g., `IO`)
   * @see
   *   [[MmapSegment]] for the segment binary format
   * @see
   *   [[raft.storage.StorageEngine]] for the pluggable SPI this implements
   */
-class MmapWalEngine private (
+class MmapWalEngine[F[_]: Async] private (
     dataDir: JPath,
-    activeSegmentRef: Ref[IO, MmapSegment],
-    sealedSegmentsRef: Ref[IO, Vector[(Int, MmapSegment)]],
-    walIndex: Ref[IO, WalIndex],
+    activeSegmentRef: Ref[F, MmapSegment],
+    sealedSegmentsRef: Ref[F, Vector[(Int, MmapSegment)]],
+    walIndex: Ref[F, WalIndex],
     hardState: MmapHardState,
-    nextSegmentId: Ref[IO, Int],
-    activeSegmentId: Ref[IO, Int]
-) extends StorageEngine[IO]:
+    nextSegmentId: Ref[F, Int],
+    activeSegmentId: Ref[F, Int]
+) extends StorageEngine[F]:
 
+  private val F = Async[F]
+  private val fs2Files = Files.forAsync[F]
   private val walDir = dataDir.resolve("wal")
   private val snapshotDir = dataDir.resolve("snapshots")
   private val checkpointPath = dataDir.resolve("index.ckpt")
 
-  def appendEntries(entries: Seq[Log]): IO[Unit] =
-    if entries.isEmpty then IO.unit
+  def appendEntries(entries: Seq[Log]): F[Unit] =
+    if entries.isEmpty then F.unit
     else
       for
         seg <- activeSegmentRef.get
         segId <- activeSegmentId.get
         batchStart = seg.currentWriteOffset
-        results <- IO(seg.appendBatch(entries))
+        results <- F.delay(seg.appendBatch(entries))
         _ <- walIndex.update { idx =>
           results.foreach { (logIdx, offset) => idx.put(logIdx, segId, offset) }
           idx
         }
-        _ <- IO(seg.forceRange(batchStart, seg.currentWriteOffset))
+        _ <- F.delay(seg.forceRange(batchStart, seg.currentWriteOffset))
         _ <- maybeCheckpointIndex
       yield ()
 
-  private def rotateSegment: IO[MmapSegment] =
+  private def rotateSegment: F[MmapSegment] =
     for
       oldSeg <- activeSegmentRef.get
-      _ <- IO(oldSeg.force())
+      _ <- F.delay(oldSeg.force())
       newId <- nextSegmentId.getAndUpdate(_ + 1)
       oldId <- activeSegmentId.getAndSet(newId)
       segPath = segmentPath(newId)
       lastIdx <- walIndex.get.map(_.lastIndex)
-      newSeg <- IO(MmapSegment.create(segPath, lastIdx + 1))
+      newSeg <- F.delay(MmapSegment.create(segPath, lastIdx + 1))
       _ <- sealedSegmentsRef.update(_ :+ (oldId, oldSeg))
       _ <- activeSegmentRef.set(newSeg)
     yield newSeg
 
-  def readEntry(index: LogIndex): IO[Option[Log]] =
+  def readEntry(index: LogIndex): F[Option[Log]] =
     walIndex.get.flatMap { idx =>
       idx.get(index.value) match
         case Some(loc) =>
           findSegment(loc.segmentId).flatMap {
-            case Some(seg) => IO(Some(seg.readEntryUnchecked(loc.fileOffset)))
-            case None      => IO.pure(None)
+            case Some(seg) =>
+              F.delay(Some(seg.readEntryUnchecked(loc.fileOffset)))
+            case None => F.pure(None)
           }
-        case None => IO.pure(None)
+        case None => F.pure(None)
     }
 
-  def readRange(start: LogIndex, end: LogIndex): IO[Vector[Log]] =
+  def readRange(start: LogIndex, end: LogIndex): F[Vector[Log]] =
     walIndex.get.flatMap { idx =>
       val locations = (start.value to end.value).flatMap { i =>
         idx.get(i).map(loc => (i, loc))
       }
-      if locations.isEmpty then IO.pure(Vector.empty)
+      if locations.isEmpty then F.pure(Vector.empty)
       else
         val bySegment = locations.groupBy(_._2.segmentId)
         bySegment.toVector
@@ -117,16 +122,16 @@ class MmapWalEngine private (
           .map(_.sortBy(_.index))
     }
 
-  def lastLogIndex: IO[LogIndex] =
+  def lastLogIndex: F[LogIndex] =
     walIndex.get.map(idx => LogIndex.unsafeFrom(idx.lastIndex))
 
-  def termAt(index: LogIndex): IO[Option[Term]] =
+  def termAt(index: LogIndex): F[Option[Term]] =
     readEntry(index).map(_.map(l => Term.unsafeFrom(l.term)))
 
-  def logIsEmpty: IO[Boolean] =
+  def logIsEmpty: F[Boolean] =
     walIndex.get.map(_.isEmpty)
 
-  def truncateFrom(index: LogIndex): IO[Unit] =
+  def truncateFrom(index: LogIndex): F[Unit] =
     for
       idx <- walIndex.get
       _ <- idx.get(index.value) match
@@ -135,74 +140,61 @@ class MmapWalEngine private (
             segOpt <- findSegment(loc.segmentId)
             _ <- segOpt match
               case Some(seg) =>
-                // Count entries in this segment before the truncation point
                 val newCount = (1L until index.value).count { i =>
                   idx.get(i).exists(_.segmentId == loc.segmentId)
                 }
-                IO(seg.truncateAt(loc.fileOffset, newCount.toLong))
-              case None => IO.unit
+                F.delay(seg.truncateAt(loc.fileOffset, newCount.toLong))
+              case None => F.unit
             _ <- sealedSegmentsRef.update(_.filter(_._1 <= loc.segmentId))
             _ <- walIndex.update { i =>
               i.truncateFrom(index.value)
               i
             }
           yield ()
-        case None => IO.unit
+        case None => F.unit
     yield ()
 
-  def discardBefore(index: LogIndex): IO[Unit] =
+  def discardBefore(index: LogIndex): F[Unit] =
     val splitIndex = index.value
     for
-      // 1. Update index to remove old entries from memory
       _ <- walIndex.update { idx =>
         idx.discardBefore(splitIndex)
         idx
       }
-
-      // 2. Identify and remove obsolete sealed segments
       obsoleteSealed <- sealedSegmentsRef.modify { segments =>
         val (kept, obsolete) = segments.partition { case (_, seg) =>
-          // Keep segment if it contains any entry >= splitIndex
-          // Last index roughly calculated as first + count - 1.
-          // If count=0, lastIndex < firstIndex, which is fine (handled as keep/discard depending on logic).
-          // However, sealed segments shouldn't be empty.
           val lastIndex = seg.firstIndex + seg.currentEntryCount - 1
           lastIndex >= splitIndex
         }
         (kept, obsolete)
       }
-
-      // 3. Delete obsolete sealed segments from disk
       _ <- obsoleteSealed.traverse_ { case (_, seg) =>
-        IO(seg.close()) >> IO(JFiles.deleteIfExists(seg.path))
+        F.delay(seg.close()) >> F.delay(JFiles.deleteIfExists(seg.path))
       }
-
-      // 4. Handle active segment if fully obsolete
       oldActive <- activeSegmentRef.get
-      // If active has entries and they are all < splitIndex, rotate (discard) it.
-      // We check count > 0 to avoid rotating an empty segment we just created.
       lastActiveIndex = oldActive.firstIndex + oldActive.currentEntryCount - 1
       _ <-
         if oldActive.currentEntryCount > 0 && lastActiveIndex < splitIndex then
           for
-            _ <- IO(oldActive.close())
-            _ <- IO(JFiles.deleteIfExists(oldActive.path))
+            _ <- F.delay(oldActive.close())
+            _ <- F.delay(JFiles.deleteIfExists(oldActive.path))
             newId <- nextSegmentId.getAndUpdate(_ + 1)
             _ <- activeSegmentId.set(newId)
-            // Create new active segment starting at splitIndex (aligned with snapshot)
-            newSeg <- IO(MmapSegment.create(segmentPath(newId), splitIndex))
+            newSeg <- F.delay(
+              MmapSegment.create(segmentPath(newId), splitIndex)
+            )
             _ <- activeSegmentRef.set(newSeg)
           yield ()
-        else IO.unit
+        else F.unit
     yield ()
 
-  def clearLog: IO[Unit] =
+  def clearLog: F[Unit] =
     for
       sealedSegs <- sealedSegmentsRef.getAndSet(Vector.empty)
-      _ <- sealedSegs.traverse_ { case (_, seg) => IO(seg.close()) }
+      _ <- sealedSegs.traverse_ { case (_, seg) => F.delay(seg.close()) }
       active <- activeSegmentRef.get
-      _ <- IO(active.close())
-      _ <- IO {
+      _ <- F.delay(active.close())
+      _ <- F.delay {
         if JFiles.exists(walDir) then
           JFiles
             .list(walDir)
@@ -212,7 +204,7 @@ class MmapWalEngine private (
             .foreach(JFiles.delete)
       }
       newId <- nextSegmentId.getAndUpdate(_ + 1)
-      newSeg <- IO(MmapSegment.create(segmentPath(newId), 1L))
+      newSeg <- F.delay(MmapSegment.create(segmentPath(newId), 1L))
       _ <- activeSegmentRef.set(newSeg)
       _ <- walIndex.update { idx =>
         idx.clear()
@@ -220,25 +212,25 @@ class MmapWalEngine private (
       }
     yield ()
 
-  def readHardState: IO[HardState] =
-    IO(hardState.read)
+  def readHardState: F[HardState] =
+    F.delay(hardState.read)
 
-  def writeHardState(state: HardState): IO[Unit] =
-    IO(hardState.write(state))
+  def writeHardState(state: HardState): F[Unit] =
+    F.delay(hardState.write(state))
 
-  def saveSnapshot(snapshot: Snapshot[IO]): IO[Unit] =
+  def saveSnapshot(snapshot: Snapshot[F]): F[Unit] =
     val fileName = s"snapshot-${"%06d".format(snapshot.lastIncludedIndex)}"
     val snapshotPath = snapshotDir.resolve(s"$fileName.bin")
     val tmpPath = snapshotDir.resolve(s"$fileName.tmp")
     val metadata = Chunk.array(serializeMetadata(snapshot))
     val stream = Stream.chunk(metadata) ++ snapshot.data
 
-    IO(JFiles.createDirectories(snapshotDir)) >>
+    F.delay(JFiles.createDirectories(snapshotDir)) >>
       stream
-        .through(Files[IO].writeAll(Path.fromNioPath(tmpPath)))
+        .through(fs2Files.writeAll(Path.fromNioPath(tmpPath)))
         .compile
         .drain >>
-      IO(
+      F.delay(
         JFiles.move(
           tmpPath,
           snapshotPath,
@@ -246,7 +238,7 @@ class MmapWalEngine private (
           java.nio.file.StandardCopyOption.ATOMIC_MOVE
         )
       ) >>
-      IO {
+      F.delay {
         JFiles
           .list(snapshotDir)
           .iterator()
@@ -263,11 +255,11 @@ class MmapWalEngine private (
     * stream is consumed outside the metadata parsing scope, at the cost of
     * opening the file twice.
     */
-  def loadSnapshot: IO[Option[Snapshot[IO]]] =
-    IO(JFiles.exists(snapshotDir)).flatMap { exists =>
-      if !exists then IO.pure(None)
+  def loadSnapshot: F[Option[Snapshot[F]]] =
+    F.delay(JFiles.exists(snapshotDir)).flatMap { exists =>
+      if !exists then F.pure(None)
       else
-        IO {
+        F.delay {
           JFiles
             .list(snapshotDir)
             .iterator()
@@ -279,10 +271,10 @@ class MmapWalEngine private (
         }.flatMap {
           case Some(path) =>
             val nioPath = Path.fromNioPath(path)
-            Files[IO]
+            fs2Files
               .readAll(nioPath)
               .pull
-              .unconsN(16, allowFewer = false) // Index(8) + Term(8)
+              .unconsN(16, allowFewer = false)
               .flatMap {
                 case Some((metaChunk, rest)) =>
                   val buf = metaChunk.toByteBuffer
@@ -300,9 +292,8 @@ class MmapWalEngine private (
                               val config =
                                 deserializeConfig(configChunk.toArray)
                               val dataOffset = 16L + 4L + configLen
-                              // Create a fresh stream for data that opens the file when run
                               val dataStream =
-                                Files[IO].readAll(nioPath).drop(dataOffset)
+                                fs2Files.readAll(nioPath).drop(dataOffset)
                               fs2.Pull.output1(
                                 Snapshot(
                                   lastIndex,
@@ -312,7 +303,7 @@ class MmapWalEngine private (
                                 )
                               )
                             case None =>
-                              fs2.Pull.raiseError[IO](
+                              fs2.Pull.raiseError[F](
                                 new RuntimeException(
                                   "Truncated snapshot config"
                                 )
@@ -321,28 +312,28 @@ class MmapWalEngine private (
                       else
                         val dataOffset = 16L + 4L
                         val dataStream =
-                          Files[IO].readAll(nioPath).drop(dataOffset)
+                          fs2Files.readAll(nioPath).drop(dataOffset)
                         fs2.Pull.output1(
                           Snapshot(lastIndex, lastTerm, dataStream, None)
                         )
                     case None =>
-                      fs2.Pull.raiseError[IO](
+                      fs2.Pull.raiseError[F](
                         new RuntimeException("Truncated snapshot config length")
                       )
                   }
                 case None =>
-                  fs2.Pull.raiseError[IO](
+                  fs2.Pull.raiseError[F](
                     new RuntimeException("Truncated snapshot metadata")
                   )
               }
               .stream
               .compile
               .last
-          case None => IO.pure(None)
+          case None => F.pure(None)
         }
     }
 
-  private def findSegment(segmentId: Int): IO[Option[MmapSegment]] =
+  private def findSegment(segmentId: Int): F[Option[MmapSegment]] =
     for
       currentActiveId <- activeSegmentId.get
       result <-
@@ -353,14 +344,14 @@ class MmapWalEngine private (
   private def segmentPath(id: Int): JPath =
     walDir.resolve(s"segment-${"%06d".format(id)}.wal")
 
-  private def maybeCheckpointIndex: IO[Unit] =
+  private def maybeCheckpointIndex: F[Unit] =
     walIndex.get.flatMap { idx =>
       if idx.size % 1000 == 0 && idx.size > 0 then
-        IO(JFiles.write(checkpointPath, idx.serialize))
-      else IO.unit
+        F.delay(JFiles.write(checkpointPath, idx.serialize)).void
+      else F.unit
     }
 
-  private def serializeMetadata(snapshot: Snapshot[IO]): Array[Byte] =
+  private def serializeMetadata(snapshot: Snapshot[F]): Array[Byte] =
     val configBytes =
       snapshot.config.map(serializeConfig).getOrElse(Array.emptyByteArray)
     val buf = java.nio.ByteBuffer.allocate(
@@ -373,7 +364,6 @@ class MmapWalEngine private (
     buf.array()
 
   private def serializeConfig(config: ClusterConfig): Array[Byte] =
-    // Format: "nodeId:role,nodeId:role,..."
     val str = config.members
       .map { case (nodeId, role) =>
         s"${nodeId.value}:${role.ordinal}"
@@ -394,13 +384,13 @@ class MmapWalEngine private (
     ClusterConfig(members)
 
   /** Close all resources (segments, hard state, etc.). */
-  def close: IO[Unit] =
+  def close: F[Unit] =
     for
       sealedSegs <- sealedSegmentsRef.get
-      _ <- sealedSegs.traverse_ { case (_, seg) => IO(seg.close()) }
+      _ <- sealedSegs.traverse_ { case (_, seg) => F.delay(seg.close()) }
       active <- activeSegmentRef.get
-      _ <- IO(active.close())
-      _ <- IO(hardState.close())
+      _ <- F.delay(active.close())
+      _ <- F.delay(hardState.close())
     yield ()
 
 object MmapWalEngine:
@@ -416,19 +406,20 @@ object MmapWalEngine:
     * @return
     *   a fully initialized storage engine
     */
-  def open(dataDir: JPath): IO[MmapWalEngine] =
+  def open[F[_]: Async](dataDir: JPath): F[MmapWalEngine[F]] =
+    val F = Async[F]
     for
-      _ <- IO(JFiles.createDirectories(dataDir.resolve("wal")))
-      _ <- IO(JFiles.createDirectories(dataDir.resolve("snapshots")))
-      hs <- IO(MmapHardState.open(dataDir.resolve("hard_state.bin")))
+      _ <- F.delay(JFiles.createDirectories(dataDir.resolve("wal")))
+      _ <- F.delay(JFiles.createDirectories(dataDir.resolve("snapshots")))
+      hs <- F.delay(MmapHardState.open(dataDir.resolve("hard_state.bin")))
       existingSegments <- discoverSegments(dataDir.resolve("wal"))
       result <-
         if existingSegments.isEmpty then initFresh(dataDir, hs)
         else recoverFromWal(dataDir, hs, existingSegments)
     yield result
 
-  private def discoverSegments(walDir: JPath): IO[List[JPath]] =
-    IO {
+  private def discoverSegments[F[_]: Async](walDir: JPath): F[List[JPath]] =
+    Async[F].delay {
       if JFiles.exists(walDir) then
         JFiles
           .list(walDir)
@@ -440,16 +431,20 @@ object MmapWalEngine:
       else List.empty
     }
 
-  private def initFresh(dataDir: JPath, hs: MmapHardState): IO[MmapWalEngine] =
+  private def initFresh[F[_]: Async](
+      dataDir: JPath,
+      hs: MmapHardState
+  ): F[MmapWalEngine[F]] =
+    val F = Async[F]
     for
-      idx <- Ref.of[IO, WalIndex](new WalIndex)
+      idx <- Ref.of[F, WalIndex](new WalIndex)
       segPath = dataDir.resolve("wal").resolve("segment-000001.wal")
-      activeSeg <- IO(MmapSegment.create(segPath, 1L))
-      activeRef <- Ref.of[IO, MmapSegment](activeSeg)
-      sealedRef <- Ref.of[IO, Vector[(Int, MmapSegment)]](Vector.empty)
-      nextId <- Ref.of[IO, Int](2)
-      activeId <- Ref.of[IO, Int](1)
-    yield new MmapWalEngine(
+      activeSeg <- F.delay(MmapSegment.create(segPath, 1L))
+      activeRef <- Ref.of[F, MmapSegment](activeSeg)
+      sealedRef <- Ref.of[F, Vector[(Int, MmapSegment)]](Vector.empty)
+      nextId <- Ref.of[F, Int](2)
+      activeId <- Ref.of[F, Int](1)
+    yield new MmapWalEngine[F](
       dataDir,
       activeRef,
       sealedRef,
@@ -459,14 +454,15 @@ object MmapWalEngine:
       activeId
     )
 
-  private def recoverFromWal(
+  private def recoverFromWal[F[_]: Async](
       dataDir: JPath,
       hs: MmapHardState,
       segmentPaths: List[JPath]
-  ): IO[MmapWalEngine] =
+  ): F[MmapWalEngine[F]] =
+    val F = Async[F]
     val checkpointPath = dataDir.resolve("index.ckpt")
     for
-      idx <- IO {
+      idx <- F.delay {
         if JFiles.exists(checkpointPath) then
           val bytes = JFiles.readAllBytes(checkpointPath)
           WalIndex.deserialize(bytes)
@@ -475,12 +471,12 @@ object MmapWalEngine:
       segments <- segmentPaths.zipWithIndex.traverse { case (path, i) =>
         val segId = i + 1
         val isLast = i == segmentPaths.size - 1
-        IO(MmapSegment.open(path, readOnly = !isLast)).map(seg => (segId, seg))
+        F.delay(MmapSegment.open(path, readOnly = !isLast))
+          .map(seg => (segId, seg))
       }
       checkpointLastIdx = idx.lastIndex
-      _ <- IO {
+      _ <- F.delay {
         segments.foreach { case (segId, seg) =>
-          // Skip segments whose entries are fully covered by the checkpoint
           val segLastIdx = seg.firstIndex + seg.currentEntryCount - 1
           if segLastIdx > checkpointLastIdx then
             seg.replay { (log, offset) =>
@@ -491,12 +487,12 @@ object MmapWalEngine:
       }
       sealedSegs = segments.init.toVector
       activeEntry = segments.last
-      activeRef <- Ref.of[IO, MmapSegment](activeEntry._2)
-      sealedRef <- Ref.of[IO, Vector[(Int, MmapSegment)]](sealedSegs)
-      idxRef <- Ref.of[IO, WalIndex](idx)
-      nextId <- Ref.of[IO, Int](activeEntry._1 + 1)
-      activeId <- Ref.of[IO, Int](activeEntry._1)
-    yield new MmapWalEngine(
+      activeRef <- Ref.of[F, MmapSegment](activeEntry._2)
+      sealedRef <- Ref.of[F, Vector[(Int, MmapSegment)]](sealedSegs)
+      idxRef <- Ref.of[F, WalIndex](idx)
+      nextId <- Ref.of[F, Int](activeEntry._1 + 1)
+      activeId <- Ref.of[F, Int](activeEntry._1)
+    yield new MmapWalEngine[F](
       dataDir,
       activeRef,
       sealedRef,
@@ -507,10 +503,11 @@ object MmapWalEngine:
     )
 
   /** Resource-based lifecycle for use with `cats.effect.Resource`. */
-  def resource(dataDir: JPath): Resource[IO, MmapWalEngine] =
-    Resource.make(open(dataDir))(_.close)
+  def resource[F[_]: Async](dataDir: JPath): Resource[F, MmapWalEngine[F]] =
+    Resource.make(open[F](dataDir))(_.close)
 
   /** Factory implementation for the [[StorageEngineFactory]] SPI. */
-  def factory: StorageEngineFactory[IO] = new StorageEngineFactory[IO]:
-    def open(dataDir: String): Resource[IO, StorageEngine[IO]] =
-      MmapWalEngine.resource(JPath.of(dataDir)).widen[StorageEngine[IO]]
+  def factory[F[_]: Async]: StorageEngineFactory[F] =
+    new StorageEngineFactory[F]:
+      def open(dataDir: String): Resource[F, StorageEngine[F]] =
+        MmapWalEngine.resource[F](JPath.of(dataDir)).widen[StorageEngine[F]]
