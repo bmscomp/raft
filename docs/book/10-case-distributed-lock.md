@@ -1,30 +1,41 @@
 # Chapter 10: Case Study — Distributed Lock Service
 
-*Mutual exclusion across distributed processes. This case study builds a lock service with TTL-based leases, ownership tracking, and automatic expiration — the same primitives used by Chubby and ZooKeeper.*
+*Mutual exclusion across distributed processes is one of the hardest problems in distributed systems. This case study builds a lock service with TTL-based leases, ownership tracking, automatic expiration, and reentrant acquisition — the same primitives that power Google's Chubby and Apache ZooKeeper. The key insight: a Raft-replicated state machine turns lock management from a distributed problem into a sequential one.*
 
 ---
 
 ## The Problem
 
-Multiple processes need exclusive access to a shared resource — a database migration, a cron job, a cache rebuild. In a single-machine world, you'd use a mutex. Across machines, you need a **distributed lock**.
+Multiple processes running on different machines need **exclusive access** to a shared resource. Think of:
 
-Requirements:
+- A database schema migration that should only run on one node at a time
+- A scheduled job (cron) that shouldn't execute concurrently across replicas
+- A cache rebuild that's expensive and shouldn't be duplicated
+- A coordination point where exactly one process must own a leadership role
 
-| Requirement | Description |
-|-------------|-------------|
-| **Mutual exclusion** | At most one holder per lock at any time |
-| **Deadlock prevention** | Locks auto-expire if the holder crashes |
-| **Reentrance** | Same client can re-acquire its own lock |
-| **Fault tolerance** | Lock state survives individual server failures |
+In a single-process world, you'd use a mutex or semaphore. But across machines, there's no shared memory and no reliable signaling. Worse, processes can crash, networks can partition, and clocks can drift.
+
+Naive distributed locks (like Redis-based locks) have fundamental safety gaps that are well-documented in Martin Kleppmann's critique of Redlock (*"How to do distributed locking"*, 2016). The core issue: without consensus, there's no way to guarantee that two clients don't both believe they hold the lock simultaneously.
+
+With Raft, the lock state is replicated to a majority before any acquisition is confirmed. During a network partition, only the side with a majority can grant locks. On the minority side, lock operations stall — they don't return stale or split-brain results. This is the correctness guarantee you need for production lock services.
+
+### Requirements
+
+| Requirement | Description | Why It Matters |
+|-------------|-------------|---------------|
+| **Mutual exclusion** | At most one holder per lock at any time | The core safety property |
+| **Deadlock prevention** | Locks auto-expire via TTL if the holder crashes | Without this, a crashed holder blocks everyone forever |
+| **Reentrance** | Same client can re-acquire its own lock (extending the lease) | Prevents self-deadlock in recursive or retry scenarios |
+| **Fault tolerance** | Lock state survives individual server failures | Locks are useless if they're lost on crash |
 
 ## Design
 
-The lock service is a Raft state machine where each lock consists of:
+The lock service is a Raft state machine where each named lock is either free or held:
 
 ```scala
 case class LockInfo(
   owner: String,      // client ID holding the lock
-  expiresAt: Long     // epoch milliseconds when the lock expires
+  expiresAt: Long     // epoch milliseconds when the lock auto-expires
 )
 ```
 
@@ -36,6 +47,8 @@ enum LockCommand:
   case Release(lockId: String, clientId: String)
   case Heartbeat(lockId: String, clientId: String)
 ```
+
+The **Heartbeat** command is a lease renewal mechanism. Clients send heartbeats periodically (at intervals shorter than the TTL) to keep their lock alive. If a client crashes or is partitioned away, its heartbeats stop, and the lock expires after the TTL. This is the same pattern used by ZooKeeper session keepalives and Chubby's lease mechanism.
 
 ## Step 1: Command Encoding
 
@@ -59,7 +72,7 @@ object LockCommand:
         Right(Release(lock, client))
       case "HEARTBEAT" :: lock :: client :: Nil =>
         Right(Heartbeat(lock, client))
-      case other => Left(s"Invalid: $other")
+      case other => Left(s"Invalid lock command: $other")
 ```
 
 ## Step 2: The Lock State Machine
@@ -81,7 +94,9 @@ class LockStateMachine[F[_]: Sync: Clock](
         Sync[F].pure(LockResult.Error(err))
 ```
 
-### Lock Acquisition Logic
+### Lock Acquisition: Four Cases
+
+The acquisition logic handles four scenarios in priority order:
 
 ```scala
 private def acquireLock(
@@ -91,27 +106,29 @@ private def acquireLock(
     now <- Clock[F].realTime
     result <- locks.modify { current =>
       current.get(lockId) match
-        // No lock exists → acquire
+        // Case 1: No lock exists → grant immediately
         case None =>
           val info = LockInfo(clientId, now.toMillis + ttl.toMillis)
           (current.updated(lockId, info), LockResult.Acquired)
 
-        // Lock expired → acquire
+        // Case 2: Lock expired → grant (previous holder timed out)
         case Some(lock) if lock.expiresAt <= now.toMillis =>
           val info = LockInfo(clientId, now.toMillis + ttl.toMillis)
           (current.updated(lockId, info), LockResult.Acquired)
 
-        // Same owner → renew (reentrant)
+        // Case 3: Same owner → renew (reentrant acquisition)
         case Some(lock) if lock.owner == clientId =>
           val info = LockInfo(clientId, now.toMillis + ttl.toMillis)
           (current.updated(lockId, info), LockResult.Renewed)
 
-        // Different owner, still valid → deny
+        // Case 4: Different owner, lock still valid → deny
         case Some(lock) =>
           (current, LockResult.Denied(s"Lock held by ${lock.owner}"))
     }
   yield result
 ```
+
+Notice that Case 3 provides **reentrance** — if a client tries to acquire a lock it already holds, the lock is simply renewed rather than denied. This prevents self-deadlocks that can occur when a client's retry logic re-sends an acquire request.
 
 ### Lock Release
 
@@ -128,46 +145,50 @@ private def releaseLock(lockId: String, clientId: String): F[LockResult] =
   }
 ```
 
+Only the lock's owner can release it. Attempts by other clients are denied. Releasing a non-existent lock returns `NotFound` — this is idempotent, which is important because release commands might be retried.
+
+> **Note — Determinism and Clock usage:** You might notice that `acquireLock` calls `Clock[F].realTime`, which reads the system clock — a non-deterministic operation. Strictly speaking, this violates the determinism contract from Chapter 6. In production, you'd encode the timestamp in the log entry data (set by the leader at submission time), so that all nodes use the same timestamp when applying the entry. We use `Clock` here for simplicity, but be aware of this subtlety in production designs.
+
 ## Step 3: Using the Lock
 
 ```scala
 val lockDemo: IO[Unit] = for
   lockFsm <- LockStateMachine[IO]
 
-  // Client-1 acquires a lock on "database-migration"
+  // Client-1 acquires a lock on the database migration
   r1 <- lockFsm.apply(Log.command(1, 1,
     LockCommand.encode(Acquire("db-migration", "client-1", 30.seconds))
   ))
   _ <- IO.println(s"Acquire: $r1")
-  // Acquire: Acquired
+  // → Acquire: Acquired
 
-  // Client-2 tries to acquire the same lock → denied
+  // Client-2 tries the same lock → denied
   r2 <- lockFsm.apply(Log.command(2, 1,
     LockCommand.encode(Acquire("db-migration", "client-2", 30.seconds))
   ))
   _ <- IO.println(s"Client-2 attempt: $r2")
-  // Client-2 attempt: Denied(Lock held by client-1)
+  // → Client-2 attempt: Denied(Lock held by client-1)
 
-  // Client-1 renews via heartbeat
+  // Client-1 sends a heartbeat to extend the lease
   r3 <- lockFsm.apply(Log.command(3, 1,
     LockCommand.encode(Heartbeat("db-migration", "client-1"))
   ))
   _ <- IO.println(s"Heartbeat: $r3")
-  // Heartbeat: Renewed
+  // → Heartbeat: Renewed
 
-  // Client-1 releases
+  // Client-1 releases the lock
   r4 <- lockFsm.apply(Log.command(4, 1,
     LockCommand.encode(Release("db-migration", "client-1"))
   ))
   _ <- IO.println(s"Release: $r4")
-  // Release: Released
+  // → Release: Released
 
   // Now Client-2 can acquire
   r5 <- lockFsm.apply(Log.command(5, 1,
     LockCommand.encode(Acquire("db-migration", "client-2", 30.seconds))
   ))
   _ <- IO.println(s"Client-2 retry: $r5")
-  // Client-2 retry: Acquired
+  // → Client-2 retry: Acquired
 yield ()
 ```
 
@@ -175,27 +196,38 @@ yield ()
 
 ### Lock Holder Crashes
 
-If a client crashes without releasing its lock, the TTL ensures automatic expiration. Other clients can acquire the lock after the TTL expires — no manual intervention needed.
+If a client crashes without releasing its lock, **nothing breaks** — the TTL ensures automatic expiration. After the TTL elapses, the next `Acquire` command finds the lock expired (Case 2 above) and grants it to the new requester. No manual intervention is needed.
+
+In practice, TTLs should be set to a multiple of the expected heartbeat interval. For example, if clients send heartbeats every 5 seconds, a TTL of 30 seconds gives the client 6 missed heartbeats before the lock expires — enough to handle short network hiccups without false expirations.
 
 ### Leader Failure During Acquisition
 
-If the Raft leader fails after the client sends an Acquire but before it's committed, the client should retry. The new leader will either:
-- Have the Acquire in its log (it was replicated to a majority) → the lock is granted
-- Not have the Acquire (it wasn't replicated) → the client retries with the new leader
+If the Raft leader fails after the client sends an Acquire but before it's committed:
+- If the Acquire was replicated to a majority → the new leader has it, and it will be committed
+- If it wasn't replicated → the Acquire is lost, and the client should retry
 
-### Split Brain Prevention
+Raft's safety guarantees ensure that a committed Acquire is never lost. The client should use the standard Raft retry pattern: submit to the leader, wait for acknowledgment, retry with the new leader if the old leader becomes unavailable.
 
-During a network partition, only the side with a majority of Raft nodes can commit new lock operations. The minority side cannot grant or release locks, preventing split-brain scenarios where two clients hold the same lock.
+### Split-Brain Prevention
 
-## Comparison with Other Systems
+During a network partition, only the side with a majority of Raft nodes can commit commands. The minority side **cannot grant or release locks**. This means:
+
+- A lock held by a client on the majority side remains valid
+- A lock held by a client on the minority side will eventually expire (heartbeats can't commit)
+- No two clients ever hold the same lock simultaneously, even during a partition
+
+This is the fundamental advantage over non-consensus lock services like standalone Redis.
+
+## Comparison with Production Lock Services
 
 | Aspect | This Library | Chubby (Google) | ZooKeeper |
 |--------|-------------|-----------------|-----------|
-| **Consensus** | Raft | Paxos | Zab |
-| **Lock model** | TTL-based, explicit release | TTL-based, session-based | Ephemeral znodes |
+| **Consensus** | Raft | Paxos | Zab (Paxos variant) |
+| **Lock model** | TTL leases + explicit release | Session-based leases | Ephemeral znodes |
 | **Failure detection** | TTL expiration | Session keepalive | Session timeout |
 | **Read consistency** | Linearizable via ReadIndex | Linearizable | Sequential (default) |
-| **Implementation** | ~80 lines of Scala | Proprietary | Java |
+| **Implementation size** | ~80 lines of Scala | Proprietary (not open source) | ~100K lines of Java |
+| **Watch/notify** | Not built-in (can be added) | Events on lock state changes | Watches on znodes |
 
 ## Run the Example
 
@@ -205,4 +237,4 @@ sbt "runMain examples.lock.DistributedLockExample"
 
 ---
 
-*Next: [Chapter 11 — Case Study: Replicated Counter](11-case-distributed-counter.md) demonstrates a full cluster simulation with in-memory networking.*
+*Next: [Chapter 11 — Case Study: Replicated Counter](11-case-distributed-counter.md) goes beyond a single state machine and simulates a complete 3-node Raft cluster with in-memory networking, showing how election, replication, and commit work end-to-end.*
