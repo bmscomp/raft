@@ -10,6 +10,14 @@ This directory contains detailed examples demonstrating real-world usage of the 
 | [Lock Service](lock/) | Distributed locks with TTL | Lock ownership, expiration |
 | [Counter](counter/) | Counter with custom codec | `MessageCodec[M]` implementation |
 | [Cluster](cluster/) | 3-node cluster simulation | Leader election, state transitions |
+| [Pre-Vote](protocol/) | Pre-vote election protocol | Two-phase election, term inflation prevention |
+| [Log Matching](protocol/) | Log consistency demonstration | `prevLogIndex`/`prevLogTerm` checks |
+| [Commit Tracking](protocol/) | Commit index advancement | Majority-based commits, `CommitEntries` |
+| [Timer Service](protocol/) | Election and heartbeat timers | `TimerService` SPI, timeout handling |
+| [Distributed Counter](distributed/) | Multi-node counter | Consensus-driven increments |
+| [Raft Transaction](distributed/) | Distributed transactions | Multi-key atomic operations |
+| [Distributed Transaction](distributed/) | Transaction coordinator | Two-phase commit over Raft |
+| [Multi-Group](distributed/) | Multi-Raft groups | `MultiRaftNode`, `GroupEnvelope` |
 
 ---
 
@@ -111,11 +119,23 @@ This example uses `RaftLogic` directly to demonstrate pure state transitions wit
 ## Running All Examples
 
 ```bash
-# Run individual examples
+# Application case studies
 sbt "runMain examples.kvstore.KVStoreExample"
 sbt "runMain examples.lock.DistributedLockExample"
 sbt "runMain examples.counter.CounterWithCodecExample"
 sbt "runMain examples.cluster.ThreeNodeClusterExample"
+
+# Protocol mechanics
+sbt "runMain examples.protocol.PreVoteExample"
+sbt "runMain examples.protocol.LogMatchingExample"
+sbt "runMain examples.protocol.CommitTrackingExample"
+sbt "runMain examples.protocol.TimerServiceExample"
+
+# Distributed systems
+sbt "runMain examples.distributed.DistributedCounterExample"
+sbt "runMain examples.distributed.RaftTransactionExample"
+sbt "runMain examples.distributed.DistributedTransactionExample"
+sbt "runMain examples.distributed.MultiGroupExample"
 ```
 
 ---

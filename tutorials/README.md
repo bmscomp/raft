@@ -52,5 +52,5 @@ The [book's case studies](../docs/book/README.md#part-iv--case-studies) (chapter
 All tutorials reference code that runs with the library's in-memory infrastructure:
 
 ```bash
-sbt test    # 350 tests — verifies all library functionality the tutorials depend on
+sbt test    # 527 tests — verifies all library functionality the tutorials depend on
 ```

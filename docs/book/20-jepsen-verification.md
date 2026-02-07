@@ -411,8 +411,8 @@ Runtime.getRuntime.addShutdownHook(new Thread(() => {
 // Crash recovery (after SIGKILL)
 def recover: IO[RaftNode[IO, MyCommand]] =
   for
-    term     <- stableStore.getCurrentTerm
-    votedFor <- stableStore.getVotedFor
+    term     <- stableStore.currentTerm
+    votedFor <- stableStore.votedFor
     lastIdx  <- logStore.lastIndex
     _        <- IO.println(s"Recovering: term=$term, votedFor=$votedFor, " +
                            s"lastLogIndex=$lastIdx")

@@ -37,8 +37,12 @@ enum NodeState:
 | Request | Response | Purpose |
 |---------|----------|---------|
 | `RequestVoteRequest(term, candidateId, lastLogIndex, lastLogTerm, isPreVote)` | `RequestVoteResponse(term, voteGranted, isPreVote)` | Leader election |
-| `AppendEntriesRequest(term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit)` | `AppendEntriesResponse(term, success, matchIndex, lastLogIndex)` | Log replication + heartbeats |
-| `InstallSnapshotRequest(term, leaderId, lastIncludedIndex, lastIncludedTerm, data)` | `InstallSnapshotResponse(term)` | Snapshot transfer |
+| `AppendEntriesRequest(term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit)` | `AppendEntriesResponse(term, success, matchIndex)` | Log replication + heartbeats |
+| `InstallSnapshotRequest(term, leaderId, lastIncludedIndex, lastIncludedTerm, offset, data, done)` | `InstallSnapshotResponse(term, success)` | Snapshot transfer |
+| `TransferLeadershipRequest(term, target)` | — | Graceful leader handoff |
+| `ReadIndexRequest(requestId)` | `ReadIndexResponse(requestId, success, readIndex)` | Linearizable reads |
+| `AddServerRequest(term, newServer, isLearner)` | `AddServerResponse(term, success, leaderHint)` | Dynamic membership add |
+| `RemoveServerRequest(term, server)` | `RemoveServerResponse(term, success, leaderHint)` | Dynamic membership remove |
 
 ---
 
@@ -182,7 +186,7 @@ case class ClusterConfig(
 |-----------|---------|---------|
 | `Transport[F]` | `send`, `broadcast`, `receive` | Network communication |
 | `LogStore[F]` | `append`, `getRange`, `truncateFrom`, `lastIndex`, `termAt` | Persistent log storage |
-| `StableStore[F]` | `getCurrentTerm`, `setCurrentTerm`, `getVotedFor`, `setVotedFor` | Hard state persistence |
+| `StableStore[F]` | `currentTerm`, `setCurrentTerm`, `votedFor`, `setVotedFor` | Hard state persistence |
 | `StateMachine[F, R]` | `apply`, `snapshot`, `restore` | Application state machine |
 | `TimerService[F]` | `electionTimeouts`, `heartbeatTicks`, `resetElectionTimer`, `resetHeartbeatTimer` | Timer events |
 

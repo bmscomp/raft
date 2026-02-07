@@ -191,11 +191,12 @@ enum RaftMessage:
     leaderId: NodeId,
     lastIncludedIndex: Long,
     lastIncludedTerm: Long,
+    offset: Long,
     data: Array[Byte],
     done: Boolean
   )
 
-  case InstallSnapshotResponse(term: Long)
+  case InstallSnapshotResponse(term: Long, success: Boolean)
 
   // Internal events (not sent over the network)
   case ElectionTimeout        // the election timer fired

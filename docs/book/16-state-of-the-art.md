@@ -232,6 +232,7 @@ A lightweight, modular Java Raft library emphasizing minimalism and clean abstra
 | **Leader election** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Log replication** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Snapshots** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Streaming snapshots** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Pre-Vote** | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Leader stickiness** | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | **Joint consensus** | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ |
@@ -244,9 +245,10 @@ A lightweight, modular Java Raft library emphasizing minimalism and clean abstra
 | **Pipelining** | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
 | **Parallel replication** | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
 | **Multi-Raft Group** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
+| **Property-based tests** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **Jepsen-verified** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
-| **Built-in transport** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ (SPI) |
-| **Built-in storage** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ (SPI) |
+| **Built-in transport** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ (SPI + gRPC) |
+| **Built-in storage** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ (SPI + MmapWAL) |
 
 ---
 

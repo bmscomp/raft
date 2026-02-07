@@ -117,7 +117,7 @@ sbt "runMain examples.distributed.DistributedTransactionExample"
 sbt "runMain examples.distributed.MultiGroupExample"
 ```
 
-Run the test suite (350 tests, completes in seconds):
+Run the test suite (527 tests, completes in seconds):
 
 ```bash
 sbt test

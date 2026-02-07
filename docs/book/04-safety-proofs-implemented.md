@@ -27,22 +27,37 @@ This is the most fundamental safety property. If two leaders exist in the same t
 
 ### How the Code Enforces It
 
-Election Safety rests on three interlocking mechanisms:
+Election Safety rests on four interlocking mechanisms:
 
-**1. A node votes at most once per term**
+**1. Stale-term vote requests are rejected immediately**
 
 ```scala
-// RaftLogic.onRequestVote — line 271
+// RaftLogic.onRequestVote — lines 273-286
+if req.term < state.term && !req.isPreVote then
+  val response =
+    RequestVoteResponse(state.term, voteGranted = false, req.isPreVote)
+  return Transition.withEffect(
+    state,
+    SendMessage(req.candidateId, response)
+  )
+```
+
+Before any other checks, the code rejects vote requests from candidates in a lower term (Raft §5.1). Without this guard, a follower could incorrectly grant a vote to a stale candidate, potentially violating the one-leader-per-term invariant. Pre-vote requests are exempt because they don't bind the voter.
+
+**2. A node votes at most once per term**
+
+```scala
+// RaftLogic.onRequestVote — line 276
 case f: Follower =>
   val canVote = f.votedFor.isEmpty || f.votedFor.contains(req.candidateId)
 ```
 
 The `canVote` guard ensures a follower with `votedFor = Some(nodeA)` will reject a vote request from `nodeB` in the same term. The only way to vote again is to advance to a higher term (which resets `votedFor` to `None`).
 
-**2. The vote is persisted before responding**
+**3. The vote is persisted before responding**
 
 ```scala
-// RaftLogic.onRequestVote — lines 291-292
+// RaftLogic.onRequestVote — lines 296-297
 val effects = List(
   SendMessage(req.candidateId, response)
 ) ++ (if req.isPreVote then Nil
@@ -51,7 +66,7 @@ val effects = List(
 
 The `PersistHardState` effect appears alongside the `SendMessage` effect. The runtime executes persistence *before* sending the response. If the node crashes between persisting and responding, it will recover with `votedFor` set — preventing a duplicate vote after restart.
 
-**3. A candidate needs a strict majority**
+**4. A candidate needs a strict majority**
 
 ```scala
 // RaftLogic.onVoteResponse — line 137
@@ -64,11 +79,12 @@ Since any two majorities in a cluster of size *n* must overlap by at least one n
 ### The Proof Structure
 
 ```
-1. Each node votes at most once per term     (votedFor guard)
-2. Votes are durable across crashes          (PersistHardState before SendMessage)
-3. A leader needs > n/2 votes               (hasMajority check)
-4. Any two majorities share ≥ 1 node        (pigeonhole principle)
-∴ At most one leader per term               □
+1. Stale-term requests are rejected              (early return guard)
+2. Each node votes at most once per term          (votedFor guard)
+3. Votes are durable across crashes               (PersistHardState before SendMessage)
+4. A leader needs > n/2 votes                    (hasMajority check)
+5. Any two majorities share ≥ 1 node             (pigeonhole principle)
+∴ At most one leader per term                    □
 ```
 
 ### How to Test It

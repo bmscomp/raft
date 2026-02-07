@@ -235,16 +235,22 @@ src/main/scala/raft/
 │   ├── MultiRaftNode.scala      # Multi-group coordinator
 │   ├── MultiGroupTransport.scala # FS2 Topic-based multiplexing
 │   └── GroupAwareCodec.scala    # Envelope-aware serialization
+├── storage/
+│   └── mmap/                    # Memory-mapped WAL engine (segments, index, hard state)
+├── compaction/
+│   └── SnapshotTransfer.scala   # Pipelined, ack-based snapshot streaming
 └── RaftNode.scala               # Cats Effect runtime combining logic + SPIs
 ```
 
 ```
-src/test/scala/raft/              # 350 tests across 43 suites
+src/test/scala/raft/              # 527 tests across 50+ suites
 ├── logic/                        # Unit tests for every protocol path
 ├── state/                        # State type tests (ClusterConfig, etc.)
 ├── integration/                  # Multi-node integration tests
 ├── chaos/                        # Adversarial network/timing scenarios
 ├── property/                     # Property-based safety invariants
+├── benchmark/                    # Election, recovery, and multi-raft benchmarks
+├── storage/                      # WAL engine and storage adapter tests
 └── multigroup/                   # Multi-raft group tests
 ```
 
@@ -252,10 +258,10 @@ src/test/scala/raft/              # 350 tests across 43 suites
 
 ## Testing
 
-The pure design makes the test suite fast and deterministic — **350 tests complete in ~1 second**:
+The pure design makes the test suite fast and deterministic — **527 tests complete in ~2 seconds**:
 
 ```bash
-sbt test                              # all 350 tests
+sbt test                              # all 527 tests
 sbt "testOnly *LogicSpec"             # core protocol unit tests
 sbt "testOnly *IntegrationSpec"       # multi-node cluster tests
 sbt "testOnly *ChaosScenarioSpec"     # adversarial network scenarios

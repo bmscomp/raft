@@ -80,7 +80,7 @@ object RaftEventGen:
       success <- Gen.oneOf(true, false)
       idx     <- Gen.choose(0L, 100L)
     yield AppendEntriesResponse(
-      term = term, success = success, matchIndex = idx, lastLogIndex = idx
+      term = term, success = success, matchIndex = idx
     )
 
   def randomEvent(currentTerm: Long): Gen[RaftMessage] =
