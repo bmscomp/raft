@@ -39,6 +39,13 @@ class InMemTransport[F[_]: Async] private (
         case None    => Async[F].unit
     }
 
+  def sendBatch(to: NodeId, msgs: Seq[RaftMessage]): F[Unit] =
+    peers.get.flatMap { p =>
+      p.get(to) match
+        case Some(q) => msgs.traverse_ { msg => q.offer((localId, msg)) }
+        case None    => Async[F].unit
+    }
+
   def broadcast(msg: RaftMessage): F[Unit] =
     peers.get.flatMap { p =>
       p.removed(localId).values.toList.traverse_(_.offer((localId, msg)))

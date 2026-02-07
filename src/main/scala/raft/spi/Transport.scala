@@ -34,6 +34,17 @@ trait Transport[F[_], Wire]:
     */
   def send(to: NodeId, msg: Wire): F[Unit]
 
+  /** Send a batch of wire-format messages to a specific peer node.
+    *
+    * Batching improves throughput by reducing network overhead.
+    *
+    * @param to
+    *   the target node identifier
+    * @param msgs
+    *   the sequence of wire-format payloads to send
+    */
+  def sendBatch(to: NodeId, msgs: Seq[Wire]): F[Unit]
+
   /** Broadcast a wire-format message to all other nodes in the cluster.
     *
     * @param msg
@@ -127,6 +138,9 @@ object Transport:
       def send(to: NodeId, msg: RaftMessage): F[Unit] =
         underlying.send(to, codec.encode(msg))
 
+      def sendBatch(to: NodeId, msgs: Seq[RaftMessage]): F[Unit] =
+        underlying.sendBatch(to, msgs.map(codec.encode))
+
       def broadcast(msg: RaftMessage): F[Unit] =
         underlying.broadcast(codec.encode(msg))
 
@@ -167,6 +181,10 @@ object Transport:
         import cats.syntax.all.*
         codec.encode(msg).flatMap(w => underlying.send(to, w))
 
+      def sendBatch(to: NodeId, msgs: Seq[RaftMessage]): F[Unit] =
+        import cats.syntax.all.*
+        msgs.traverse(codec.encode).flatMap(ws => underlying.sendBatch(to, ws))
+
       def broadcast(msg: RaftMessage): F[Unit] =
         import cats.syntax.all.*
         codec.encode(msg).flatMap(underlying.broadcast)
@@ -205,6 +223,15 @@ trait RaftTransport[F[_]]:
     *   the RAFT protocol message to send
     */
   def send(to: NodeId, msg: RaftMessage): F[Unit]
+
+  /** Send a batch of RAFT messages to a specific peer.
+    *
+    * @param to
+    *   the target node identifier
+    * @param msgs
+    *   the sequence of RAFT messages to send
+    */
+  def sendBatch(to: NodeId, msgs: Seq[RaftMessage]): F[Unit]
 
   /** Broadcast a RAFT message to all other nodes in the cluster.
     *
