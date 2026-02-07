@@ -19,6 +19,10 @@ lazy val root = project
       "-unchecked"
     ),
 
+    // Exclude Jepsen-tagged tests from `sbt test`
+    Test / testOptions += Tests
+      .Argument(TestFrameworks.ScalaTest, "-l", "Jepsen"),
+
     // Dependencies
     libraryDependencies ++= Seq(
       // Effect system
@@ -45,3 +49,9 @@ lazy val root = project
       "org.typelevel" %% "cats-effect-testing-scalatest" % "1.7.0" % Test
     )
   )
+
+// Run only Jepsen verification tests: `sbt jepsen`
+addCommandAlias(
+  "jepsen",
+  """set Test / testOptions := Seq(Tests.Argument(TestFrameworks.ScalaTest, "-n", "Jepsen")); test"""
+)
