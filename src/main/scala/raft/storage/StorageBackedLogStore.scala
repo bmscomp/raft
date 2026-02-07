@@ -36,5 +36,8 @@ class StorageBackedLogStore[F[_]](engine: StorageEngine[F]) extends LogStore[F]:
   def truncateFrom(index: LogIndex): F[Unit] =
     engine.truncateFrom(index)
 
+  def discardBefore(index: LogIndex): F[Unit] =
+    engine.discardBefore(index)
+
   def clear: F[Unit] =
     engine.clearLog

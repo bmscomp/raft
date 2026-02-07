@@ -148,6 +148,52 @@ class MmapWalEngine private (
         case None => IO.unit
     yield ()
 
+  def discardBefore(index: LogIndex): IO[Unit] =
+    val splitIndex = index.value
+    for
+      // 1. Update index to remove old entries from memory
+      _ <- walIndex.update { idx =>
+        idx.discardBefore(splitIndex)
+        idx
+      }
+
+      // 2. Identify and remove obsolete sealed segments
+      obsoleteSealed <- sealedSegmentsRef.modify { segments =>
+        val (kept, obsolete) = segments.partition { case (_, seg) =>
+          // Keep segment if it contains any entry >= splitIndex
+          // Last index roughly calculated as first + count - 1.
+          // If count=0, lastIndex < firstIndex, which is fine (handled as keep/discard depending on logic).
+          // However, sealed segments shouldn't be empty.
+          val lastIndex = seg.firstIndex + seg.currentEntryCount - 1
+          lastIndex >= splitIndex
+        }
+        (kept, obsolete)
+      }
+
+      // 3. Delete obsolete sealed segments from disk
+      _ <- obsoleteSealed.traverse_ { case (_, seg) =>
+        IO(seg.close()) >> IO(Files.deleteIfExists(seg.path))
+      }
+
+      // 4. Handle active segment if fully obsolete
+      oldActive <- activeSegmentRef.get
+      // If active has entries and they are all < splitIndex, rotate (discard) it.
+      // We check count > 0 to avoid rotating an empty segment we just created.
+      lastActiveIndex = oldActive.firstIndex + oldActive.currentEntryCount - 1
+      _ <-
+        if oldActive.currentEntryCount > 0 && lastActiveIndex < splitIndex then
+          for
+            _ <- IO(oldActive.close())
+            _ <- IO(Files.deleteIfExists(oldActive.path))
+            newId <- nextSegmentId.getAndUpdate(_ + 1)
+            _ <- activeSegmentId.set(newId)
+            // Create new active segment starting at splitIndex (aligned with snapshot)
+            newSeg <- IO(MmapSegment.create(segmentPath(newId), splitIndex))
+            _ <- activeSegmentRef.set(newSeg)
+          yield ()
+        else IO.unit
+    yield ()
+
   def clearLog: IO[Unit] =
     for
       sealedSegs <- sealedSegmentsRef.getAndSet(Vector.empty)

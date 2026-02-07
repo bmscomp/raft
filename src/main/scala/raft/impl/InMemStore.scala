@@ -55,6 +55,9 @@ class InMemLogStore[F[_]: Async] private (
   def truncateFrom(index: LogIndex): F[Unit] =
     logs.update(_.filter(_.index < index.value))
 
+  def discardBefore(index: LogIndex): F[Unit] =
+    logs.update(_.filter(_.index >= index.value))
+
   def clear: F[Unit] =
     logs.set(Vector.empty)
 

@@ -98,6 +98,24 @@ class StorageBackedAdaptersSpec
         empty <- logStore.isEmpty
       yield empty shouldBe true
     }
+
+    "should support discardBefore (compaction)" in withAdapters {
+      (logStore, _) =>
+        for
+          _ <- logStore.append((1L to 10L).map(i => mkLog(i, 1L)))
+          // Compact everything strictly before index 6 (i.e., keep 6..10)
+          _ <- logStore.discardBefore(LogIndex.unsafeFrom(6))
+
+          last <- logStore.lastIndex
+          e1 <- logStore.get(LogIndex.unsafeFrom(1))
+          e5 <- logStore.get(LogIndex.unsafeFrom(5))
+          e6 <- logStore.get(LogIndex.unsafeFrom(6))
+        yield
+          last shouldBe LogIndex.unsafeFrom(10)
+          e1 shouldBe None
+          e5 shouldBe None
+          e6 shouldBe defined
+    }
   }
 
   "StorageBackedStableStore" - {

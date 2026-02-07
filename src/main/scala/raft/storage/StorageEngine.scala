@@ -100,6 +100,19 @@ trait StorageEngine[F[_]]:
     */
   def truncateFrom(index: LogIndex): F[Unit]
 
+  /** Remove all entries before the given index (exclusive).
+    *
+    * Used for log compaction/garbage collection. Implementations should delete
+    * or archive old segments that beneficial to reclaim space. The index
+    * provided is typically the `lastIncludedIndex` of a newly installed
+    * snapshot.
+    *
+    * @param index
+    *   the index up to which logs can be discarded (entries with index <
+    *   `index` are removed)
+    */
+  def discardBefore(index: LogIndex): F[Unit]
+
   /** Remove all entries from the log (e.g., during snapshot restore). */
   def clearLog: F[Unit]
 

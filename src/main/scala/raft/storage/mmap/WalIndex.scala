@@ -48,6 +48,24 @@ class WalIndex:
   /** Whether the index contains no entries. */
   def isEmpty: Boolean = index.isEmpty
 
+  /** Remove all entries before the given index (exclusive).
+    *
+    * @param toIndex
+    *   the index up to which entries are removed (entries with index <
+    *   `toIndex` are discarded)
+    */
+  def discardBefore(toIndex: Long): Unit =
+    val toRemove = index.keys.filter(_ < toIndex).toList
+    toRemove.foreach(index.remove)
+    // lastIdx remains unchanged unless empty? No, lastIdx is max key.
+    // If we remove everything, lastIdx should update?
+    // Actually, raft state maintains "lastIncludedIndex" in snapshot, so WAL
+    // might become empty but logically index > 0.
+    // But WalIndex tracks physical locations. If empty, lastIdx=0 is correct for *this structure*,
+    // but MmapWalEngine.lastLogIndex handles the snapshot offset.
+    if index.isEmpty then lastIdx = 0L
+    // If not empty, lastIdx is still the max key, which didn't change (we removed prefix).
+
   /** Remove all entries at or after the given index.
     *
     * @param fromIndex

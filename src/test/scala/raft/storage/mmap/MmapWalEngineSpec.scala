@@ -303,4 +303,45 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         last shouldBe raft.state.LogIndex.Zero
       test
     }
+
+    "should delete fully obsolete segments on discardBefore" in {
+      val test = for
+        tmpDir <- IO(Files.createTempDirectory("raft-wal-compact-del-"))
+        engine <- MmapWalEngine.open(tmpDir)
+
+        // 1. Initial segment (1..5)
+        _ <- engine.appendEntries(
+          (1L to 5L).map(i => raft.state.Log.command(i, 1L, "data".getBytes))
+        )
+
+        // Verify segment-000001.wal exists
+        seg1Path = tmpDir.resolve("wal").resolve("segment-000001.wal")
+        _ <- IO(Files.exists(seg1Path) shouldBe true)
+
+        // 2. Discard everything < 6. This obsoletes active segment 1.
+        // Engine should delete seg1 and create seg2 starting at 6.
+        _ <- engine.discardBefore(raft.state.LogIndex.unsafeFrom(6))
+
+        // Verify seg1 gone
+        _ <- IO(Files.exists(seg1Path) shouldBe false)
+
+        // Verify new segment exists (ID 2)
+        seg2Path = tmpDir.resolve("wal").resolve("segment-000002.wal")
+        _ <- IO(Files.exists(seg2Path) shouldBe true)
+
+        // 3. Append 6..10
+        _ <- engine.appendEntries(
+          (6L to 10L).map(i => raft.state.Log.command(i, 2L, "new".getBytes))
+        )
+
+        // Verify we can read 6
+        e6 <- engine.readEntry(raft.state.LogIndex.unsafeFrom(6))
+
+        _ <- engine.close
+        _ <- IO(deleteRecursive(tmpDir))
+      yield
+        e6 shouldBe defined
+        e6.get.term shouldBe 2L
+      test
+    }
   }
