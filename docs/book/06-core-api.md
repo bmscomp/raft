@@ -1,4 +1,4 @@
-# Chapter 5: Core API
+# Chapter 6: Core API
 
 *This chapter is a complete tour of the library's public API — the types, functions, and data structures you'll work with when building distributed systems. Think of it as the reference companion to the conceptual material in Chapters 2–4. Each section connects back to the protocol concepts we've covered, so you'll see how theory maps to code.*
 
@@ -395,4 +395,4 @@ Here's the complete API surface at a glance:
 
 ---
 
-*Next: [Chapter 6 — The SPI Layer](06-spi-layer.md) covers the four interfaces you implement to connect the pure protocol logic to your infrastructure: Transport, LogStore, StableStore, and StateMachine.*
+*Next: [Chapter 7 — The SPI Layer](07-spi-layer.md) covers the four interfaces you implement to connect the pure protocol logic to your infrastructure: Transport, LogStore, StableStore, and StateMachine.*

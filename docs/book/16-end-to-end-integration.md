@@ -1,4 +1,4 @@
-# Chapter 15: End-to-End Integration with RaftNode
+# Chapter 16: End-to-End Integration with RaftNode
 
 *The previous chapters built your understanding from pure functions to complete applications. This chapter shows how to wire everything together using `RaftNode[F, M]` — the library's ready-made runtime that combines the pure protocol logic with real SPI implementations into a running Raft cluster.*
 
@@ -135,7 +135,7 @@ For production, you need a real network transport. Common choices:
 | **HTTP/2** | Simple, widely supported | Overhead for high-frequency messages |
 | **TCP sockets** | Lowest latency, full control | Must handle framing, reconnection |
 
-Key requirements from the `Transport[F]` SPI (see [Chapter 6](06-spi-layer.md)):
+Key requirements from the `Transport[F]` SPI (see [Chapter 7](07-spi-layer.md)):
 - Messages must be delivered **in order** between any two nodes
 - The transport must handle reconnection transparently
 - Broadcast should be concurrent (don't let a slow node block others)
@@ -218,10 +218,10 @@ flowchart TB
 
 For WAN deployments, consider:
 - **Higher election timeouts** (2–5 seconds) to avoid flaky elections across data centers
-- **Pipelining** to overlap round-trips (see [Chapter 8](08-log-replication-practice.md))
+- **Pipelining** to overlap round-trips (see [Chapter 9](09-log-replication-practice.md))
 - **Lease-based reads** at followers to distribute read load (see [Chapter 3](03-raft-advanced-theory.md))
 - **Learner nodes** in remote data centers for read replicas without affecting write quorum
 
 ---
 
-*Next: [Chapter 16 — Property-Based Testing](16-property-based-testing.md) shows how to express Raft's safety invariants as ScalaCheck properties and verify them with random message schedules.*
+*Next: [Chapter 17 — Property-Based Testing](17-property-based-testing.md) shows how to express Raft's safety invariants as ScalaCheck properties and verify them with random message schedules.*

@@ -1,4 +1,4 @@
-# Chapter 6: The SPI Layer
+# Chapter 7: The SPI Layer
 
 *The Service Provider Interface (SPI) is the boundary between the pure Raft protocol logic and the messy real world of networks, disks, and clocks. This chapter explains each interface, its contract, the subtle requirements for correctness, and how to implement it. Getting these implementations right is essential — a correct protocol with a buggy transport or a non-durable store is a system waiting to fail.*
 
@@ -393,4 +393,4 @@ val program: Resource[IO, Unit] =
 
 ---
 
-*Next: [Chapter 7 — Getting Started](07-getting-started.md) walks through building your first application with the library — from project setup to a running three-node cluster.*
+*Next: [Chapter 8 — Getting Started](08-getting-started.md) walks through building your first application with the library — from project setup to a running three-node cluster.*

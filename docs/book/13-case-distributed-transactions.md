@@ -1,4 +1,4 @@
-# Chapter 12: Case Study — Distributed Transactions
+# Chapter 13: Case Study — Distributed Transactions
 
 *Multi-key atomic operations are the hardest problem in distributed data stores. This case study builds a transactional store with optimistic concurrency control that guarantees **serializable isolation** — the strongest consistency level — by leveraging Raft's total ordering. The same pattern powers the transaction engines in CockroachDB, TiKV, and Spanner.*
 
@@ -6,7 +6,7 @@
 
 ## The Problem
 
-A key-value store (Chapter 9) lets you read and write individual keys atomically. But real applications need **multi-key atomic operations**:
+A key-value store (Chapter 10) lets you read and write individual keys atomically. But real applications need **multi-key atomic operations**:
 
 - **Bank transfer**: debit account A and credit account B — both updates must succeed or neither does
 - **Conditional update**: increment a counter only if a feature flag is enabled
@@ -327,4 +327,4 @@ sbt "runMain examples.distributed.DistributedTransactionExample"
 
 ---
 
-*Next: [Chapter 13 — State of the Art: Raft Libraries Compared](13-state-of-the-art.md) surveys the major Raft implementations across Go, Rust, Java, and Scala, comparing architectures, feature sets, and trade-offs.*
+*Next: [Chapter 14 — State of the Art: Raft Libraries Compared](14-state-of-the-art.md) surveys the major Raft implementations across Go, Rust, Java, and Scala, comparing architectures, feature sets, and trade-offs.*

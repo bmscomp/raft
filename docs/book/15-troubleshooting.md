@@ -1,4 +1,4 @@
-# Chapter 14: Troubleshooting & Operational Pitfalls
+# Chapter 15: Troubleshooting & Operational Pitfalls
 
 *Production Raft clusters hit failure modes that don't appear in textbooks. This chapter catalogs the most common operational problems, explains why they happen, and provides concrete diagnostic steps. If you're running Raft in production and something goes wrong, start here.*
 
@@ -108,7 +108,7 @@ This should **not** happen with a correct Raft implementation. If it does, the m
 - Verify your `StableStore` persists to durable storage and survives process restarts
 - Verify `PersistHardState` effects are awaited before sending any responses
 - If using lease reads, increase `maxClockSkew` margin or switch to ReadIndex
-- Run the library's property-based safety tests to verify your integration (see [Chapter 16](16-property-based-testing.md))
+- Run the library's property-based safety tests to verify your integration (see [Chapter 17](17-property-based-testing.md))
 
 ---
 
@@ -198,7 +198,7 @@ val newConfig = clusterConfig.beginJointConsensus(
 )
 ```
 
-See [Chapter 3](03-raft-advanced-theory.md) for learner semantics and [Chapter 8](08-log-replication-practice.md) for parallel replication.
+See [Chapter 3](03-raft-advanced-theory.md) for learner semantics and [Chapter 9](09-log-replication-practice.md) for parallel replication.
 
 ---
 
@@ -217,4 +217,4 @@ When debugging a Raft cluster, check these in order:
 
 ---
 
-*Next: [Chapter 15 — End-to-End Integration](15-end-to-end-integration.md) shows how to wire all the SPIs together into a production-ready `RaftNode` runtime.*
+*Next: [Chapter 16 — End-to-End Integration](16-end-to-end-integration.md) shows how to wire all the SPIs together into a production-ready `RaftNode` runtime.*

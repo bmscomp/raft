@@ -1,4 +1,4 @@
-# Chapter 13: State of the Art — Raft Libraries Compared
+# Chapter 14: State of the Art — Raft Libraries Compared
 
 *The Raft ecosystem is rich with implementations across Go, Rust, Java, and now Scala. This chapter surveys the major libraries, compares their architectures and feature sets, and helps you choose the right one for your use case. The differences are not just about language — they reflect fundamentally different design philosophies about where the boundary should sit between the library's responsibility and yours.*
 
@@ -65,7 +65,7 @@ This pattern should look familiar — it's the same loop from Chapter 7, express
 
 A more **batteries-included** Raft library designed for rapid embedding. Powers three of HashiCorp's flagship products: Consul (service mesh), Nomad (workload orchestrator), and Vault (secrets management).
 
-**Architecture**: Unlike etcd/raft, HashiCorp Raft provides built-in transport (TCP), log storage (BoltDB), and snapshot management (file-based). You implement a `FSM` (finite state machine) interface — essentially the same as our `StateMachine` SPI from Chapter 6 — and the library handles the rest:
+**Architecture**: Unlike etcd/raft, HashiCorp Raft provides built-in transport (TCP), log storage (BoltDB), and snapshot management (file-based). You implement a `FSM` (finite state machine) interface — essentially the same as our `StateMachine` SPI from Chapter 7 — and the library handles the rest:
 
 ```go
 // HashiCorp Raft — user implements this interface
@@ -337,5 +337,5 @@ The Raft ecosystem offers strong options for every language and architectural pr
 
 ---
 
-*This concludes Part V. Continue to [Chapter 14 — Troubleshooting & Operational Pitfalls](14-troubleshooting.md) for production diagnostics and common failure mode solutions, or jump to [Appendix A — Quick Reference](appendix-a-quick-reference.md) for a one-page lookup of all library types and APIs.*
+*This concludes Part V. Continue to [Chapter 15 — Troubleshooting & Operational Pitfalls](15-troubleshooting.md) for production diagnostics and common failure mode solutions, or jump to [Appendix A — Quick Reference](appendix-a-quick-reference.md) for a one-page lookup of all library types and APIs.*
 

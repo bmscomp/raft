@@ -1,4 +1,4 @@
-# Chapter 7: Getting Started
+# Chapter 8: Getting Started
 
 *This chapter takes you from zero to a working Raft election in under 50 lines of code. No networking, no threads, no server processes — just pure function calls. By the end, you'll have built a complete event loop and understand how to test any Raft scenario.*
 
@@ -208,7 +208,7 @@ def executeEffects(
   }
 ```
 
-> **Note — Effect ordering:** The `traverse_` function processes effects in order. This is important because the protocol logic emits `PersistHardState` effects before `Broadcast` and `SendMessage` effects. Executing them in order ensures that the node persists its state before sending messages — which is required for crash safety (see Chapter 6).
+> **Note — Effect ordering:** The `traverse_` function processes effects in order. This is important because the protocol logic emits `PersistHardState` effects before `Broadcast` and `SendMessage` effects. Executing them in order ensures that the node persists its state before sending messages — which is required for crash safety (see Chapter 7).
 
 ## Running the Examples
 
@@ -298,4 +298,4 @@ The test suite runs in seconds, not minutes, because there are no real network c
 
 ---
 
-*Next: [Chapter 8 — Log Replication in Practice](08-log-replication-practice.md) covers how data actually flows through the cluster — creating entries, handling conflicts, advancing the commit index, and tuning throughput with batching and pipelining.*
+*Next: [Chapter 9 — Log Replication in Practice](09-log-replication-practice.md) covers how data actually flows through the cluster — creating entries, handling conflicts, advancing the commit index, and tuning throughput with batching and pipelining.*

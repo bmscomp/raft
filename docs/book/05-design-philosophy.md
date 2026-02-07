@@ -1,4 +1,4 @@
-# Chapter 4: Design Philosophy
+# Chapter 5: Design Philosophy
 
 *Most Raft libraries mix protocol logic with networking, disk I/O, and timer management into a single tangled codebase. This library takes a fundamentally different approach — one borrowed from the world of functional programming — that makes it radically easier to test, port, and reason about. If you've ever wondered why testing distributed systems is so painful, this chapter explains the root cause and how to fix it.*
 
@@ -245,4 +245,4 @@ The effect interpreter is **your code**, which means you have total control over
 
 ---
 
-*Next: [Chapter 5 — Core API](05-core-api.md) walks through every type and function in the library's public API, showing how the design philosophy translates into concrete code.*
+*Next: [Chapter 6 — Core API](06-core-api.md) walks through every type and function in the library's public API, showing how the design philosophy translates into concrete code.*

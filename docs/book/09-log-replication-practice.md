@@ -1,4 +1,4 @@
-# Chapter 8: Log Replication in Practice
+# Chapter 9: Log Replication in Practice
 
 *Elections choose a leader; log replication is what the leader does. This chapter shows how data actually flows through the cluster — from client command to committed entry — and how to use batching, pipelining, and parallel replication to achieve high throughput. Every concept maps directly to library APIs you can call.*
 
@@ -341,4 +341,4 @@ These numbers come from running the library's pure functions in a tight loop wit
 
 ---
 
-*Next: [Chapter 9 — Case Study: Distributed Key-Value Store](09-case-distributed-kv.md) builds a complete replicated data store using everything we've covered, from command encoding to linearizable reads and snapshot recovery.*
+*Next: [Chapter 10 — Case Study: Distributed Key-Value Store](10-case-distributed-kv.md) builds a complete replicated data store using everything we've covered, from command encoding to linearizable reads and snapshot recovery.*

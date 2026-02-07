@@ -345,7 +345,7 @@ Follower: installs snapshot, replaces its state machine state
 Leader: → resumes normal AppendEntries from index 1001
 ```
 
-For large state machines, the snapshot data may be too large to fit in a single RPC. In such cases, the leader can send the snapshot in **chunks** (offset-based transfer), with the follower reassembling the chunks and applying the complete snapshot once all chunks arrive. The library supports this via the `PendingSnapshot` data structure (see Chapter 5).
+For large state machines, the snapshot data may be too large to fit in a single RPC. In such cases, the leader can send the snapshot in **chunks** (offset-based transfer), with the follower reassembling the chunks and applying the complete snapshot once all chunks arrive. The library supports this via the `PendingSnapshot` data structure (see Chapter 6).
 
 > **Note — Snapshot triggering**: The Raft paper leaves the policy for when to take snapshots up to the implementation. Common strategies include:
 > - **Size-based**: snapshot when the log exceeds a threshold size (e.g., 10,000 entries)
@@ -397,4 +397,4 @@ For example, a two-datacenter deployment might have 2 full voters in DC-1 and 2 
 
 ---
 
-*Next: [Chapter 4 — Design Philosophy](04-design-philosophy.md) explains how the Functional RAFT Library implements these concepts using pure state transitions and an effects system, achieving testability and portability that imperative implementations struggle to match.*
+*Next: [Chapter 4 — Safety Proofs, Implemented](04-safety-proofs-implemented.md) maps each of Raft's five safety properties to the exact lines of library code that enforce them, with formal proof sketches, test cases, and TLA+ cross-references.*

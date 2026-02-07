@@ -1,4 +1,4 @@
-# Chapter 9: Case Study — Distributed Key-Value Store
+# Chapter 10: Case Study — Distributed Key-Value Store
 
 *The most common application of consensus is a replicated data store that survives server failures and serves consistent reads. This case study builds a complete distributed key-value store from scratch, step by step — from defining the command protocol through linearizable reads and snapshot-based recovery. By the end, you'll have a pattern you can apply to any stateful distributed system.*
 
@@ -126,7 +126,7 @@ Let's examine why each method works correctly:
 
 **`restore`**: Replaces the map atomically with the deserialized snapshot data. After restore, subsequent `apply` calls continue from the entries after the snapshot's last included index.
 
-**Determinism**: This implementation is deterministic — `apply` doesn't use randomness, system clocks, or external I/O. Given the same sequence of log entries, every node produces the same map state. This is the absolute requirement for replicated state machines (Chapter 6).
+**Determinism**: This implementation is deterministic — `apply` doesn't use randomness, system clocks, or external I/O. Given the same sequence of log entries, every node produces the same map state. This is the absolute requirement for replicated state machines (Chapter 7).
 
 > **Note — Performance considerations for production:** An in-memory `Map` works well for moderate data sizes. For data sets exceeding available RAM, consider using an embedded database (RocksDB, LevelDB, LMDB) as the backing store. The `StateMachine` interface is the same — only `apply`, `snapshot`, and `restore` change. RocksDB's native snapshot support makes the `snapshot` method efficient even for large data sets.
 
@@ -295,4 +295,4 @@ The example creates a complete in-memory cluster, sends multiple PUT/GET/DELETE 
 
 ---
 
-*Next: [Chapter 10 — Case Study: Distributed Lock Service](10-case-distributed-lock.md) builds a mutual exclusion service with TTL-based leases — a different kind of state machine that manages ephemeral state.*
+*Next: [Chapter 11 — Case Study: Distributed Lock Service](11-case-distributed-lock.md) builds a mutual exclusion service with TTL-based leases — a different kind of state machine that manages ephemeral state.*
