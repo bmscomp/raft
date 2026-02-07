@@ -114,9 +114,10 @@ Run an example to see the library in action:
 sbt "runMain examples.kvstore.KVStoreExample"
 sbt "runMain examples.cluster.ThreeNodeClusterExample"
 sbt "runMain examples.distributed.DistributedTransactionExample"
+sbt "runMain examples.distributed.MultiGroupExample"
 ```
 
-Run the test suite (333 tests, completes in seconds):
+Run the test suite (350 tests, completes in seconds):
 
 ```bash
 sbt test

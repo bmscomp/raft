@@ -40,6 +40,7 @@ No threads are spawned. No network connections are opened. No disk writes happen
 │   Pre-Vote · Leader Stickiness · Joint Consensus         │
 │   ReadIndex · Lease Reads · Leadership Transfer          │
 │   Batching · Pipelining · Parallel Replication           │
+│   Multi-Raft Groups · Transport Multiplexing             │
 ├──────────────────────────────────────────────────────────┤
 │          Effect ADT — what should happen next            │
 │   SendMessage · Broadcast · PersistHardState             │
@@ -87,6 +88,16 @@ The SPI (Service Provider Interface) layer defines abstract traits for all infra
 | **Batching** | Combine multiple commands into a single AppendEntries RPC — dramatically reduces per-entry overhead |
 | **Pipelining** | Send new AppendEntries requests without waiting for acknowledgments — critical for WAN deployments |
 | **Parallel Replication** | Replicate to all followers concurrently — a slow follower doesn't delay communication with others |
+
+### Multi-Raft Group Support
+
+| Feature | Description |
+|---------|-------------|
+| **MultiRaftNode** | Coordinator managing multiple independent consensus groups on one node — dynamic create/remove lifecycle |
+| **GroupId** | Type-safe opaque group identifiers (zero runtime cost) |
+| **Transport Multiplexing** | FS2 Topic-based multiplexing/demultiplexing — all groups share one connection per node pair |
+| **GroupEnvelope** | Wire-level message wrapper tagging each RPC with its target group for routing |
+| **Per-Group Isolation** | Each group has independent log, stable store, state machine, and timers |
 
 ---
 
@@ -160,7 +171,7 @@ transition.effects.traverse_ {
 
 ## Examples
 
-The library ships with 11 runnable examples covering protocol fundamentals, cluster simulation, and complete applications:
+The library ships with 12 runnable examples covering protocol fundamentals, cluster simulation, and complete applications:
 
 ```bash
 # Protocol mechanics
@@ -179,6 +190,9 @@ sbt "runMain examples.counter.CounterWithCodecExample"
 sbt "runMain examples.distributed.DistributedCounterExample"
 sbt "runMain examples.distributed.RaftTransactionExample"
 sbt "runMain examples.distributed.DistributedTransactionExample"
+
+# Multi-Raft groups
+sbt "runMain examples.distributed.MultiGroupExample"
 ```
 
 ---
@@ -215,48 +229,58 @@ src/main/scala/raft/
 │   └── JsonCodec.scala          # JSON message encoding
 ├── metrics/
 │   └── RaftMetrics.scala        # Observable metrics
+├── multigroup/
+│   ├── GroupEnvelope.scala      # Wire-level group routing wrapper
+│   ├── GroupConfig.scala        # Per-group dependency bundle
+│   ├── MultiRaftNode.scala      # Multi-group coordinator
+│   ├── MultiGroupTransport.scala # FS2 Topic-based multiplexing
+│   └── GroupAwareCodec.scala    # Envelope-aware serialization
 └── RaftNode.scala               # Cats Effect runtime combining logic + SPIs
 ```
 
 ```
-src/test/scala/raft/              # 333 tests across 40 suites
+src/test/scala/raft/              # 350 tests across 43 suites
 ├── logic/                        # Unit tests for every protocol path
 ├── state/                        # State type tests (ClusterConfig, etc.)
 ├── integration/                  # Multi-node integration tests
 ├── chaos/                        # Adversarial network/timing scenarios
-└── property/                     # Property-based safety invariants
+├── property/                     # Property-based safety invariants
+└── multigroup/                   # Multi-raft group tests
 ```
 
 ---
 
 ## Testing
 
-The pure design makes the test suite fast and deterministic — **333 tests complete in ~1 second**:
+The pure design makes the test suite fast and deterministic — **350 tests complete in ~1 second**:
 
 ```bash
-sbt test                              # all 333 tests
+sbt test                              # all 350 tests
 sbt "testOnly *LogicSpec"             # core protocol unit tests
 sbt "testOnly *IntegrationSpec"       # multi-node cluster tests
 sbt "testOnly *ChaosScenarioSpec"     # adversarial network scenarios
 sbt "testOnly *SafetyPropertySpec"    # property-based safety invariants
 sbt "testOnly *ClusterConfigSpec"     # membership change safety
+sbt "testOnly *MultiRaftNodeSpec"     # multi-raft group tests
 ```
 
 ---
 
 ## Documentation
 
-The library includes a comprehensive **13-chapter book** covering both Raft theory and practical implementation:
+The library includes a comprehensive **21-chapter book** covering both Raft theory and practical implementation:
 
 📖 **[Raft: Theory and Practice](docs/book/README.md)**
 
 | Part | Chapters | What You'll Learn |
 |------|----------|-------------------|
-| **I — Foundations** | 1–3 | Consensus theory, Raft protocol, advanced extensions |
-| **II — Architecture** | 4–6 | Pure functional design, Core API, SPI layer |
-| **III — Building** | 7–8 | Setup, event loop, replication, performance tuning |
-| **IV — Case Studies** | 9–12 | KV store, lock service, counter, transactions |
-| **V — Ecosystem** | 13 | Comparison with etcd/raft, tikv/raft-rs, OpenRaft, SOFAJRaft, MicroRaft |
+| **I — Foundations** | 1–4 | Consensus theory, Raft protocol, advanced extensions, safety proofs |
+| **II — Architecture** | 5–7 | Pure functional design, Core API, SPI layer |
+| **III — Building** | 8–11 | Setup, replication, performance tuning, failure modes |
+| **IV — Case Studies** | 12–15 | KV store, lock service, counter, transactions |
+| **V — Ecosystem** | 16 | Comparison with etcd/raft, tikv/raft-rs, OpenRaft, SOFAJRaft, MicroRaft |
+| **VI — Operations** | 17–20 | Troubleshooting, integration, property testing, Jepsen verification |
+| **VII — Scaling** | 21 | Multi-Raft group design, transport multiplexing, partitioning strategies |
 
 ---
 

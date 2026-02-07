@@ -156,24 +156,66 @@ This requires a transport layer that routes messages to the correct group based 
 
 ## How This Library Supports Multi-Raft
 
-This library's pure functional design makes multi-raft natural. Each Raft group is an independent `RaftNode` instance, and you can run many of them in the same process:
+This library provides first-class multi-raft support through the `raft.multigroup` package. The pure functional `RaftLogic` core needed **zero changes** — multi-group support is a coordinator layer above `RaftNode`.
+
+### Core Types
+
+| Type | Purpose |
+|------|--------|
+| `GroupId` | Opaque type for type-safe group identifiers (zero runtime cost) |
+| `GroupEnvelope` | Wire-level wrapper tagging each `RaftMessage` with its target `GroupId` |
+| `GroupConfig[F]` | Per-group dependency bundle (log store, stable store, state machine, timers) |
+| `MultiRaftNode[F]` | Coordinator managing group lifecycle and command routing |
+| `MultiGroupTransport[F]` | FS2 Topic-based transport multiplexing across groups |
+| `GroupAwareCodec` | Envelope-aware serialization wrapping `SimpleMessageCodec` |
+
+### Creating Multiple Groups
 
 ```scala
-// Conceptual sketch — run 100 Raft groups on one node
-val groups: List[RaftNode[IO, MyCommand]] =
-  (0 until 100).toList.map { groupId =>
-    val config = RaftConfig(
-      localId = NodeId(s"node-1-group-$groupId"),
-      // ... configuration
-    )
-    RaftNode.create(config, sharedTransport, logStore(groupId), ...)
-  }
+import raft.state.*
+import raft.multigroup.*
+import raft.impl.*
+import cats.effect.IO
 
-// Start all groups concurrently
-groups.parTraverse_(_.start)
+for
+  // Shared transport multiplexes all groups over one connection per node pair
+  transport <- MultiGroupTransport[IO](
+    localId = NodeId("node-1"),
+    sendEnvelope = env => sendOverNetwork(env)  // your wire-level send
+  )
+
+  // Coordinator manages group lifecycle
+  multi <- MultiRaftNode[IO](NodeId("node-1"), transport)
+
+  // Create independent shards
+  _ <- multi.createGroup(GroupId("shard-0"), shardConfig0)
+  _ <- multi.createGroup(GroupId("shard-1"), shardConfig1)
+
+  // Submit to a specific group
+  _ <- multi.submitToGroup(GroupId("shard-0"), "key=value".getBytes)
+
+  // Query group state
+  state <- multi.getGroupState(GroupId("shard-0"))
+
+  // Dynamic lifecycle
+  _ <- multi.removeGroup(GroupId("shard-1"))
+  groups <- multi.listGroups  // Set(GroupId("shard-0"))
+yield ()
+```
+
+### Transport Multiplexing
+
+The `MultiGroupTransport` uses an FS2 `Topic` for fan-out: incoming `GroupEnvelope` messages are published once and filtered by each per-group subscriber, so only messages for a given group reach its `RaftNode`.
+
+```scala
+// Per-group transport is created automatically
+val groupTransport: RaftTransport[IO] = transport.transportForGroup(GroupId("shard-0"))
+// group transport only sees messages tagged with GroupId("shard-0")
 ```
 
 Because `RaftLogic.onMessage` is a pure function with no global state, there are no concurrency hazards between groups. Each group's state is isolated in its own `Ref[IO, NodeState]`.
+
+> **Run the example:** `sbt "runMain examples.distributed.MultiGroupExample"` demonstrates a sharded key-value store partitioning keys across two independent Raft groups.
 
 ## Resource Sharing Across Groups
 
@@ -181,7 +223,7 @@ Running many groups on one node introduces resource management concerns:
 
 | Resource | Sharing Strategy | Pitfall |
 |----------|-----------------|---------|
-| **Transport** | One TCP connection per node pair, multiplexed | Message ordering must be per-group, not per-connection |
+| **Transport** | One TCP connection per node pair, multiplexed via `GroupEnvelope` | Message ordering must be per-group, not per-connection |
 | **Disk** | Shared WAL with per-group log prefixes | A slow group's `fsync` blocks all groups sharing the disk |
 | **Timers** | Shared timer wheel with per-group deadlines | Too many groups → timer granularity degrades |
 | **CPU** | Cats Effect fiber pool (work-stealing) | A group with expensive `apply` can starve others |
