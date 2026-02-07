@@ -29,7 +29,7 @@ Result: A=400, B=400 — one transfer was lost!
 The key insight is that Raft's log already provides **total ordering**. If we encode each transaction as a single log entry, the state machine applies transactions one at a time, in order. This gives us **serializable isolation** for free.
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────┐
 │                Transaction Flow                          │
 │                                                          │
 │  Client                                                  │
@@ -37,7 +37,7 @@ The key insight is that Raft's log already provides **total ordering**. If we en
 │    ▼                                                     │
 │  Leader                                                  │
 │    │ encode → Log entry                                  │
-│    │ replicate via Raft                                   │
+│    │ replicate via Raft                                  │
 │    ▼                                                     │
 │  Committed!                                              │
 │    │                                                     │
@@ -45,9 +45,9 @@ The key insight is that Raft's log already provides **total ordering**. If we en
 │  StateMachine.apply(log)                                 │
 │    │ decode transaction                                  │
 │    │ validate preconditions (CAS checks)                 │
-│    │ if valid → apply operations → Committed              │
-│    │ if conflict → ConflictDetected                       │
-│    │ if error → Aborted                                   │
+│    │ if valid → apply operations → Committed             │
+│    │ if conflict → ConflictDetected                      │
+│    │ if error → Aborted                                  │
 └─────────────────────────────────────────────────────────┘
 ```
 
