@@ -7,6 +7,7 @@ import raft.message.*
 import raft.spi.StateMachine
 
 import java.nio.charset.StandardCharsets
+import fs2.Stream
 
 /** Example 3: Distributed Counter with Custom Message Codec
   *
@@ -66,11 +67,13 @@ class CounterStateMachine[F[_]: Sync](
 
   def get: F[Long] = counter.get
 
-  def snapshot: F[Array[Byte]] =
-    counter.get.map(n => n.toString.getBytes)
+  def snapshot: F[Stream[F, Byte]] =
+    counter.get.map(n => Stream.emits(n.toString.getBytes).covary[F])
 
-  def restore(data: Array[Byte]): F[Unit] =
-    counter.set(new String(data).toLong)
+  def restore(data: Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap { bytes =>
+      counter.set(new String(bytes).toLong)
+    }
 
 object CounterStateMachine:
   def apply[F[_]: Sync]: F[CounterStateMachine[F]] =

@@ -5,6 +5,7 @@ import cats.effect.std.Queue
 import cats.syntax.all.*
 import java.util.UUID
 import scala.concurrent.duration.*
+import fs2.Stream
 
 import raft.state.*
 import raft.state.NodeState.*
@@ -171,17 +172,24 @@ object RaftTransactionExample extends IOApp.Simple:
     def get(key: String): F[Option[String]] = state.get.map(_.get(key))
     def getAll: F[Map[String, String]] = state.get
     def getLog: F[List[TxnResult]] = txnLog.get
-    def snapshot: F[Array[Byte]] =
-      state.get.map(_.map((k, v) => s"$k=$v").mkString("\n").getBytes)
-    def restore(data: Array[Byte]): F[Unit] = state.set(
-      new String(data)
-        .split("\n")
-        .flatMap(_.split("=", 2) match {
-          case Array(k, v) => Some(k -> v)
-          case _           => None
-        })
-        .toMap
-    )
+    def snapshot: F[Stream[F, Byte]] =
+      state.get.map { s =>
+        Stream
+          .emits(s.map((k, v) => s"$k=$v").mkString("\n").getBytes)
+          .covary[F]
+      }
+    def restore(data: Stream[F, Byte]): F[Unit] =
+      data.compile.to(Array).flatMap { bytes =>
+        state.set(
+          new String(bytes)
+            .split("\n")
+            .flatMap(_.split("=", 2) match {
+              case Array(k, v) => Some(k -> v)
+              case _           => None
+            })
+            .toMap
+        )
+      }
 
   object TransactionalStore:
     def apply[F[_]: Sync]: F[TransactionalStore[F]] =
@@ -284,7 +292,7 @@ object RaftTransactionExample extends IOApp.Simple:
       yield ()
 
     /** Execute effects produced by RaftLogic. */
-    private def executeEffect(effect: raft.effect.Effect): F[Unit] =
+    private def executeEffect(effect: raft.effect.Effect[F]): F[Unit] =
       effect match
         case SendMessage(to, msg) =>
           messageQueue.offer((to, msg))
@@ -309,7 +317,7 @@ object RaftTransactionExample extends IOApp.Simple:
             logs <- logRef.get
             currentCommit <- commitIndexRef.get
             toApply = logs.filter(l =>
-              l.index > currentCommit && l.index <= upToIndex
+              l.index > currentCommit && l.index <= upToIndex.value
             )
             _ <- toApply.traverse_ { entry =>
               stateMachine.apply(entry) *>
@@ -319,7 +327,7 @@ object RaftTransactionExample extends IOApp.Simple:
                   )
                 )
             }
-            _ <- commitIndexRef.set(upToIndex)
+            _ <- commitIndexRef.set(upToIndex.value)
           yield ()
 
         case BecomeLeader =>

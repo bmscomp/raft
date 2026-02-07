@@ -2,6 +2,7 @@ package examples.distributed
 
 import cats.effect.*
 import cats.syntax.all.*
+import fs2.Stream
 
 import raft.state.*
 import raft.impl.{InMemLogStore, InMemStableStore, DefaultTimerService}
@@ -110,20 +111,20 @@ object MultiGroupExample extends IOApp.Simple:
       _ <- IO.println("  MULTI-RAFT GROUP SUMMARY")
       _ <- IO.println("═" * 70)
       _ <- IO.println("""
-   KEY CONCEPTS:
-   
-   1. GroupId identifies each independent consensus group
-   2. MultiRaftNode coordinates multiple RaftNode instances
-   3. MultiGroupTransport multiplexes all groups over shared connections
-   4. GroupEnvelope tags each wire message with its target group
-   5. Each group has independent: log, state machine, timers, elections
-   
-   PRODUCTION PATTERNS (CockroachDB/TiKV):
-   
-   - Data is partitioned into ranges/regions, each = one Raft group
-   - Thousands of groups run on each physical node
-   - Groups can be dynamically created, split, merged, or moved
-   - Heartbeats are coalesced between node pairs for efficiency
+    KEY CONCEPTS:
+    
+    1. GroupId identifies each independent consensus group
+    2. MultiRaftNode coordinates multiple RaftNode instances
+    3. MultiGroupTransport multiplexes all groups over shared connections
+    4. GroupEnvelope tags each wire message with its target group
+    5. Each group has independent: log, state machine, timers, elections
+    
+    PRODUCTION PATTERNS (CockroachDB/TiKV):
+    
+    - Data is partitioned into ranges/regions, each = one Raft group
+    - Thousands of groups run on each physical node
+    - Groups can be dynamically created, split, merged, or moved
+    - Heartbeats are coalesced between node pairs for efficiency
 """)
     yield ()
 
@@ -158,8 +159,8 @@ object MultiGroupExample extends IOApp.Simple:
       stateMachine = new StateMachine[IO, Unit]:
         def apply(log: Log): IO[Unit] =
           IO.println(s"   [$name] Applied: ${String(log.data)}")
-        def snapshot: IO[Array[Byte]] = IO.pure(Array.empty)
-        def restore(data: Array[Byte]): IO[Unit] = IO.unit
+        def snapshot: IO[Stream[IO, Byte]] = IO.pure(Stream.empty)
+        def restore(data: Stream[IO, Byte]): IO[Unit] = data.compile.drain
       ,
       timerService = timerService
     )

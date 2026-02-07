@@ -8,6 +8,7 @@ import raft.spi.StateMachine
 
 import java.nio.charset.StandardCharsets
 import scala.concurrent.duration.*
+import fs2.Stream
 
 /** Example 2: Distributed Lock Service
   *
@@ -151,24 +152,30 @@ class LockStateMachine[F[_]: Sync: Clock](
       }
     yield result
 
-  def snapshot: F[Array[Byte]] =
+  def snapshot: F[Stream[F, Byte]] =
     locks.get.map { m =>
-      m.map { case (k, v) => s"$k:${v.owner}:${v.expiresAt}" }
-        .mkString("\n")
-        .getBytes
+      Stream
+        .emits(
+          m.map { case (k, v) => s"$k:${v.owner}:${v.expiresAt}" }
+            .mkString("\n")
+            .getBytes
+        )
+        .covary[F]
     }
 
-  def restore(data: Array[Byte]): F[Unit] =
-    val entries = new String(data)
-      .split("\n")
-      .flatMap { line =>
-        line.split(":") match
-          case Array(lockId, owner, expiresAt) =>
-            Some(lockId -> LockInfo(owner, expiresAt.toLong))
-          case _ => None
-      }
-      .toMap
-    locks.set(entries)
+  def restore(data: Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap { bytes =>
+      val entries = new String(bytes)
+        .split("\n")
+        .flatMap { line =>
+          line.split(":") match
+            case Array(lockId, owner, expiresAt) =>
+              Some(lockId -> LockInfo(owner, expiresAt.toLong))
+            case _ => None
+        }
+        .toMap
+      locks.set(entries)
+    }
 
   // For queries
   def isLocked(lockId: String): F[Boolean] =

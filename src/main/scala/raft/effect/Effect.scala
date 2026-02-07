@@ -1,7 +1,8 @@
 package raft.effect
 
-import raft.state.{NodeId, Log}
+import raft.state.{NodeId, Log, LogIndex}
 import raft.message.RaftMessage
+import raft.state.Snapshot
 
 import scala.concurrent.duration.FiniteDuration
 
@@ -13,272 +14,119 @@ import scala.concurrent.duration.FiniteDuration
   * runtime ([[raft.RaftNode]]) then interprets each effect, executing the
   * actual I/O (network sends, disk writes, timer resets).
   *
-  * This '''reified effect pattern''' is analogous to a free monad or the Writer
-  * monad pattern: the logic ''writes'' effects to a list, and the runtime
-  * ''reads'' them and acts. The key benefit is testability: unit tests can
-  * inspect the returned `List[Effect]` without mocking any infrastructure.
-  *
-  * Effects are grouped into categories:
-  *   - '''Messaging''' — send/broadcast/pipelining of RPC messages
-  *   - '''Persistence''' — hard-state writes and log mutations (§5.2
-  *     durability)
-  *   - '''State Machine''' — applying committed entries and snapshotting (§5.3)
-  *   - '''Timers''' — resetting election and heartbeat timers (§5.2)
-  *   - '''Leadership''' — leader initialization, transfer, and commit tracking
-  *   - '''Linearizable Reads''' — ReadIndex and lease-based read protocols
-  *
-  * @see
-  *   [[Transition]] for the state + effects result type
-  * @see
-  *   [[raft.logic.RaftLogic]] for the functions that produce effects
-  * @see
-  *   [[raft.RaftNode]] for the runtime that executes effects
+  * Effects are generic in `F` to allow carrying effectful data types (like
+  * [[raft.state.Snapshot]] which contains a stream).
   */
-enum Effect:
-  /** Send a Raft protocol message to a specific peer node.
-    *
-    * @param to
-    *   the target node identifier
-    * @param message
-    *   the RPC message to send
-    */
+enum Effect[+F[_]]:
+  /** Send a Raft protocol message to a specific peer node. */
   case SendMessage(to: NodeId, message: RaftMessage)
 
-  /** Broadcast a Raft protocol message to all other nodes in the cluster.
-    *
-    * @param message
-    *   the RPC message to broadcast
-    */
+  /** Broadcast a Raft protocol message to all other nodes in the cluster. */
   case Broadcast(message: RaftMessage)
 
-  /** Persist hard state (current term and votedFor) to durable storage.
-    *
-    * This must be flushed to disk before responding to any RPC, as required by
-    * the RAFT safety guarantees for crash recovery.
-    *
-    * @param term
-    *   the current term to persist
-    * @param votedFor
-    *   the candidate voted for in the current term (if any)
-    */
-  case PersistHardState(term: Long, votedFor: Option[NodeId])
+  /** Reset the election timer. */
+  case ResetElectionTimer
 
-  /** Append new log entries to persistent storage in the order they appear.
-    *
-    * @param entries
-    *   the log entries to append
-    */
+  /** Reset the heartbeat timer. */
+  case ResetHeartbeatTimer
+
+  /** Commit entries up to the given index. */
+  case CommitEntries(index: LogIndex)
+
+  /** Append new entries to the local log. */
   case AppendLogs(entries: Seq[Log])
 
-  /** Truncate the log from the given index onwards, removing conflicting
-    * entries.
-    *
-    * This occurs when a follower discovers entries that conflict with the
-    * leader's log during the log matching check.
-    *
-    * @param fromIndex
-    *   the first index to remove (inclusive); all entries at or after this
-    *   index are deleted
-    */
-  case TruncateLog(fromIndex: Long)
+  /** Persist hard state (current term and votedFor). */
+  case PersistHardState(term: Long, votedFor: Option[NodeId])
 
-  /** Apply a committed log entry to the user's state machine.
-    *
-    * @param entry
-    *   the log entry whose command should be executed
+  /** Transition to Leader state. */
+  case BecomeLeader
+
+  /** Clean up any state from a previous leadership term. */
+  case StopLeader
+
+  /** Signal that the state machine has applied a command and the client result
+    * is available.
     */
   case ApplyToStateMachine(entry: Log)
 
-  /** Reset the election timer with a randomized duration to prevent split
-    * votes.
-    *
-    * Called when a follower receives a valid heartbeat or grants a vote,
-    * ensuring it does not start an unnecessary election.
-    */
-  case ResetElectionTimer
+  /** Initiate a linearizable read (ReadIndex) operation. */
+  case RunReadIndex(callback: () => Unit)
 
-  /** Reset the heartbeat timer to schedule the next heartbeat to followers.
-    *
-    * Called after a leader sends heartbeats, ensuring periodic keep-alive
-    * messages.
-    */
-  case ResetHeartbeatTimer
+  /** Send a ReadIndex confirmation to the leader. */
+  case SendReadIndexResponse(from: NodeId, index: Long)
 
-  /** Trigger a snapshot at the given index to compact the log and reduce
-    * storage.
-    *
-    * @param lastIncludedIndex
-    *   the last log index included in the snapshot
-    * @param lastIncludedTerm
-    *   the term of the last included log entry
+  /** Verify leadership and execute a callback if confirmed (lease-based read).
     */
-  case TakeSnapshot(lastIncludedIndex: Long, lastIncludedTerm: Long)
+  case VerifyLease(callback: () => Unit)
 
-  /** Transition to leader state and initialize replication tracking for all
-    * followers.
-    */
-  case BecomeLeader
+  /** Notify that a lease read is ready to be served. */
+  case LeaseReadReady(requestId: String)
 
-  /** Initiate graceful leadership transfer to the specified target node.
-    *
-    * @param target
-    *   the node that should become the next leader
-    * @see
-    *   [[TimeoutNow]] for the follow-up effect that triggers immediate election
+  /** Request the compaction manager to initiate a snapshot at the given applied
+    * index.
     */
-  case TransferLeadership(target: NodeId)
+  case RequestSnapshot(lastApplied: Long, logSize: Long)
 
-  /** Initialize nextIndex and matchIndex maps for all followers upon becoming
-    * leader.
-    *
-    * Sets `nextIndex = lastLogIndex + 1` and `matchIndex = 0` for each
-    * follower, following the RAFT leader initialization protocol.
-    *
-    * @param followers
-    *   the set of follower node IDs to track
-    * @param lastLogIndex
-    *   the index of the last entry in the leader's log
-    */
-  case InitializeLeaderState(followers: Set[NodeId], lastLogIndex: Long)
-
-  /** Update the replication progress for a specific follower after receiving a
-    * response.
-    *
-    * @param followerId
-    *   the follower whose indices are being updated
-    * @param matchIndex
-    *   the highest log index replicated on the follower
-    * @param nextIndex
-    *   the next log index to send to the follower
-    */
-  case UpdateFollowerIndex(
-      followerId: NodeId,
-      matchIndex: Long,
-      nextIndex: Long
+  /** Send a chunk of a snapshot to a follower via `InstallSnapshot` RPC. */
+  case SendSnapshotChunk(
+      to: NodeId,
+      request: raft.message.RaftMessage.InstallSnapshotRequest
   )
 
-  /** Commit all log entries up to the given index by applying them to the state
-    * machine.
+  /** Install a complete snapshot — restore the state machine and discard the
+    * log up to the snapshot's last included index.
     *
-    * @param upToIndex
-    *   the highest index to commit (inclusive)
+    * @param snapshot
+    *   the assembled snapshot to install (containing a stream of data)
     */
-  case CommitEntries(upToIndex: Long)
+  case InstallSnapshot[F[_]](snapshot: Snapshot[F]) extends Effect[F]
 
-  /** Replicate entries to multiple followers in parallel.
-    *
-    * The runtime should execute sends concurrently for improved throughput.
-    *
-    * @param targets
-    *   the set of follower node IDs to replicate to
-    * @param message
-    *   the AppendEntries message to send
-    */
+  /** Truncate the log from the given index onwards. */
+  case TruncateLog(fromIndex: Long)
+
+  /** Transfer leadership to a specific node. */
+  case TransferLeadership(target: NodeId)
+
+  /** Initialize leader state with follower mapping. */
+  case InitializeLeaderState(followers: Set[NodeId], lastLogIndex: Long)
+
+  /** Update a follower's match and next indices. */
+  case UpdateFollowerIndex(
+      followerId: NodeId,
+      matchIndex: LogIndex,
+      nextIndex: LogIndex
+  )
+
+  /** Replicate a message to multiple targets in parallel. */
   case ParallelReplicate(targets: Set[NodeId], message: RaftMessage)
 
-  /** Batch multiple client commands into a single log append for throughput.
-    *
-    * @param entries
-    *   the batched log entries
-    * @param batchId
-    *   unique identifier for tracking this batch
-    * @see
-    *   [[BatchComplete]] for the completion notification
-    */
-  case BatchAppend(entries: Seq[Log], batchId: String)
+  /** Append a batch of entries to the log. */
+  case BatchAppend(
+      entries: Seq[Log],
+      callback: Option[Throwable => Unit] = None
+  )
 
-  /** Notify that a batch has been committed.
-    *
-    * @param batchId
-    *   the identifier of the completed batch
-    * @param commitIndex
-    *   the commit index at completion time
-    */
-  case BatchComplete(batchId: String, commitIndex: Long)
+  /** Signal completion of a batch append. */
+  case BatchComplete(batchId: String, result: Either[Throwable, Unit])
 
-  /** Send the next AppendEntries without waiting for the previous response.
-    *
-    * Pipelining increases replication throughput by overlapping RPCs.
-    *
-    * @param to
-    *   the target follower
-    * @param message
-    *   the AppendEntries message to send
-    * @param sequenceNum
-    *   monotonic sequence number for ordering pipelined requests
-    */
-  case PipelinedSend(to: NodeId, message: RaftMessage, sequenceNum: Long)
+  /** Send a message as part of a pipeline. */
+  case PipelinedSend(to: NodeId, message: RaftMessage, pipelineId: String)
 
-  /** Track an in-flight pipelined request for flow control.
-    *
-    * @param followerId
-    *   the follower receiving the pipelined request
-    * @param sequenceNum
-    *   the sequence number of the in-flight request
-    * @param lastIndex
-    *   the last log index included in the request
-    */
-  case TrackInflight(followerId: NodeId, sequenceNum: Long, lastIndex: Long)
+  /** Track an inflight message for flow control. */
+  case TrackInflight(to: NodeId, messageId: String, callback: () => Unit)
 
-  /** ReadIndex request accepted — client can read after commitIndex reaches
-    * readIndex.
-    *
-    * @param requestId
-    *   the unique identifier of the read request
-    * @param readIndex
-    *   the commit index the client must wait for before reading
-    * @see
-    *   [[ReadIndexRejected]] for the failure case
-    */
-  case ReadIndexReady(requestId: String, readIndex: Long)
+  /** Signal that a ReadIndex request is ready to be executed. */
+  case ReadIndexReady(id: String, index: Long)
 
-  /** ReadIndex request rejected — node is not the leader or quorum was not
-    * confirmed.
-    *
-    * @param requestId
-    *   the unique identifier of the rejected read request
-    * @param leaderHint
-    *   the known leader's ID (if any) for client redirection
-    */
-  case ReadIndexRejected(requestId: String, leaderHint: Option[NodeId])
+  /** Signal that a ReadIndex request was rejected. */
+  case ReadIndexRejected(id: String, reason: String)
 
-  /** Confirm leadership via a heartbeat round for the ReadIndex protocol.
-    *
-    * Before serving a ReadIndex request, the leader must verify it still holds
-    * authority by receiving responses from a majority.
-    *
-    * @param requestId
-    *   the read request waiting for confirmation
-    * @param pendingReadIndex
-    *   the commit index to serve once leadership is confirmed
-    */
-  case ConfirmLeadership(requestId: String, pendingReadIndex: Long)
+  /** Confirm leadership for a given term. */
+  case ConfirmLeadership(term: Long, callback: () => Unit)
 
-  /** Request the target node to start an election immediately.
-    *
-    * Used during leadership transfer to trigger the target's election without
-    * waiting for an election timeout.
-    *
-    * @param target
-    *   the node that should immediately start an election
-    * @see
-    *   [[TransferLeadership]] for the initiating effect
-    */
+  /** Trigger an immediate election (e.g. for leadership transfer). */
   case TimeoutNow(target: NodeId)
 
-  /** Extend the leader lease after a successful heartbeat quorum.
-    *
-    * @param until
-    *   the timestamp (epoch millis) until which the lease is valid
-    * @see
-    *   [[LeaseReadReady]] for reads served under an active lease
-    */
+  /** Extend the leader's lease. */
   case ExtendLease(until: Long)
-
-  /** Lease read accepted — the leader's lease is active and the client can read
-    * immediately.
-    *
-    * @param requestId
-    *   the unique identifier of the lease read request
-    */
-  case LeaseReadReady(requestId: String)

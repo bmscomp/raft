@@ -7,6 +7,7 @@ import raft.state.*
 import raft.spi.StateMachine
 
 import java.nio.charset.StandardCharsets
+import fs2.Stream
 
 /** Example 1: Distributed Key-Value Store
   *
@@ -78,21 +79,25 @@ class KVStateMachine[F[_]: Sync](
       case Left(err) =>
         Sync[F].pure(KVResult.Error(err))
 
-  def snapshot: F[Array[Byte]] =
+  def snapshot: F[Stream[F, Byte]] =
     store.get.map { m =>
-      m.map { case (k, v) => s"$k=$v" }.mkString("\n").getBytes
+      Stream
+        .emits(m.map { case (k, v) => s"$k=$v" }.mkString("\n").getBytes)
+        .covary[F]
     }
 
-  def restore(data: Array[Byte]): F[Unit] =
-    val entries = new String(data)
-      .split("\n")
-      .flatMap { line =>
-        line.split("=") match
-          case Array(k, v) => Some(k -> v)
-          case _           => None
-      }
-      .toMap
-    store.set(entries)
+  def restore(data: Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap { bytes =>
+      val entries = new String(bytes)
+        .split("\n")
+        .flatMap { line =>
+          line.split("=") match
+            case Array(k, v) => Some(k -> v)
+            case _           => None
+        }
+        .toMap
+      store.set(entries)
+    }
 
   // Additional method for reads (not in trait)
   def get(key: String): F[Option[String]] =

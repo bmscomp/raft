@@ -5,12 +5,12 @@ import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
+import fs2.Stream
 
 import raft.state.*
 import raft.state.NodeState.Follower
-import raft.impl.{InMemLogStore, InMemStableStore}
+import raft.impl.{InMemLogStore, InMemStableStore, DefaultTimerService}
 import raft.spi.{StateMachine, TimerService}
-import raft.impl.DefaultTimerService
 
 class MultiRaftNodeSpec extends AnyFunSuite with Matchers:
 
@@ -29,8 +29,8 @@ class MultiRaftNodeSpec extends AnyFunSuite with Matchers:
       stableStore = stableStore,
       stateMachine = new StateMachine[IO, Unit]:
         def apply(log: Log): IO[Unit] = IO.unit
-        def snapshot: IO[Array[Byte]] = IO.pure(Array.empty)
-        def restore(data: Array[Byte]): IO[Unit] = IO.unit
+        def snapshot: IO[Stream[IO, Byte]] = IO.pure(Stream.empty)
+        def restore(data: Stream[IO, Byte]): IO[Unit] = data.compile.drain
       ,
       timerService = timerService
     )

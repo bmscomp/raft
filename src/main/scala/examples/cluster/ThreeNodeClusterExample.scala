@@ -11,6 +11,7 @@ import raft.impl.*
 import raft.spi.*
 
 import scala.concurrent.duration.*
+import fs2.Stream
 
 /** Example 4: 3-Node Cluster Simulation
   *
@@ -38,11 +39,15 @@ class LoggingStateMachine[F[_]: Sync](
 
   def getApplied: F[List[String]] = applied.get
 
-  def snapshot: F[Array[Byte]] =
-    applied.get.map(_.mkString("\n").getBytes)
+  def snapshot: F[Stream[F, Byte]] =
+    applied.get.map { list =>
+      Stream.emits(list.mkString("\n").getBytes).covary[F]
+    }
 
-  def restore(data: Array[Byte]): F[Unit] =
-    applied.set(new String(data).split("\n").toList)
+  def restore(data: Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap { bytes =>
+      applied.set(new String(bytes).split("\n").toList)
+    }
 
 object LoggingStateMachine:
   def apply[F[_]: Sync]: F[LoggingStateMachine[F]] =

@@ -107,7 +107,8 @@ final case class RaftConfig(
     leaderLeaseDuration: FiniteDuration = 100.millis,
     parallelReplicationEnabled: Boolean = true,
     batching: BatchConfig = BatchConfig(),
-    pipelining: PipelineConfig = PipelineConfig()
+    pipelining: PipelineConfig = PipelineConfig(),
+    compaction: CompactionConfig = CompactionConfig()
 )
 
 /** Factory methods for [[RaftConfig]]. */

@@ -272,7 +272,7 @@ private class RaftNodeImpl[F[_]: Async](
       _ <- executeEffects(transition.effects)
     yield ()
 
-  private def executeEffects(effects: List[Eff]): F[Unit] =
+  private def executeEffects(effects: List[Eff[F]]): F[Unit] =
     effects.traverse_ {
       case Eff.SendMessage(to, msg)       => transport.send(to, msg)
       case Eff.Broadcast(msg)             => transport.broadcast(msg)
@@ -287,10 +287,47 @@ private class RaftNodeImpl[F[_]: Async](
       case Eff.ApplyToStateMachine(entry)      => stateMachine.apply(entry).void
       case Eff.ResetElectionTimer              => resetElectionTimer
       case Eff.ResetHeartbeatTimer             => resetHeartbeatTimer
-      case Eff.TakeSnapshot(lastIdx, lastTerm) =>
-        logger.debug(
-          s"Snapshot requested at index=$lastIdx term=$lastTerm"
-        )
+      case Eff.RequestSnapshot(lastApplied, _) =>
+        for
+          _ <- logger.info(
+            s"Snapshot requested at index=$lastApplied"
+          )
+          termOpt <- logStore.termAt(LogIndex.unsafeFrom(lastApplied))
+          term = termOpt.map(_.value).getOrElse(0L)
+          data <- stateMachine.snapshot
+          snapshot = raft.state.Snapshot[F](
+            lastApplied,
+            term,
+            data
+          )
+          _ <- logStore match
+            case sbl: raft.storage.StorageBackedLogStore[F] =>
+              Async[F].unit // TODO: Trigger compaction
+            case _ => Async[F].unit
+          _ <- metrics.onSnapshotTaken(config.localId, lastApplied)
+        yield ()
+      case Eff.InstallSnapshot(snapshot) =>
+        for
+          _ <- logger.info(
+            s"Installing snapshot at index=${snapshot.lastIncludedIndex} term=${snapshot.lastIncludedTerm}"
+          )
+          _ <- stateMachine.restore(snapshot.data)
+          _ <- logStore.clear
+          _ <- lastAppliedRef.set(snapshot.lastIncludedIndex)
+          _ <- stateRef.update {
+            case f: Follower =>
+              f.copy(leaderId = f.leaderId)
+            case s => s
+          }
+          _ <- metrics.onSnapshotTaken(
+            config.localId,
+            snapshot.lastIncludedIndex
+          )
+        yield ()
+      case Eff.RequestSnapshot(lastApplied, _) =>
+        Async[F].unit
+      case Eff.SendSnapshotChunk(to, req) =>
+        transport.send(to, req)
       case Eff.BecomeLeader =>
         logger.info("Became leader!") *>
           metrics.onBecomeLeader(config.localId, 0L) *>
@@ -305,13 +342,13 @@ private class RaftNodeImpl[F[_]: Async](
       case Eff.UpdateFollowerIndex(followerId, matchIdx, nextIdx) =>
         stateRef.update {
           case l: Leader =>
-            l.withMatchIndex(followerId, matchIdx)
-              .withNextIndex(followerId, nextIdx)
+            l.withMatchIndex(followerId, matchIdx.value)
+              .withNextIndex(followerId, nextIdx.value)
           case s => s
         }
       case Eff.CommitEntries(upToIndex) =>
         applyCommittedEntries(upToIndex) *>
-          metrics.onEntriesCommitted(config.localId, upToIndex)
+          metrics.onEntriesCommitted(config.localId, upToIndex.value)
       case Eff.ParallelReplicate(targets, msg) =>
         targets.toList.traverse_(t => transport.send(t, msg))
       case Eff.BatchAppend(entries, _) =>
@@ -378,12 +415,12 @@ private class RaftNodeImpl[F[_]: Async](
       }
     yield ()
 
-  private def applyCommittedEntries(upToIndex: Long): F[Unit] =
+  private def applyCommittedEntries(upToIndex: LogIndex): F[Unit] =
     for
       lastApplied <- lastAppliedRef.get
       _ <-
-        if upToIndex > lastApplied then
-          (lastApplied + 1 to upToIndex).toList.traverse_ { idx =>
+        if upToIndex.value > lastApplied then
+          (lastApplied + 1 to upToIndex.value).toList.traverse_ { idx =>
             val logIndex = LogIndex.unsafeFrom(idx)
             logStore.get(logIndex).flatMap {
               case Some(entry) =>

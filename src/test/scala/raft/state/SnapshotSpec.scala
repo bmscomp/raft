@@ -2,35 +2,40 @@ package raft.state
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import fs2.Stream
 
 class SnapshotSpec extends AnyFlatSpec with Matchers:
-  
+
+  type Pure[A] = fs2.Pure[A]
+
   "Snapshot" should "store metadata and data" in {
     val data = "state machine data".getBytes
-    val snapshot = Snapshot(
+    val snapshot = Snapshot[Pure](
       lastIncludedIndex = 100,
       lastIncludedTerm = 5,
-      data = data
+      data = Stream.emits(data)
     )
-    
+
     snapshot.lastIncludedIndex shouldBe 100
     snapshot.lastIncludedTerm shouldBe 5
-    new String(snapshot.data) shouldBe "state machine data"
+
+    val dataBytes = snapshot.data.compile.toVector.toArray
+    new String(dataBytes) shouldBe "state machine data"
   }
-  
+
   it should "include cluster config" in {
     val config = ClusterConfig(Set(NodeId("a"), NodeId("b")))
-    val snapshot = Snapshot(
+    val snapshot = Snapshot[Pure](
       lastIncludedIndex = 50,
       lastIncludedTerm = 3,
-      data = Array.empty,
+      data = Stream.empty,
       config = Some(config)
     )
-    
+
     snapshot.config shouldBe defined
     snapshot.config.get.voters shouldBe Set(NodeId("a"), NodeId("b"))
   }
-  
+
   "PendingSnapshot" should "accumulate chunks" in {
     val pending = PendingSnapshot(
       lastIncludedIndex = 100,
@@ -38,19 +43,19 @@ class SnapshotSpec extends AnyFlatSpec with Matchers:
       offset = 0,
       chunks = Vector.empty
     )
-    
+
     val chunk1 = "chunk1".getBytes
     val chunk2 = "chunk2".getBytes
-    
+
     val withChunk1 = pending.appendChunk(chunk1)
     withChunk1.offset shouldBe chunk1.length
     withChunk1.chunks.size shouldBe 1
-    
+
     val withChunk2 = withChunk1.appendChunk(chunk2)
     withChunk2.offset shouldBe (chunk1.length + chunk2.length)
     withChunk2.chunks.size shouldBe 2
   }
-  
+
   it should "convert to final Snapshot" in {
     val pending = PendingSnapshot(
       lastIncludedIndex = 100,
@@ -58,11 +63,13 @@ class SnapshotSpec extends AnyFlatSpec with Matchers:
       offset = 0,
       chunks = Vector.empty
     )
-    .appendChunk("hello".getBytes)
-    .appendChunk(" world".getBytes)
-    
-    val snapshot = pending.toSnapshot
+      .appendChunk("hello".getBytes)
+      .appendChunk(" world".getBytes)
+
+    val snapshot = pending.toSnapshot[Pure]
     snapshot.lastIncludedIndex shouldBe 100
     snapshot.lastIncludedTerm shouldBe 5
-    new String(snapshot.data) shouldBe "hello world"
+
+    val dataBytes = snapshot.data.compile.toVector.toArray
+    new String(dataBytes) shouldBe "hello world"
   }

@@ -4,6 +4,7 @@ import cats.effect.*
 import cats.syntax.all.*
 import java.util.UUID
 import scala.concurrent.duration.*
+import fs2.Stream
 
 import raft.state.*
 import raft.spi.StateMachine
@@ -236,21 +237,24 @@ object DistributedTransactionExample extends IOApp.Simple:
     def getAll: F[Map[String, String]] = state.get
     def getTransactionLog: F[List[TxnResult]] = txnLog.get
 
-    def snapshot: F[Array[Byte]] =
-      state.get.map { m =>
-        m.map { case (k, v) => s"$k=$v" }.mkString("\n").getBytes
+    def snapshot: F[Stream[F, Byte]] =
+      state.get.map { s =>
+        Stream
+          .emits(s.map((k, v) => s"$k=$v").mkString("\n").getBytes)
+          .covary[F]
       }
-
-    def restore(data: Array[Byte]): F[Unit] =
-      val entries = new String(data)
-        .split("\n")
-        .flatMap { line =>
-          line.split("=", 2) match
-            case Array(k, v) => Some(k -> v)
-            case _           => None
-        }
-        .toMap
-      state.set(entries)
+    def restore(data: Stream[F, Byte]): F[Unit] =
+      data.compile.to(Array).flatMap { bytes =>
+        val entries = new String(bytes)
+          .split("\n")
+          .flatMap { line =>
+            line.split("=", 2) match
+              case Array(k, v) => Some(k -> v)
+              case _           => None
+          }
+          .toMap
+        state.set(entries)
+      }
 
   object TransactionalStore:
     def apply[F[_]: Sync]: F[TransactionalStore[F]] =

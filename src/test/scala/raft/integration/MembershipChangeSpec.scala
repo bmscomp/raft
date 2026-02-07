@@ -4,6 +4,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import raft.state.*
 import raft.state.NodeState.*
+import fs2.Stream
 
 /** Tests for cluster membership changes using joint consensus.
   *
@@ -144,12 +145,14 @@ class SnapshotMembershipSpec extends AnyFlatSpec with Matchers:
   val node3 = NodeId("node-3")
   val node4 = NodeId("node-4")
 
+  type Pure[A] = fs2.Pure[A]
+
   "Snapshot" should "include cluster configuration" in {
     val config = ClusterConfig(Set(node1, node2, node3))
-    val snapshot = Snapshot(
+    val snapshot = Snapshot[Pure](
       lastIncludedIndex = 100,
       lastIncludedTerm = 5,
-      data = "state machine data".getBytes,
+      data = Stream.emits("state machine data".getBytes),
       config = Some(config)
     )
 
@@ -162,10 +165,10 @@ class SnapshotMembershipSpec extends AnyFlatSpec with Matchers:
     val leaderConfig = ClusterConfig(Set(node1, node2, node3, node4))
 
     // Snapshot captures config at time of snapshot
-    val snapshot = Snapshot(
+    val snapshot = Snapshot[Pure](
       lastIncludedIndex = 500,
       lastIncludedTerm = 10,
-      data = "compacted state".getBytes,
+      data = Stream.emits("compacted state".getBytes),
       config = Some(leaderConfig)
     )
 
@@ -193,8 +196,9 @@ class SnapshotMembershipSpec extends AnyFlatSpec with Matchers:
     withChunks.offset shouldBe (chunk1.length + chunk2.length)
 
     // Finalize snapshot
-    val finalSnapshot = withChunks.toSnapshot
-    new String(finalSnapshot.data) shouldBe "first part second part"
+    val finalSnapshot = withChunks.toSnapshot[Pure]
+    val dataBytes = finalSnapshot.data.compile.toVector.toArray
+    new String(dataBytes) shouldBe "first part second part"
     finalSnapshot.lastIncludedIndex shouldBe 100
     finalSnapshot.lastIncludedTerm shouldBe 5
   }

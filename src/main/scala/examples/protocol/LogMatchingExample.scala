@@ -112,7 +112,10 @@ object LogMatchingExample extends IOApp.Simple:
       s"  Result: success=${response2.success}, matchIndex=${response2.matchIndex} ✓"
     )
 
-    val hasAppendEffect = result2.effects.exists(_.isInstanceOf[AppendLogs])
+    val hasAppendEffect = result2.effects.exists {
+      case AppendLogs(_) => true
+      case _             => false
+    }
     println(s"  AppendLogs effect generated: $hasAppendEffect\n")
 
     // Scenario 3: Missing entry - should reject
@@ -202,7 +205,7 @@ object LogMatchingExample extends IOApp.Simple:
     *   the `AppendEntriesResponse` or throws if none found
     */
   private def extractResponse(
-      effects: List[raft.effect.Effect]
+      effects: List[raft.effect.Effect[Nothing]]
   ): AppendEntriesResponse =
     effects
       .collectFirst { case SendMessage(_, resp: AppendEntriesResponse) =>

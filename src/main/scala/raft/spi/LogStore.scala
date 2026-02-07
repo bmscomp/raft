@@ -102,6 +102,16 @@ trait LogWriter[F[_]]:
     */
   def clear: F[Unit]
 
+  /** Discard all log entries before the given index.
+    *
+    * Entries before `index` (exclusive) are removed. This is used during log
+    * compaction after a snapshot has been persisted.
+    *
+    * @param index
+    *   the first index to keep (all entries before this are discarded)
+    */
+  def discardBefore(index: LogIndex): F[Unit]
+
 /** Combined log store providing both read and write capabilities.
   *
   * This is the primary interface that [[raft.RaftNode]] depends on for log

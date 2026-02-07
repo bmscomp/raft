@@ -106,11 +106,13 @@ object DistributedCounterExample extends IOApp.Simple:
           case CounterCommand.Reset     => counter.set(0) *> Sync[F].pure(0L)
       yield result
 
-    def snapshot: F[Array[Byte]] =
-      counter.get.map(_.toString.getBytes)
+    def snapshot: F[Stream[F, Byte]] =
+      counter.get.map(v => Stream.emits(v.toString.getBytes).covary[F])
 
-    def restore(data: Array[Byte]): F[Unit] =
-      counter.set(new String(data).toLong)
+    def restore(data: Stream[F, Byte]): F[Unit] =
+      data.compile.to(Array).flatMap { bytes =>
+        counter.set(new String(bytes).toLong)
+      }
 
     def getValue: F[Long] = counter.get
     def getAppliedLog: F[List[String]] = appliedLog.get
@@ -224,7 +226,7 @@ object DistributedCounterExample extends IOApp.Simple:
 
     private def executeEffect(
         from: NodeId,
-        effect: raft.effect.Effect
+        effect: raft.effect.Effect[F]
     ): F[Unit] =
       effect match
         case SendMessage(to, msg) =>
@@ -244,10 +246,10 @@ object DistributedCounterExample extends IOApp.Simple:
             logs <- logRef.get
             currentCommit <- commitIndex.get
             toApply = logs.filter(l =>
-              l.index > currentCommit && l.index <= upToIndex
+              l.index > currentCommit && l.index <= upToIndex.value
             )
             _ <- toApply.traverse_(log => stateMachine.apply(log))
-            _ <- commitIndex.set(upToIndex)
+            _ <- commitIndex.set(upToIndex.value)
           yield ()
 
         case _ => Async[F].unit // Simplified - ignore other effects

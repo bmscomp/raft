@@ -20,25 +20,25 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
   "InMemStableStore" should "persist and retrieve term" in {
     val test = for
       store <- InMemStableStore[IO]()
-      initial <- store.getCurrentTerm
+      initial <- store.currentTerm
       _ <- store.setCurrentTerm(Term.unsafeFrom(42))
-      updated <- store.getCurrentTerm
+      updated <- store.currentTerm
     yield (initial, updated)
 
     val (initial, updated) = test.unsafeRunSync()
-    initial shouldBe 0L
-    updated shouldBe 42L
+    initial.value shouldBe 0L
+    updated.value shouldBe 42L
   }
 
   it should "persist and retrieve votedFor" in {
     val nodeId = NodeId("candidate-1")
     val test = for
       store <- InMemStableStore[IO]()
-      initial <- store.getVotedFor
+      initial <- store.votedFor
       _ <- store.setVotedFor(Some(nodeId))
-      updated <- store.getVotedFor
+      updated <- store.votedFor
       _ <- store.setVotedFor(None)
-      cleared <- store.getVotedFor
+      cleared <- store.votedFor
     yield (initial, updated, cleared)
 
     val (initial, updated, cleared) = test.unsafeRunSync()
@@ -52,12 +52,12 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
       store <- InMemStableStore[IO]()
       _ <- store.setCurrentTerm(Term.unsafeFrom(10))
       _ <- store.setVotedFor(Some(NodeId("node-5")))
-      term <- store.getCurrentTerm
-      voted <- store.getVotedFor
+      term <- store.currentTerm
+      voted <- store.votedFor
     yield (term, voted)
 
     val (term, voted) = test.unsafeRunSync()
-    term shouldBe 10L
+    term.value shouldBe 10L
     voted shouldBe Some(NodeId("node-5"))
   }
 
@@ -70,10 +70,10 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
 
     val test = for
       store <- InMemLogStore[IO]()
-      _ <- store.appendLogs(entries)
-      log1 <- store.getLog(1)
-      log3 <- store.getLog(3)
-      missing <- store.getLog(99)
+      _ <- store.append(entries)
+      log1 <- store.get(LogIndex.unsafeFrom(1))
+      log3 <- store.get(LogIndex.unsafeFrom(3))
+      missing <- store.get(LogIndex.unsafeFrom(99))
     yield (log1, log3, missing)
 
     val (log1, log3, missing) = test.unsafeRunSync()
@@ -89,10 +89,10 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
       store <- InMemLogStore[IO]()
       emptyCheck <- store.isEmpty
       idx0 <- store.lastIndex
-      _ <- store.appendLogs(Seq(Log.command(1, 1, "a".getBytes)))
+      _ <- store.append(Seq(Log.command(1, 1, "a".getBytes)))
       nonEmpty <- store.isEmpty
       idx1 <- store.lastIndex
-      _ <- store.appendLogs(
+      _ <- store.append(
         Seq(Log.command(2, 1, "b".getBytes), Log.command(3, 2, "c".getBytes))
       )
       idx3 <- store.lastIndex
@@ -112,8 +112,8 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
 
     val test = for
       store <- InMemLogStore[IO]()
-      _ <- store.appendLogs(entries)
-      range <- store.getLogs(3, 7)
+      _ <- store.append(entries)
+      range <- store.getRange(LogIndex.unsafeFrom(3), LogIndex.unsafeFrom(7))
     yield range
 
     val range = test.unsafeRunSync()
@@ -128,9 +128,12 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
 
     val test = for
       store <- InMemLogStore[IO]()
-      _ <- store.appendLogs(entries)
+      _ <- store.append(entries)
       _ <- store.truncateFrom(LogIndex.unsafeFrom(3))
-      remaining <- store.getLogs(1, 5)
+      remaining <- store.getRange(
+        LogIndex.unsafeFrom(1),
+        LogIndex.unsafeFrom(5)
+      )
       lastIdx <- store.lastIndex
     yield (remaining, lastIdx.value)
 
@@ -149,7 +152,7 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
 
     val test = for
       store <- InMemLogStore[IO]()
-      _ <- store.appendLogs(entries)
+      _ <- store.append(entries)
       t1 <- store.termAt(LogIndex.unsafeFrom(1))
       t3 <- store.termAt(LogIndex.unsafeFrom(3))
       tMissing <- store.termAt(LogIndex.unsafeFrom(99))

@@ -8,6 +8,7 @@ import raft.message.*
 import raft.message.RaftMessage.*
 import raft.effect.Effect
 import raft.effect.Effect.*
+import fs2.Stream
 
 /** Snapshot lifecycle tests — creation, chunked transfer, and restoration.
   *
@@ -24,25 +25,30 @@ class SnapshotLifecycleSpec extends AnyFlatSpec with Matchers:
   val n2 = NodeId("node-2")
   val config = RaftConfig.default(n1)
 
+  // Use pure streams for logic testing without IO overhead
+  type Pure[A] = fs2.Pure[A]
+
   "Snapshot" should "capture state at a specific index and term" in {
-    val snapshot = Snapshot(
+    val snapshot = Snapshot[Pure](
       lastIncludedIndex = 100,
       lastIncludedTerm = 5,
-      data = "state-machine-data".getBytes
+      data = Stream.emits("state-machine-data".getBytes)
     )
 
     snapshot.lastIncludedIndex shouldBe 100
     snapshot.lastIncludedTerm shouldBe 5
-    new String(snapshot.data) shouldBe "state-machine-data"
+
+    val dataBytes = snapshot.data.compile.toVector.toArray
+    new String(dataBytes) shouldBe "state-machine-data"
     snapshot.config shouldBe None
   }
 
   it should "preserve cluster configuration" in {
     val clusterConfig = ClusterConfig(Set(n1, n2, NodeId("node-3")))
-    val snapshot = Snapshot(
+    val snapshot = Snapshot[Pure](
       lastIncludedIndex = 200,
       lastIncludedTerm = 8,
-      data = "snapshot-data".getBytes,
+      data = Stream.emits("snapshot-data".getBytes),
       config = Some(clusterConfig)
     )
 
@@ -92,11 +98,13 @@ class SnapshotLifecycleSpec extends AnyFlatSpec with Matchers:
       .appendChunk(data1)
       .appendChunk(data2)
       .appendChunk(data3)
-      .toSnapshot
+      .toSnapshot[Pure]
 
     complete.lastIncludedIndex shouldBe 50
     complete.lastIncludedTerm shouldBe 3
-    new String(complete.data) shouldBe "Hello, RAFT World!"
+
+    val dataBytes = complete.data.compile.toVector.toArray
+    new String(dataBytes) shouldBe "Hello, RAFT World!"
   }
 
   it should "handle single-chunk snapshots" in {
@@ -104,15 +112,17 @@ class SnapshotLifecycleSpec extends AnyFlatSpec with Matchers:
 
     val snapshot = PendingSnapshot(100, 5, 0, Vector.empty)
       .appendChunk(allData)
-      .toSnapshot
+      .toSnapshot[Pure]
 
-    new String(snapshot.data) shouldBe "single-chunk-snapshot-data"
+    val dataBytes = snapshot.data.compile.toVector.toArray
+    new String(dataBytes) shouldBe "single-chunk-snapshot-data"
   }
 
   it should "handle empty snapshot data" in {
-    val snapshot = PendingSnapshot(0, 0, 0, Vector.empty).toSnapshot
+    val snapshot = PendingSnapshot(0, 0, 0, Vector.empty).toSnapshot[Pure]
 
-    snapshot.data shouldBe empty
+    val dataVec = snapshot.data.compile.toVector
+    dataVec shouldBe empty
     snapshot.lastIncludedIndex shouldBe 0
     snapshot.lastIncludedTerm shouldBe 0
   }
@@ -191,8 +201,9 @@ class SnapshotLifecycleSpec extends AnyFlatSpec with Matchers:
       offset += chunk.length
 
       if isDone then
-        val snapshot = pending.toSnapshot
-        new String(snapshot.data) shouldBe originalData
+        val snapshot = pending.toSnapshot[Pure]
+        val dataBytes = snapshot.data.compile.toVector.toArray
+        new String(dataBytes) shouldBe originalData
         snapshot.lastIncludedIndex shouldBe 200
 
     pending.chunks.size shouldBe chunks.size

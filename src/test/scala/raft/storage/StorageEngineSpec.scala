@@ -121,21 +121,24 @@ trait StorageEngineSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     }
 
     "should persist and load snapshots" in withEngine { engine =>
-      val snapshot = raft.state.Snapshot(
+      val snapshot = raft.state.Snapshot[IO](
         lastIncludedIndex = 100L,
         lastIncludedTerm = 5L,
-        data = "snapshot-data".getBytes("UTF-8")
+        data = fs2.Stream.emits("snapshot-data".getBytes("UTF-8")).covary[IO]
       )
       for
         before <- engine.loadSnapshot
         _ <- engine.saveSnapshot(snapshot)
         after <- engine.loadSnapshot
+        dataBytes <- after
+          .map(_.data.compile.to(Array))
+          .getOrElse(IO.pure(Array.empty[Byte]))
       yield
         before shouldBe None
         after shouldBe defined
         after.get.lastIncludedIndex shouldBe 100L
         after.get.lastIncludedTerm shouldBe 5L
-        new String(after.get.data) shouldBe "snapshot-data"
+        new String(dataBytes) shouldBe "snapshot-data"
     }
 
     "should handle NoOp entries" in withEngine { engine =>

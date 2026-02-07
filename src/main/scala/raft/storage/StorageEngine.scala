@@ -135,14 +135,14 @@ trait StorageEngine[F[_]]:
     * @param snapshot
     *   the snapshot to persist
     */
-  def saveSnapshot(snapshot: Snapshot): F[Unit]
+  def saveSnapshot(snapshot: Snapshot[F]): F[Unit]
 
   /** Load the most recent snapshot, if any.
     *
     * @return
     *   `Some(snapshot)` if a snapshot exists, `None` otherwise
     */
-  def loadSnapshot: F[Option[Snapshot]]
+  def loadSnapshot: F[Option[Snapshot[F]]]
 
 /** Factory for creating [[StorageEngine]] instances with resource lifecycle.
   *

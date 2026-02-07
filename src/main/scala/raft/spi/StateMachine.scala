@@ -48,24 +48,14 @@ trait StateMachine[F[_], R]:
 
   /** Capture a snapshot of the current state machine for log compaction.
     *
-    * The returned byte array should be a complete, self-contained serialization
-    * of the state machine that can be restored via [[restore]].
-    *
     * @return
-    *   the serialized state machine data
-    * @see
-    *   [[restore]] for the inverse operation
+    *   stream of the serialized state machine data
     */
-  def snapshot: F[Array[Byte]]
+  def snapshot: F[fs2.Stream[F, Byte]]
 
   /** Restore the state machine from a previously captured snapshot.
     *
-    * After restoration, the state machine should be in the exact same state as
-    * it was when [[snapshot]] was called.
-    *
     * @param data
-    *   the serialized state machine data from a snapshot
-    * @see
-    *   [[snapshot]] for the inverse operation
+    *   stream of serialized state machine data from a snapshot
     */
-  def restore(data: Array[Byte]): F[Unit]
+  def restore(data: fs2.Stream[F, Byte]): F[Unit]

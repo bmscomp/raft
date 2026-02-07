@@ -26,10 +26,18 @@ lazy val root = project
 
       // Streaming
       "co.fs2" %% "fs2-core" % "3.12.2",
+      "co.fs2" %% "fs2-io" % "3.12.2",
 
       // Logging
       "org.typelevel" %% "log4cats-slf4j" % "2.7.1",
       "ch.qos.logback" % "logback-classic" % "1.5.27" % Runtime,
+
+      // gRPC
+      "io.grpc" % "grpc-netty-shaded" % "1.72.0",
+      "io.grpc" % "grpc-protobuf" % "1.72.0",
+      "io.grpc" % "grpc-stub" % "1.72.0",
+      "com.thesamet.scalapb" %% "scalapb-runtime" % "0.11.17",
+      "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % "0.11.17",
 
       // Testing
       "org.scalatest" %% "scalatest" % "3.2.19" % Test,

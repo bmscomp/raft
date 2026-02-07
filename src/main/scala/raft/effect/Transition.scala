@@ -29,9 +29,9 @@ import raft.state.NodeState
   * @see
   *   [[Effect]] for the hierarchy of possible side effects
   */
-final case class Transition(
+final case class Transition[+F[_]](
     state: NodeState,
-    effects: List[Effect]
+    effects: List[Effect[F]]
 )
 
 /** Factory methods for constructing [[Transition]] instances.
@@ -47,7 +47,7 @@ object Transition:
     * @return
     *   a transition with an empty effect list
     */
-  def pure(state: NodeState): Transition =
+  def pure[F[_]](state: NodeState): Transition[F] =
     Transition(state, Nil)
 
   /** Create a transition with a single effect.
@@ -59,7 +59,7 @@ object Transition:
     * @return
     *   a transition containing the given effect
     */
-  def withEffect(state: NodeState, effect: Effect): Transition =
+  def withEffect[F[_]](state: NodeState, effect: Effect[F]): Transition[F] =
     Transition(state, List(effect))
 
   /** Create a transition with multiple effects.
@@ -71,5 +71,5 @@ object Transition:
     * @return
     *   a transition containing all given effects
     */
-  def withEffects(state: NodeState, effects: Effect*): Transition =
+  def withEffects[F[_]](state: NodeState, effects: Effect[F]*): Transition[F] =
     Transition(state, effects.toList)

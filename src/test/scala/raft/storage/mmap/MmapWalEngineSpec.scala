@@ -173,10 +173,10 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         tmpDir <- IO(Files.createTempDirectory("raft-wal-snap-"))
         engine <- MmapWalEngine.open(tmpDir)
         snapshotData = "state-machine-snapshot-v1".getBytes("UTF-8")
-        snapshot = raft.state.Snapshot(
+        snapshot = raft.state.Snapshot[IO](
           lastIncludedIndex = 500L,
           lastIncludedTerm = 10L,
-          data = snapshotData
+          data = fs2.Stream.emits(snapshotData).covary[IO]
         )
         _ <- engine.saveSnapshot(snapshot)
         _ <- engine.close
@@ -184,13 +184,16 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         // Reopen and verify snapshot survives
         engine2 <- MmapWalEngine.open(tmpDir)
         loaded <- engine2.loadSnapshot
+        loadedData <- loaded
+          .map(_.data.compile.to(Array))
+          .getOrElse(IO.pure(Array.empty[Byte]))
         _ <- engine2.close
         _ <- IO(deleteRecursive(tmpDir))
       yield
         loaded shouldBe defined
         loaded.get.lastIncludedIndex shouldBe 500L
         loaded.get.lastIncludedTerm shouldBe 10L
-        new String(loaded.get.data) shouldBe "state-machine-snapshot-v1"
+        new String(loadedData) shouldBe "state-machine-snapshot-v1"
       test
     }
 

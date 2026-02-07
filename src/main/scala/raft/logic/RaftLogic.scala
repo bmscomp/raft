@@ -90,7 +90,7 @@ object RaftLogic:
       lastLogTerm: Long,
       clusterSize: Int,
       getTermAt: Long => Option[Long] = _ => None
-  ): Transition = msg match
+  ): Transition[Nothing] = msg match
     case req: AppendEntriesRequest =>
       onAppendEntries(state, req, config, getTermAt)
     case resp: AppendEntriesResponse =>
@@ -139,7 +139,7 @@ object RaftLogic:
       resp: RequestVoteResponse,
       config: RaftConfig,
       clusterSize: Int
-  ): Transition =
+  ): Transition[Nothing] =
     if resp.voteGranted && resp.term == state.term then
       val newCandidate = state.withVote(voter)
       if newCandidate.hasMajority(clusterSize) then
@@ -154,7 +154,7 @@ object RaftLogic:
       req: AppendEntriesRequest,
       config: RaftConfig,
       getTermAt: Long => Option[Long]
-  ): Transition =
+  ): Transition[Nothing] =
     // Reject if request term is lower
     if req.term < state.term then
       val response = AppendEntriesResponse(state.term, success = false, 0)
@@ -191,7 +191,8 @@ object RaftLogic:
             if req.entries.nonEmpty then List(AppendLogs(req.entries)) else Nil
           val responseEffect = SendMessage(req.leaderId, response)
           val commitEffects =
-            if req.leaderCommit > 0 then List(CommitEntries(req.leaderCommit))
+            if req.leaderCommit > 0 then
+              List(CommitEntries(LogIndex.unsafeFrom(req.leaderCommit)))
             else Nil
 
           Transition(
@@ -232,7 +233,7 @@ object RaftLogic:
       resp: AppendEntriesResponse,
       clusterSize: Int,
       getTermAt: Long => Option[Long]
-  ): Transition = state match
+  ): Transition[Nothing] = state match
     case l: Leader if resp.term > l.term =>
       // Higher term - step down
       Transition.pure(l.stepDown(resp.term))
@@ -251,7 +252,7 @@ object RaftLogic:
         // New entries to commit
         Transition(
           l.withCommitIndex(newCommitIndex),
-          List(CommitEntries(newCommitIndex))
+          List(CommitEntries(LogIndex.unsafeFrom(newCommitIndex)))
         )
       else Transition.pure(l)
 
@@ -269,7 +270,7 @@ object RaftLogic:
       config: RaftConfig,
       lastLogIndex: Long,
       lastLogTerm: Long
-  ): Transition =
+  ): Transition[Nothing] =
     // Check if we should step down
     val currentState =
       if req.term > state.term then state.stepDown(req.term) else state
@@ -329,7 +330,7 @@ object RaftLogic:
       clusterSize: Int,
       lastLogIndex: Long,
       lastLogTerm: Long
-  ): Transition =
+  ): Transition[Nothing] =
     val voterId = NodeId(s"voter-${voteCounter.getAndIncrement()}")
 
     if resp.isPreVote then
@@ -377,7 +378,7 @@ object RaftLogic:
       config: RaftConfig,
       lastLogIndex: Long,
       lastLogTerm: Long
-  ): Transition = state match
+  ): Transition[Nothing] = state match
     case f: Follower if config.preVoteEnabled =>
       // Pre-vote phase: don't increment term yet
       val preCandidate = PreCandidate(f.term, Set(config.localId))
@@ -459,7 +460,7 @@ object RaftLogic:
       config: RaftConfig,
       lastLogIndex: Long,
       lastLogTerm: Long
-  ): Transition = state match
+  ): Transition[Nothing] = state match
     case l: Leader =>
       val heartbeat = AppendEntriesRequest(
         term = l.term,

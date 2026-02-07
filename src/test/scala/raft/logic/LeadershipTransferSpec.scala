@@ -4,6 +4,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scala.concurrent.duration.*
 
+import cats.effect.IO
 import raft.state.*
 import raft.state.NodeState.*
 import raft.message.*
@@ -42,7 +43,7 @@ class LeadershipTransferSpec extends AnyFlatSpec with Matchers:
   // === TRANSFER LEADERSHIP EFFECT ===
 
   "TransferLeadership effect" should "contain target node" in {
-    val effect: Effect = TransferLeadership(node2)
+    val effect: Effect[IO] = TransferLeadership(node2)
 
     effect match
       case TransferLeadership(target) => target shouldBe node2
@@ -53,7 +54,7 @@ class LeadershipTransferSpec extends AnyFlatSpec with Matchers:
 
   "TimeoutNow effect" should "trigger immediate election on target" in {
     // Leader sends TimeoutNow to tell target to start election immediately
-    val effect: Effect = TimeoutNow(node2)
+    val effect: Effect[IO] = TimeoutNow(node2)
 
     effect match
       case TimeoutNow(target) => target shouldBe node2
@@ -79,7 +80,7 @@ class LeadershipTransferSpec extends AnyFlatSpec with Matchers:
 
   it should "send TimeoutNow when target is caught up" in {
     // Once target is caught up, send TimeoutNow
-    val effect = TimeoutNow(node2)
+    val effect: Effect[IO] = TimeoutNow(node2)
 
     effect match
       case TimeoutNow(target) =>
