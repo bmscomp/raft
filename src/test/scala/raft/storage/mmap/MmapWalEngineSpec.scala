@@ -421,4 +421,49 @@ class MmapWalEngineSpec extends StorageEngineSpec:
       yield tmpFiles.size shouldBe 0
       test
     }
+
+    "should handle concurrent snapshot save and load without corruption" in {
+      val test = for
+        tmpDir <- IO(Files.createTempDirectory("raft-wal-concurrent-snap-"))
+        engine <- MmapWalEngine.open[IO](tmpDir)
+
+        // Save an initial snapshot
+        snap1 = raft.state.Snapshot[IO](
+          lastIncludedIndex = 100L,
+          lastIncludedTerm = 5L,
+          data = fs2.Stream.emits("initial-state".getBytes("UTF-8")).covary[IO]
+        )
+        _ <- engine.saveSnapshot(snap1)
+
+        // Concurrently save a newer snapshot while loading the current one
+        snap2 = raft.state.Snapshot[IO](
+          lastIncludedIndex = 200L,
+          lastIncludedTerm = 8L,
+          data = fs2.Stream.emits("updated-state".getBytes("UTF-8")).covary[IO]
+        )
+
+        results <- (
+          engine.saveSnapshot(snap2),
+          engine.loadSnapshot.flatMap {
+            case Some(s) => s.data.compile.to(Array).map(Some(_))
+            case None    => IO.pure(None)
+          }
+        ).parTupled
+
+        // After concurrent operations, the final state must be consistent
+        finalSnap <- engine.loadSnapshot
+        finalData <- finalSnap
+          .map(_.data.compile.to(Array))
+          .getOrElse(IO.pure(Array.empty[Byte]))
+
+        _ <- engine.close
+        _ <- IO(deleteRecursive(tmpDir))
+      yield
+        // The final snapshot must be snap2 (the newer one)
+        finalSnap shouldBe defined
+        finalSnap.get.lastIncludedIndex shouldBe 200L
+        finalSnap.get.lastIncludedTerm shouldBe 8L
+        new String(finalData) shouldBe "updated-state"
+      test
+    }
   }
