@@ -187,7 +187,7 @@ class ClusterConfigSpec extends AnyFlatSpec with Matchers:
 
     // Verify joint state
     joint.isInJointConsensus shouldBe true
-    joint.members shouldBe newMembers
+    joint.pendingConfig shouldBe Some(newMembers)
 
     // Complete transition
     val completed = joint.completeJointConsensus

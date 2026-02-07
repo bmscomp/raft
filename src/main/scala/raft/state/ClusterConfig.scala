@@ -46,7 +46,8 @@ enum NodeRole:
   */
 case class ClusterConfig(
     members: Map[NodeId, NodeRole] = Map.empty,
-    jointConfig: Option[Map[NodeId, NodeRole]] = None
+    jointConfig: Option[Map[NodeId, NodeRole]] = None,
+    pendingConfig: Option[Map[NodeId, NodeRole]] = None
 ):
   require(
     members.values.exists(r => r == NodeRole.Voter || r == NodeRole.Witness),
@@ -143,7 +144,12 @@ case class ClusterConfig(
       newConfig.values.exists(_ != NodeRole.Learner),
       "New configuration must have at least one voter"
     )
-    copy(members = newConfig, jointConfig = Some(members))
+    val merged = members ++ newConfig
+    copy(
+      members = merged,
+      jointConfig = Some(members),
+      pendingConfig = Some(newConfig)
+    )
 
   /** Complete the joint consensus transition, dropping the old configuration.
     *
@@ -155,7 +161,10 @@ case class ClusterConfig(
     *   [[beginJointConsensus]] to start a transition
     */
   def completeJointConsensus: ClusterConfig =
-    copy(jointConfig = None)
+    pendingConfig match
+      case Some(newMembers) =>
+        copy(members = newMembers, jointConfig = None, pendingConfig = None)
+      case None => copy(jointConfig = None, pendingConfig = None)
 
   /** Abort a joint consensus transition, reverting to the old configuration.
     *
@@ -167,8 +176,9 @@ case class ClusterConfig(
     */
   def abortJointConsensus: ClusterConfig =
     jointConfig match
-      case Some(oldConfig) => copy(members = oldConfig, jointConfig = None)
-      case None            => this
+      case Some(oldConfig) =>
+        copy(members = oldConfig, jointConfig = None, pendingConfig = None)
+      case None => this
 
   /** Check if a node is a voting member (Voter or Witness). */
   def isVoter(nodeId: NodeId): Boolean =
