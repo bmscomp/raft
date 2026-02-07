@@ -280,7 +280,7 @@ class MyRaftSpec extends AnyFlatSpec with Matchers:
 Run the full test suite:
 
 ```bash
-sbt test                            # all 333 tests
+sbt test                            # all 350 tests
 sbt "testOnly *ChaosScenarioSpec"   # adversarial network/timing scenarios
 sbt "testOnly *SafetyPropertySpec"  # property-based safety invariants
 ```

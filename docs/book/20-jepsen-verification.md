@@ -445,7 +445,7 @@ flowchart TB
 | Approach | Time to Run | Bugs Found | Coverage |
 |----------|-----------|-----------|----------|
 | **Unit tests** | Milliseconds | Logic errors in specific cases | Hand-picked scenarios |
-| **Property tests** (Ch.16) | Seconds | Invariant violations from random schedules | Random but in-memory |
+| **Property tests** (Ch.19) | Seconds | Invariant violations from random schedules | Random but in-memory |
 | **Integration tests** | Seconds–minutes | Wiring and SPI errors | Real SPIs, no faults |
 | **Jepsen-style** | Minutes–hours | Concurrency bugs under real faults | Real faults, real clock skew |
 | **TLA+/formal proof** | Hours–months | Design-level impossibilities | All possible executions (model) |

@@ -208,14 +208,14 @@ A lightweight, modular Java Raft library emphasizing minimalism and clean abstra
 - **Explicit effect ADT** gives granular control over side-effect execution (effects can be logged, reordered, filtered, or batched)
 - **Type-safe** with Scala 3 opaque types (`Term`, `LogIndex`, `NodeId`)
 - **Immutable state transitions** — no shared mutable state, no data races possible
-- **Comprehensive feature set**: Pre-Vote, joint consensus, linearizable reads (ReadIndex + lease), leadership transfer, learners, witnesses, batching, pipelining, parallel replication
+- **Comprehensive feature set**: Pre-Vote, joint consensus, linearizable reads (ReadIndex + lease), leadership transfer, learners, witnesses, Multi-Raft Group, batching, pipelining, parallel replication
 - **Pluggable SPI** for all infrastructure concerns (Transport, LogStore, StableStore, StateMachine, TimerService)
 - **Cats Effect + FS2 integration** for resource-safe, cancellation-aware runtimes
 - **Multi-platform**: runs on JVM, Scala.js, and GraalVM native image
 
 **Weaknesses**:
 - Scala ecosystem is smaller than Go, Rust, or Java
-- No Multi-Raft Group support yet
+- Multi-Raft Group support is newer and less battle-tested than single-group mode
 - No Jepsen verification yet
 - Young project — no production track record
 - Requires familiarity with functional programming patterns (effects-as-data, ADTs, referential transparency)
@@ -243,7 +243,7 @@ A lightweight, modular Java Raft library emphasizing minimalism and clean abstra
 | **Batching** | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
 | **Pipelining** | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
 | **Parallel replication** | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **Multi-Raft Group** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| **Multi-Raft Group** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
 | **Jepsen-verified** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 | **Built-in transport** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ (SPI) |
 | **Built-in storage** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ (SPI) |

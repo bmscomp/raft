@@ -241,5 +241,5 @@ Running many groups on one node introduces resource management concerns:
 
 ---
 
-*Next: [Chapter 18 — Jepsen-Style Verification](18-jepsen-verification.md) shows how to prove your Raft implementation is correct under real-world failure conditions using Jepsen-style testing with fault injection and linearizability checking.*
+*Next: [Chapter 20 — Jepsen-Style Verification](20-jepsen-verification.md) shows how to prove your Raft implementation is correct under real-world failure conditions using Jepsen-style testing with fault injection and linearizability checking.*
 

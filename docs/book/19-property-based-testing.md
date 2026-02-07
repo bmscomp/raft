@@ -228,4 +228,4 @@ Because the logic is pure, this reproduces deterministically. No flaky tests, no
 
 ---
 
-*Next: [Chapter 21 — Multi-Raft Group Design](19-multi-raft-groups.md) discusses how to scale beyond a single Raft group to handle larger datasets and higher throughput.*
+*Next: [Chapter 20 — Jepsen-Style Verification](20-jepsen-verification.md) introduces the gold standard for proving consensus correctness under real-world fault injection.*

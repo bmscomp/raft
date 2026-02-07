@@ -168,7 +168,7 @@ The `DefaultTimerService` implementation uses FS2 streams with `Stream.fixedDela
 
 ## Testing Your Integration
 
-The pure protocol tests (333 of them) verify the library's internal logic. You need additional tests for your SPI integration:
+The pure protocol tests (350 of them) verify the library's internal logic. You need additional tests for your SPI integration:
 
 ```scala
 class IntegrationSpec extends AnyFlatSpec:
