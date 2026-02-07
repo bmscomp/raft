@@ -46,7 +46,8 @@ class MmapWalEngine private (
     sealedSegmentsRef: Ref[IO, Vector[(Int, MmapSegment)]],
     walIndex: Ref[IO, WalIndex],
     hardState: MmapHardState,
-    nextSegmentId: Ref[IO, Int]
+    nextSegmentId: Ref[IO, Int],
+    activeSegmentId: Ref[IO, Int]
 ) extends StorageEngine[IO]:
 
   private val walDir = dataDir.resolve("wal")
@@ -57,38 +58,28 @@ class MmapWalEngine private (
     if entries.isEmpty then IO.unit
     else
       for
-        _ <- entries.toList.traverse_(appendSingle)
         seg <- activeSegmentRef.get
-        _ <- IO(seg.force())
+        segId <- activeSegmentId.get
+        batchStart = seg.currentWriteOffset
+        results <- IO(seg.appendBatch(entries))
+        _ <- walIndex.update { idx =>
+          results.foreach { (logIdx, offset) => idx.put(logIdx, segId, offset) }
+          idx
+        }
+        _ <- IO(seg.forceRange(batchStart, seg.currentWriteOffset))
         _ <- maybeCheckpointIndex
       yield ()
-
-  private def appendSingle(log: Log): IO[Unit] =
-    for
-      seg <- activeSegmentRef.get
-      neededSize = EntryOverhead + log.data.length
-      currentSeg <-
-        if seg.remaining < neededSize then rotateSegment else IO.pure(seg)
-      offset <- IO(currentSeg.appendEntry(log))
-      segId <- nextSegmentId.get.map(_ - 1)
-      _ <- walIndex.update { idx =>
-        idx.put(log.index, segId, offset)
-        idx
-      }
-    yield ()
 
   private def rotateSegment: IO[MmapSegment] =
     for
       oldSeg <- activeSegmentRef.get
       _ <- IO(oldSeg.force())
       newId <- nextSegmentId.getAndUpdate(_ + 1)
+      oldId <- activeSegmentId.getAndSet(newId)
       segPath = segmentPath(newId)
       lastIdx <- walIndex.get.map(_.lastIndex)
       newSeg <- IO(MmapSegment.create(segPath, lastIdx + 1))
-      _ <- sealedSegmentsRef.update { segs =>
-        val oldId = newId - 1
-        segs :+ (oldId, oldSeg)
-      }
+      _ <- sealedSegmentsRef.update(_ :+ (oldId, oldSeg))
       _ <- activeSegmentRef.set(newSeg)
     yield newSeg
 
@@ -97,16 +88,32 @@ class MmapWalEngine private (
       idx.get(index.value) match
         case Some(loc) =>
           findSegment(loc.segmentId).flatMap {
-            case Some(seg) => IO(Some(seg.readEntry(loc.fileOffset)))
+            case Some(seg) => IO(Some(seg.readEntryUnchecked(loc.fileOffset)))
             case None      => IO.pure(None)
           }
         case None => IO.pure(None)
     }
 
   def readRange(start: LogIndex, end: LogIndex): IO[Vector[Log]] =
-    (start.value to end.value).toVector
-      .traverse(i => readEntry(LogIndex.unsafeFrom(i)))
-      .map(_.flatten)
+    walIndex.get.flatMap { idx =>
+      val locations = (start.value to end.value).flatMap { i =>
+        idx.get(i).map(loc => (i, loc))
+      }
+      if locations.isEmpty then IO.pure(Vector.empty)
+      else
+        val bySegment = locations.groupBy(_._2.segmentId)
+        bySegment.toVector
+          .flatTraverse { case (segId, locs) =>
+            findSegment(segId).map {
+              case Some(seg) =>
+                locs.map { case (_, loc) =>
+                  seg.readEntryUnchecked(loc.fileOffset)
+                }.toVector
+              case None => Vector.empty
+            }
+          }
+          .map(_.sortBy(_.index))
+    }
 
   def lastLogIndex: IO[LogIndex] =
     walIndex.get.map(idx => LogIndex.unsafeFrom(idx.lastIndex))
@@ -126,9 +133,11 @@ class MmapWalEngine private (
             segOpt <- findSegment(loc.segmentId)
             _ <- segOpt match
               case Some(seg) =>
-                val newCount =
-                  countEntriesBefore(idx, loc.segmentId, index.value)
-                IO(seg.truncateAt(loc.fileOffset, newCount))
+                // Count entries in this segment before the truncation point
+                val newCount = (1L until index.value).count { i =>
+                  idx.get(i).exists(_.segmentId == loc.segmentId)
+                }
+                IO(seg.truncateAt(loc.fileOffset, newCount.toLong))
               case None => IO.unit
             _ <- sealedSegmentsRef.update(_.filter(_._1 <= loc.segmentId))
             _ <- walIndex.update { i =>
@@ -138,19 +147,6 @@ class MmapWalEngine private (
           yield ()
         case None => IO.unit
     yield ()
-
-  private def countEntriesBefore(
-      idx: WalIndex,
-      segId: Int,
-      beforeIndex: Long
-  ): Long =
-    var count = 0L
-    for i <- 1L to idx.lastIndex do
-      idx.get(i) match
-        case Some(loc) if loc.segmentId == segId && i < beforeIndex =>
-          count += 1
-        case _ => ()
-    count
 
   def clearLog: IO[Unit] =
     for
@@ -211,10 +207,9 @@ class MmapWalEngine private (
 
   private def findSegment(segmentId: Int): IO[Option[MmapSegment]] =
     for
-      active <- activeSegmentRef.get
-      currentActiveId <- nextSegmentId.get.map(_ - 1)
+      currentActiveId <- activeSegmentId.get
       result <-
-        if segmentId == currentActiveId then IO.pure(Some(active))
+        if segmentId == currentActiveId then activeSegmentRef.get.map(Some(_))
         else sealedSegmentsRef.get.map(_.find(_._1 == segmentId).map(_._2))
     yield result
 
@@ -334,7 +329,16 @@ object MmapWalEngine:
       activeRef <- Ref.of[IO, MmapSegment](activeSeg)
       sealedRef <- Ref.of[IO, Vector[(Int, MmapSegment)]](Vector.empty)
       nextId <- Ref.of[IO, Int](2)
-    yield new MmapWalEngine(dataDir, activeRef, sealedRef, idx, hs, nextId)
+      activeId <- Ref.of[IO, Int](1)
+    yield new MmapWalEngine(
+      dataDir,
+      activeRef,
+      sealedRef,
+      idx,
+      hs,
+      nextId,
+      activeId
+    )
 
   private def recoverFromWal(
       dataDir: Path,
@@ -357,10 +361,13 @@ object MmapWalEngine:
       checkpointLastIdx = idx.lastIndex
       _ <- IO {
         segments.foreach { case (segId, seg) =>
-          seg.replay { (log, offset) =>
-            if log.index > checkpointLastIdx then
-              idx.put(log.index, segId, offset)
-          }
+          // Skip segments whose entries are fully covered by the checkpoint
+          val segLastIdx = seg.firstIndex + seg.currentEntryCount - 1
+          if segLastIdx > checkpointLastIdx then
+            seg.replay { (log, offset) =>
+              if log.index > checkpointLastIdx then
+                idx.put(log.index, segId, offset)
+            }
         }
       }
       sealedSegs = segments.init.toVector
@@ -369,7 +376,16 @@ object MmapWalEngine:
       sealedRef <- Ref.of[IO, Vector[(Int, MmapSegment)]](sealedSegs)
       idxRef <- Ref.of[IO, WalIndex](idx)
       nextId <- Ref.of[IO, Int](activeEntry._1 + 1)
-    yield new MmapWalEngine(dataDir, activeRef, sealedRef, idxRef, hs, nextId)
+      activeId <- Ref.of[IO, Int](activeEntry._1)
+    yield new MmapWalEngine(
+      dataDir,
+      activeRef,
+      sealedRef,
+      idxRef,
+      hs,
+      nextId,
+      activeId
+    )
 
   /** Resource-based lifecycle for use with `cats.effect.Resource`. */
   def resource(dataDir: Path): Resource[IO, MmapWalEngine] =

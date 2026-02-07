@@ -59,10 +59,10 @@ class MmapSegment private (
     private var entryCount: Long
 ):
 
-  /** Read a log entry at the given file offset.
+  /** Read a log entry at the given file offset, with CRC32 validation.
     *
-    * Validates the CRC32 checksum and raises `CorruptedEntryException` if the
-    * data doesn't match.
+    * Use this on recovery paths where corruption detection is essential. For
+    * hot-path reads during normal operation, prefer `readEntryUnchecked`.
     *
     * @param offset
     *   byte offset within the segment file
@@ -87,11 +87,32 @@ class MmapSegment private (
     val storedCrc =
       mapped.get(ValueLayout.JAVA_INT_UNALIGNED, offset + 25 + dataLen)
 
-    val computedCrc =
-      computeCrc(mapped, offset + 4, recordLen - 8) // skip recordLen and crc
+    val computedCrc = computeCrc(offset + 4, recordLen - 8)
     if storedCrc != computedCrc then
       throw CorruptedEntryException(path, offset, index, storedCrc, computedCrc)
 
+    Log(index, term, LogType.fromOrdinal(logTypeByte.toInt), data)
+
+  /** Read a log entry without CRC validation.
+    *
+    * Faster than `readEntry` — skips the checksum computation and the
+    * intermediate buffer allocation. Safe to use on entries that were written
+    * by this process (i.e., not yet recovered from a crash).
+    */
+  def readEntryUnchecked(offset: Long): Log =
+    val index = mapped.get(ValueLayout.JAVA_LONG_UNALIGNED, offset + 4)
+    val term = mapped.get(ValueLayout.JAVA_LONG_UNALIGNED, offset + 12)
+    val logTypeByte = mapped.get(ValueLayout.JAVA_BYTE, offset + 20)
+    val dataLen = mapped.get(ValueLayout.JAVA_INT_UNALIGNED, offset + 21)
+    val data = new Array[Byte](dataLen)
+    MemorySegment.copy(
+      mapped,
+      ValueLayout.JAVA_BYTE,
+      offset + 25,
+      data,
+      0,
+      dataLen
+    )
     Log(index, term, LogType.fromOrdinal(logTypeByte.toInt), data)
 
   /** Append a log entry at the current write position.
@@ -105,36 +126,41 @@ class MmapSegment private (
     *   the file offset where the entry was written (for the index)
     */
   def appendEntry(log: Log): Long =
-    val recordLen = EntryOverhead + log.data.length
-    val pos = writeOffset
-
-    mapped.set(ValueLayout.JAVA_INT_UNALIGNED, pos, recordLen)
-    mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, pos + 4, log.index)
-    mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, pos + 12, log.term)
-    mapped.set(ValueLayout.JAVA_BYTE, pos + 20, log.logType.ordinal.toByte)
-    mapped.set(ValueLayout.JAVA_INT_UNALIGNED, pos + 21, log.data.length)
-    if log.data.length > 0 then
-      MemorySegment.copy(
-        log.data,
-        0,
-        mapped,
-        ValueLayout.JAVA_BYTE,
-        pos + 25,
-        log.data.length
-      )
-
-    val crc = computeCrc(mapped, pos + 4, recordLen - 8)
-    mapped.set(ValueLayout.JAVA_INT_UNALIGNED, pos + 25 + log.data.length, crc)
-
-    writeOffset = pos + recordLen
-    entryCount += 1
-
-    // Update header entry count
+    val pos = writeRawEntry(log)
     mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, 16, entryCount)
     pos
 
+  /** Append a batch of log entries in a tight loop.
+    *
+    * Writes all entries sequentially, updating the header entry count once at
+    * the end. Returns `(logIndex, fileOffset)` pairs for index updates. The
+    * caller must call `force()` or `forceRange()` after this method.
+    *
+    * @param entries
+    *   the entries to write
+    * @return
+    *   vector of `(logIndex, fileOffset)` pairs
+    */
+  def appendBatch(entries: Seq[Log]): Vector[(Long, Long)] =
+    val results = Vector.newBuilder[(Long, Long)]
+    entries.foreach { log =>
+      val pos = writeRawEntry(log)
+      results += ((log.index, pos))
+    }
+    mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, 16, entryCount)
+    results.result()
+
   /** Flush all pending writes to durable storage (msync). */
   def force(): Unit =
+    mapped.force()
+
+  /** Flush only the bytes in `[fromOffset, toOffset)` to durable storage.
+    *
+    * Currently delegates to full `force()` since `MemorySegment` does not
+    * expose range-based msync. The method boundary exists for future
+    * platform-specific optimization (e.g., direct msync syscall via FFM).
+    */
+  def forceRange(fromOffset: Long, toOffset: Long): Unit =
     mapped.force()
 
   /** Truncate the segment at the given file offset.
@@ -187,12 +213,51 @@ class MmapSegment private (
   def close(): Unit =
     arena.close()
 
-  private def computeCrc(seg: MemorySegment, offset: Long, length: Int): Int =
-    val crc = new CRC32()
-    val bytes = new Array[Byte](length)
-    MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, offset, bytes, 0, length)
-    crc.update(bytes)
-    crc.getValue.toInt
+  /** Write a single entry without updating the header. Shared by `appendEntry`
+    * and `appendBatch`.
+    */
+  private def writeRawEntry(log: Log): Long =
+    val recordLen = EntryOverhead + log.data.length
+    val pos = writeOffset
+
+    mapped.set(ValueLayout.JAVA_INT_UNALIGNED, pos, recordLen)
+    mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, pos + 4, log.index)
+    mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, pos + 12, log.term)
+    mapped.set(ValueLayout.JAVA_BYTE, pos + 20, log.logType.ordinal.toByte)
+    mapped.set(ValueLayout.JAVA_INT_UNALIGNED, pos + 21, log.data.length)
+    if log.data.length > 0 then
+      MemorySegment.copy(
+        log.data,
+        0,
+        mapped,
+        ValueLayout.JAVA_BYTE,
+        pos + 25,
+        log.data.length
+      )
+
+    val crc = computeCrc(pos + 4, recordLen - 8)
+    mapped.set(ValueLayout.JAVA_INT_UNALIGNED, pos + 25 + log.data.length, crc)
+
+    writeOffset = pos + recordLen
+    entryCount += 1
+    pos
+
+  private val crcInstance = new CRC32()
+  private var crcBuffer = new Array[Byte](4096)
+
+  private def computeCrc(offset: Long, length: Int): Int =
+    crcInstance.reset()
+    if length > crcBuffer.length then crcBuffer = new Array[Byte](length)
+    MemorySegment.copy(
+      mapped,
+      ValueLayout.JAVA_BYTE,
+      offset,
+      crcBuffer,
+      0,
+      length
+    )
+    crcInstance.update(crcBuffer, 0, length)
+    crcInstance.getValue.toInt
 
 /** Error raised when a WAL entry fails CRC validation. */
 case class CorruptedEntryException(
