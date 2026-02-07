@@ -85,6 +85,7 @@ Whether you're learning about distributed consensus for the first time or design
 | 14 | [Troubleshooting & Operational Pitfalls](14-troubleshooting.md) | Frequent leader changes, stalled writes, split-brain diagnosis, term inflation, slow followers, diagnostic checklist |
 | 15 | [End-to-End Integration](15-end-to-end-integration.md) | Wiring `RaftNode` with production SPIs, event loop architecture, SPI implementation guidance, deployment topology |
 | 16 | [Property-Based Testing](16-property-based-testing.md) | Five Raft safety invariants as ScalaCheck properties, random event generation, shrinking, deterministic reproduction |
+| 18 | [Jepsen-Style Verification](18-jepsen-verification.md) | Jepsen methodology, fault injection, linearizability checking, real-world results, designing for Jepsen |
 
 ### Part VII — Scaling
 

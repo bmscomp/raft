@@ -199,4 +199,5 @@ Running many groups on one node introduces resource management concerns:
 
 ---
 
-*Next: [Appendix A — Quick Reference](appendix-a-quick-reference.md) provides a one-page lookup for all types, effects, messages, and configuration parameters in the library.*
+*Next: [Chapter 18 — Jepsen-Style Verification](18-jepsen-verification.md) shows how to prove your Raft implementation is correct under real-world failure conditions using Jepsen-style testing with fault injection and linearizability checking.*
+
