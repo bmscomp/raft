@@ -13,7 +13,8 @@ import raft.spi.LogStore
   * @tparam F
   *   the effect type
   */
-class StorageBackedLogStore[F[_]](engine: StorageEngine[F]) extends LogStore[F]:
+class StorageBackedLogStore[F[_]](val engine: StorageEngine[F])
+    extends LogStore[F]:
 
   def get(index: LogIndex): F[Option[Log]] =
     engine.readEntry(index)

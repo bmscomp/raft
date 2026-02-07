@@ -5,7 +5,7 @@ import cats.syntax.all.*
 import java.nio.file.{Files as JFiles, Path as JPath}
 import scala.jdk.CollectionConverters.*
 import fs2.{Stream, Chunk}
-import _root_.fs2.io.file.{Files, Path}
+import fs2.io.file.{Files, Path}
 
 import raft.state.{
   ClusterConfig,
@@ -227,18 +227,42 @@ class MmapWalEngine private (
     IO(hardState.write(state))
 
   def saveSnapshot(snapshot: Snapshot[IO]): IO[Unit] =
-    val snapshotPath = snapshotDir.resolve(
-      s"snapshot-${"%06d".format(snapshot.lastIncludedIndex)}.bin"
-    )
+    val fileName = s"snapshot-${"%06d".format(snapshot.lastIncludedIndex)}"
+    val snapshotPath = snapshotDir.resolve(s"$fileName.bin")
+    val tmpPath = snapshotDir.resolve(s"$fileName.tmp")
     val metadata = Chunk.array(serializeMetadata(snapshot))
     val stream = Stream.chunk(metadata) ++ snapshot.data
 
     IO(JFiles.createDirectories(snapshotDir)) >>
       stream
-        .through(Files[IO].writeAll(Path.fromNioPath(snapshotPath)))
+        .through(Files[IO].writeAll(Path.fromNioPath(tmpPath)))
         .compile
-        .drain
+        .drain >>
+      IO(
+        JFiles.move(
+          tmpPath,
+          snapshotPath,
+          java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+          java.nio.file.StandardCopyOption.ATOMIC_MOVE
+        )
+      ) >>
+      IO {
+        JFiles
+          .list(snapshotDir)
+          .iterator()
+          .asScala
+          .filter(p => p.toString.endsWith(".bin") && !p.equals(snapshotPath))
+          .foreach(JFiles.deleteIfExists)
+      }
 
+  /** Load the most recent snapshot.
+    *
+    * '''Design note:''' metadata is parsed in an initial read pass, while the
+    * returned `Snapshot.data` stream opens the file independently (seeking past
+    * the header bytes). This avoids `ClosedChannelException` when the data
+    * stream is consumed outside the metadata parsing scope, at the cost of
+    * opening the file twice.
+    */
   def loadSnapshot: IO[Option[Snapshot[IO]]] =
     IO(JFiles.exists(snapshotDir)).flatMap { exists =>
       if !exists then IO.pure(None)

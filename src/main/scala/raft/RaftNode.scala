@@ -302,8 +302,17 @@ private class RaftNodeImpl[F[_]: Async](
           )
           _ <- logStore match
             case sbl: raft.storage.StorageBackedLogStore[F] =>
-              Async[F].unit // TODO: Trigger compaction
+              sbl.engine.saveSnapshot(snapshot) *>
+                sbl.engine.discardBefore(
+                  LogIndex.unsafeFrom(
+                    math.max(
+                      1L,
+                      lastApplied - config.compaction.retainedEntries
+                    )
+                  )
+                )
             case _ => Async[F].unit
+          _ <- lastAppliedRef.set(lastApplied)
           _ <- metrics.onSnapshotTaken(config.localId, lastApplied)
         yield ()
       case Eff.InstallSnapshot(snapshot) =>
@@ -324,8 +333,7 @@ private class RaftNodeImpl[F[_]: Async](
             snapshot.lastIncludedIndex
           )
         yield ()
-      case Eff.RequestSnapshot(lastApplied, _) =>
-        Async[F].unit
+
       case Eff.SendSnapshotChunk(to, req) =>
         transport.send(to, req)
       case Eff.BecomeLeader =>
@@ -373,6 +381,14 @@ private class RaftNodeImpl[F[_]: Async](
       case Eff.ExtendLease(_) =>
         Async[F].unit
       case Eff.LeaseReadReady(_) =>
+        Async[F].unit
+      case Eff.StopLeader =>
+        Async[F].unit
+      case Eff.RunReadIndex(_) =>
+        Async[F].unit
+      case Eff.SendReadIndexResponse(_, _) =>
+        Async[F].unit
+      case Eff.VerifyLease(_) =>
         Async[F].unit
     }
 

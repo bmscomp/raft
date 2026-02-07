@@ -43,5 +43,7 @@ case class PendingSnapshot(
     Snapshot(
       lastIncludedIndex = lastIncludedIndex,
       lastIncludedTerm = lastIncludedTerm,
-      data = Stream.emits(chunks).flatMap(chunk => Stream.emits(chunk.toSeq))
+      data = Stream
+        .emits(chunks)
+        .flatMap(chunk => Stream.chunk(fs2.Chunk.array(chunk)))
     )
