@@ -7,67 +7,145 @@ import raft.message.RaftMessage.*
 import raft.effect.*
 import raft.effect.Effect.*
 
-/** Pure RAFT state transition functions. No I/O - effects are data for runtime. */
+/** Pure RAFT state transition functions — the deterministic core of the
+  * consensus engine.
+  *
+  * All functions in this object are pure: they take the current [[NodeState]]
+  * and an incoming [[RaftMessage]], and return a [[Transition]] containing the
+  * new state and a list of [[Effect]]s for the runtime to execute. No I/O is
+  * performed — effects are pure data descriptions.
+  *
+  * This separation makes the consensus logic fully deterministic and testable:
+  * tests assert on the returned state and effect list without any mocking.
+  *
+  * {{{
+  * val follower = NodeState.Follower(term = 1)
+  * val config   = RaftConfig.default(NodeId("node1"))
+  * val timeout  = RaftMessage.ElectionTimeout
+  *
+  * val transition = RaftLogic.onMessage(follower, timeout, config, 0L, 0L, 3)
+  * // transition.state  => PreCandidate or Candidate (depending on preVoteEnabled)
+  * // transition.effects => List(Broadcast(...), ResetElectionTimer, ...)
+  * }}}
+  *
+  * @see
+  *   [[Transition]] for the result type
+  * @see
+  *   [[Effect]] for the side-effect descriptions
+  * @see
+  *   [[raft.RaftNode]] for the runtime that interprets effects
+  */
 object RaftLogic:
-  
-  /** Main message dispatcher. Routes to appropriate handler. */
+
+  /** Main message dispatcher — routes any incoming message to the appropriate
+    * handler.
+    *
+    * This is the single entry point for all protocol events. It handles:
+    *   - `AppendEntriesRequest/Response` — log replication and heartbeats
+    *   - `RequestVoteRequest/Response` — leader elections (including pre-vote)
+    *   - `ElectionTimeout` — triggers election start or restart
+    *   - `HeartbeatTimeout` — triggers leader heartbeat broadcast
+    *
+    * Messages not handled by specialized logic (e.g., snapshot, membership)
+    * return the state unchanged with no effects.
+    *
+    * @param state
+    *   the current node state (Follower, PreCandidate, Candidate, or Leader)
+    * @param msg
+    *   the incoming RAFT message or timeout event
+    * @param config
+    *   the node's configuration (timeouts, features, local ID)
+    * @param lastLogIndex
+    *   the index of the last entry in the local log
+    * @param lastLogTerm
+    *   the term of the last entry in the local log
+    * @param clusterSize
+    *   the total number of voting members in the cluster
+    * @param getTermAt
+    *   callback to look up the term at a given log index; defaults to
+    *   `_ => None` (used for log matching and commit checks)
+    * @return
+    *   a [[Transition]] containing the new state and effects to execute
+    */
   def onMessage(
-    state: NodeState,
-    msg: RaftMessage,
-    config: RaftConfig,
-    lastLogIndex: Long,
-    lastLogTerm: Long,
-    clusterSize: Int,
-    getTermAt: Long => Option[Long] = _ => None
+      state: NodeState,
+      msg: RaftMessage,
+      config: RaftConfig,
+      lastLogIndex: Long,
+      lastLogTerm: Long,
+      clusterSize: Int,
+      getTermAt: Long => Option[Long] = _ => None
   ): Transition = msg match
-    case req: AppendEntriesRequest   => onAppendEntries(state, req, config, getTermAt)
-    case resp: AppendEntriesResponse => onAppendEntriesResponse(state, resp, clusterSize, getTermAt)
-    case req: RequestVoteRequest     => onRequestVote(state, req, config, lastLogIndex, lastLogTerm)
-    case resp: RequestVoteResponse   => handleVoteResponse(state, resp, clusterSize)
-    case ElectionTimeout             => onElectionTimeout(state, config, lastLogIndex, lastLogTerm)
-    case HeartbeatTimeout            => onHeartbeatTimeout(state, config, lastLogIndex)
-    case _                           => Transition.pure(state)
-  
-  /** Handle vote response with voter tracking. Used for testing vote accumulation. */
+    case req: AppendEntriesRequest =>
+      onAppendEntries(state, req, config, getTermAt)
+    case resp: AppendEntriesResponse =>
+      onAppendEntriesResponse(state, resp, clusterSize, getTermAt)
+    case req: RequestVoteRequest =>
+      onRequestVote(state, req, config, lastLogIndex, lastLogTerm)
+    case resp: RequestVoteResponse =>
+      handleVoteResponse(state, resp, clusterSize)
+    case ElectionTimeout =>
+      onElectionTimeout(state, config, lastLogIndex, lastLogTerm)
+    case HeartbeatTimeout => onHeartbeatTimeout(state, config, lastLogIndex)
+    case _                => Transition.pure(state)
+
+  /** Handle a vote response for a Candidate with explicit voter tracking.
+    *
+    * Unlike the internal `handleVoteResponse` which uses simplified voter IDs,
+    * this method accepts an explicit `voter` NodeId for precise vote
+    * accumulation. Primarily used in tests to verify vote counting and majority
+    * detection.
+    *
+    * @param state
+    *   the current Candidate state
+    * @param voter
+    *   the node ID of the voter that responded
+    * @param resp
+    *   the vote response message
+    * @param config
+    *   the node's configuration
+    * @param clusterSize
+    *   the total number of voting members in the cluster
+    * @return
+    *   a [[Transition]] — either to Leader (if majority reached), stepped-down
+    *   Follower (if higher term), or unchanged Candidate
+    */
   def onVoteResponse(
-    state: Candidate,
-    voter: NodeId,
-    resp: RequestVoteResponse,
-    config: RaftConfig,
-    clusterSize: Int
+      state: Candidate,
+      voter: NodeId,
+      resp: RequestVoteResponse,
+      config: RaftConfig,
+      clusterSize: Int
   ): Transition =
     if resp.voteGranted && resp.term == state.term then
       val newCandidate = state.withVote(voter)
       if newCandidate.hasMajority(clusterSize) then
         Transition.withEffect(Leader(state.term), BecomeLeader)
-      else
-        Transition.pure(newCandidate)
+      else Transition.pure(newCandidate)
     else if resp.term > state.term then
       Transition.pure(state.stepDown(resp.term))
-    else
-      Transition.pure(state)
-  
-  // === AppendEntries ===
-  
+    else Transition.pure(state)
+
   private def onAppendEntries(
-    state: NodeState,
-    req: AppendEntriesRequest,
-    config: RaftConfig,
-    getTermAt: Long => Option[Long]
+      state: NodeState,
+      req: AppendEntriesRequest,
+      config: RaftConfig,
+      getTermAt: Long => Option[Long]
   ): Transition =
     // Reject if request term is lower
     if req.term < state.term then
       val response = AppendEntriesResponse(state.term, success = false, 0)
       return Transition.withEffect(state, SendMessage(req.leaderId, response))
-    
+
     // Step down if request term is higher
-    val currentState = if req.term > state.term then state.stepDown(req.term) else state
-    
+    val currentState =
+      if req.term > state.term then state.stepDown(req.term) else state
+
     // Log matching validation
-    val logMatches = 
-      if req.prevLogIndex == 0 then true  // Empty log case
+    val logMatches =
+      if req.prevLogIndex == 0 then true // Empty log case
       else getTermAt(req.prevLogIndex).contains(req.prevLogTerm)
-    
+
     currentState match
       case f: Follower =>
         if !logMatches then
@@ -81,16 +159,23 @@ object RaftLogic:
           // Accept - apply entries and update commit
           val newFollower = Follower(req.term, f.votedFor, Some(req.leaderId))
           val matchIndex = req.prevLogIndex + req.entries.size
-          val response = AppendEntriesResponse(req.term, success = true, matchIndex)
-          
+          val response =
+            AppendEntriesResponse(req.term, success = true, matchIndex)
+
           // Build effects: reset timer, persist entries, respond, apply committed
           val baseEffects = List(ResetElectionTimer)
-          val logEffects = if req.entries.nonEmpty then List(AppendLogs(req.entries)) else Nil
+          val logEffects =
+            if req.entries.nonEmpty then List(AppendLogs(req.entries)) else Nil
           val responseEffect = SendMessage(req.leaderId, response)
-          val commitEffects = if req.leaderCommit > 0 then List(CommitEntries(req.leaderCommit)) else Nil
-          
-          Transition(newFollower, baseEffects ++ logEffects ++ List(responseEffect) ++ commitEffects)
-      
+          val commitEffects =
+            if req.leaderCommit > 0 then List(CommitEntries(req.leaderCommit))
+            else Nil
+
+          Transition(
+            newFollower,
+            baseEffects ++ logEffects ++ List(responseEffect) ++ commitEffects
+          )
+
       case _: Candidate | _: PreCandidate =>
         // Step down to follower, accept leader
         if !logMatches then
@@ -102,109 +187,132 @@ object RaftLogic:
         else
           val newFollower = Follower(req.term, None, Some(req.leaderId))
           val matchIndex = req.prevLogIndex + req.entries.size
-          val response = AppendEntriesResponse(req.term, success = true, matchIndex)
-          Transition(newFollower, List(ResetElectionTimer, SendMessage(req.leaderId, response)))
-      
+          val response =
+            AppendEntriesResponse(req.term, success = true, matchIndex)
+          Transition(
+            newFollower,
+            List(ResetElectionTimer, SendMessage(req.leaderId, response))
+          )
+
       case l: Leader if req.term > l.term =>
         // Higher term leader - step down
         val newFollower = Follower(req.term, None, Some(req.leaderId))
         Transition.withEffect(newFollower, ResetElectionTimer)
-      
+
       case l: Leader =>
         // Reject - we are the leader in this term
         val response = AppendEntriesResponse(l.term, success = false, 0)
         Transition.withEffect(l, SendMessage(req.leaderId, response))
-  
+
   private def onAppendEntriesResponse(
-    state: NodeState,
-    resp: AppendEntriesResponse,
-    clusterSize: Int,
-    getTermAt: Long => Option[Long]
+      state: NodeState,
+      resp: AppendEntriesResponse,
+      clusterSize: Int,
+      getTermAt: Long => Option[Long]
   ): Transition = state match
     case l: Leader if resp.term > l.term =>
       // Higher term - step down
       Transition.pure(l.stepDown(resp.term))
-    
+
     case l: Leader if resp.success =>
       // Success: update matchIndex and nextIndex, check for commit advancement
       // Note: In a real impl, we'd know which follower this is from transport layer
       // For now, we update based on matchIndex value as a simplified model
       val newMatchIndex = resp.matchIndex
       val newNextIndex = resp.matchIndex + 1
-      
+
       // Calculate new commit index
       val newCommitIndex = l.calculateCommitIndex(clusterSize, getTermAt)
-      
+
       if newCommitIndex > l.commitIndex then
         // New entries to commit
         Transition(
           l.withCommitIndex(newCommitIndex),
           List(CommitEntries(newCommitIndex))
         )
-      else
-        Transition.pure(l)
-    
+      else Transition.pure(l)
+
     case l: Leader if !resp.success =>
       // Failure: leader should decrement nextIndex and retry
       // This is handled by the runtime layer tracking per-follower state
       Transition.pure(l)
-    
+
     case _ =>
       Transition.pure(state)
-  
-  // === RequestVote ===
-  
+
   private def onRequestVote(
-    state: NodeState,
-    req: RequestVoteRequest,
-    config: RaftConfig,
-    lastLogIndex: Long,
-    lastLogTerm: Long
+      state: NodeState,
+      req: RequestVoteRequest,
+      config: RaftConfig,
+      lastLogIndex: Long,
+      lastLogTerm: Long
   ): Transition =
     // Check if we should step down
-    val currentState = if req.term > state.term then state.stepDown(req.term) else state
-    
+    val currentState =
+      if req.term > state.term then state.stepDown(req.term) else state
+
     currentState match
       case f: Follower =>
         val canVote = f.votedFor.isEmpty || f.votedFor.contains(req.candidateId)
-        val logOk = isLogUpToDate(req.lastLogIndex, req.lastLogTerm, lastLogIndex, lastLogTerm)
-        
+        val logOk = isLogUpToDate(
+          req.lastLogIndex,
+          req.lastLogTerm,
+          lastLogIndex,
+          lastLogTerm
+        )
+
         // Leader stickiness check
-        val leaderAlive = config.leaderStickinessEnabled && f.leaderId.isDefined && !req.isPreVote
-        
+        val leaderAlive =
+          config.leaderStickinessEnabled && f.leaderId.isDefined && !req.isPreVote
+
         if canVote && logOk && !leaderAlive then
-          val newFollower = if req.isPreVote then f else f.copy(votedFor = Some(req.candidateId))
-          val response = RequestVoteResponse(req.term, voteGranted = true, req.isPreVote)
+          val newFollower =
+            if req.isPreVote then f
+            else f.copy(votedFor = Some(req.candidateId))
+          val response =
+            RequestVoteResponse(req.term, voteGranted = true, req.isPreVote)
           val effects = List(
             SendMessage(req.candidateId, response)
-          ) ++ (if req.isPreVote then Nil else List(PersistHardState(req.term, Some(req.candidateId))))
+          ) ++ (if req.isPreVote then Nil
+                else List(PersistHardState(req.term, Some(req.candidateId))))
           Transition(newFollower, effects)
         else
-          val response = RequestVoteResponse(f.term, voteGranted = false, req.isPreVote)
+          val response =
+            RequestVoteResponse(f.term, voteGranted = false, req.isPreVote)
           Transition.withEffect(f, SendMessage(req.candidateId, response))
-      
+
       case _ =>
-        val response = RequestVoteResponse(currentState.term, voteGranted = false, req.isPreVote)
-        Transition.withEffect(currentState, SendMessage(req.candidateId, response))
-  
+        val response = RequestVoteResponse(
+          currentState.term,
+          voteGranted = false,
+          req.isPreVote
+        )
+        Transition.withEffect(
+          currentState,
+          SendMessage(req.candidateId, response)
+        )
+
   private def handleVoteResponse(
-    state: NodeState,
-    resp: RequestVoteResponse,
-    clusterSize: Int
-  ): Transition = 
+      state: NodeState,
+      resp: RequestVoteResponse,
+      clusterSize: Int
+  ): Transition =
     // Handle pre-vote responses for PreCandidate
     if resp.isPreVote then
       state match
         case p: PreCandidate if resp.voteGranted =>
           // Pre-vote granted - check for majority
-          val newPreCandidate = p.withPreVote(NodeId("voter")) // simplified voter tracking
+          val newPreCandidate =
+            p.withPreVote(NodeId("voter")) // simplified voter tracking
           if newPreCandidate.hasPreVoteMajority(clusterSize) then
             // Pre-vote majority achieved - start real election
             val newTerm = p.term + 1
-            val candidate = Candidate(newTerm, Set(NodeId("self"))) // votes for self
+            val candidate =
+              Candidate(newTerm, Set(NodeId("self"))) // votes for self
             val voteReq = RequestVoteRequest(
               term = newTerm,
-              candidateId = NodeId("self"), // will be replaced by config in runtime
+              candidateId =
+                NodeId("self"), // will be replaced by config in runtime
               lastLogIndex = 0, // will be filled by runtime
               lastLogTerm = 0,
               isPreVote = false
@@ -217,8 +325,7 @@ object RaftLogic:
                 ResetElectionTimer
               )
             )
-          else
-            Transition.pure(newPreCandidate)
+          else Transition.pure(newPreCandidate)
         case p: PreCandidate =>
           // Pre-vote rejected - stay PreCandidate
           Transition.pure(p)
@@ -231,27 +338,25 @@ object RaftLogic:
           val newCandidate = c.withVote(NodeId("voter")) // simplified
           if newCandidate.hasMajority(clusterSize) then
             Transition.withEffect(Leader(c.term), BecomeLeader)
-          else
-            Transition.pure(newCandidate)
+          else Transition.pure(newCandidate)
         case c: Candidate if resp.term > c.term =>
           // Higher term - step down
           Transition.pure(c.stepDown(resp.term))
         case _ =>
           Transition.pure(state)
-  
-  // === Timeouts ===
-  
+
   private def onElectionTimeout(
-    state: NodeState,
-    config: RaftConfig,
-    lastLogIndex: Long,
-    lastLogTerm: Long
+      state: NodeState,
+      config: RaftConfig,
+      lastLogIndex: Long,
+      lastLogTerm: Long
   ): Transition = state match
     case f: Follower if config.preVoteEnabled =>
       // Pre-vote phase: don't increment term yet
       val preCandidate = PreCandidate(f.term, Set(config.localId))
       val voteReq = RequestVoteRequest(
-        term = f.term + 1, // Request votes for NEXT term, but don't persist it yet
+        term =
+          f.term + 1, // Request votes for NEXT term, but don't persist it yet
         candidateId = config.localId,
         lastLogIndex = lastLogIndex,
         lastLogTerm = lastLogTerm,
@@ -262,7 +367,7 @@ object RaftLogic:
         List(Broadcast(voteReq), ResetElectionTimer)
         // No PersistHardState - pre-vote doesn't change persistent state
       )
-    
+
     case f: Follower =>
       // Direct election (pre-vote disabled)
       val newTerm = f.term + 1
@@ -282,7 +387,7 @@ object RaftLogic:
           ResetElectionTimer
         )
       )
-    
+
     case p: PreCandidate =>
       // Timeout during pre-vote - restart pre-vote
       val newPreCandidate = PreCandidate(p.term, Set(config.localId))
@@ -297,7 +402,7 @@ object RaftLogic:
         newPreCandidate,
         List(Broadcast(voteReq), ResetElectionTimer)
       )
-    
+
     case c: Candidate =>
       // Election timeout - restart election
       val newTerm = c.term + 1
@@ -317,15 +422,15 @@ object RaftLogic:
           ResetElectionTimer
         )
       )
-    
+
     case l: Leader =>
       // Leaders don't have election timeouts
       Transition.pure(l)
-  
+
   private def onHeartbeatTimeout(
-    state: NodeState,
-    config: RaftConfig,
-    lastLogIndex: Long
+      state: NodeState,
+      config: RaftConfig,
+      lastLogIndex: Long
   ): Transition = state match
     case l: Leader =>
       // Send heartbeats with actual commit index
@@ -340,14 +445,12 @@ object RaftLogic:
       Transition(l, List(Broadcast(heartbeat), ResetHeartbeatTimer))
     case _ =>
       Transition.pure(state)
-  
-  // === Helpers ===
-  
+
   private def isLogUpToDate(
-    candidateLastIndex: Long,
-    candidateLastTerm: Long,
-    myLastIndex: Long,
-    myLastTerm: Long
+      candidateLastIndex: Long,
+      candidateLastTerm: Long,
+      myLastIndex: Long,
+      myLastTerm: Long
   ): Boolean =
-    candidateLastTerm > myLastTerm || 
+    candidateLastTerm > myLastTerm ||
       (candidateLastTerm == myLastTerm && candidateLastIndex >= myLastIndex)

@@ -4,31 +4,78 @@ import cats.effect.kernel.{Async, Resource}
 import cats.syntax.all.*
 import raft.state.{NodeId, Term}
 
-/**
- * Stable storage for RAFT hard state.
- * 
- * Must be durable - survives restarts.
- */
+/** Stable storage for RAFT hard state (current term and voted-for candidate).
+  *
+  * This state ''must be durable'' — it must survive process crashes and
+  * restarts. The RAFT safety proof depends on the guarantee that a node never
+  * forgets its current term or the candidate it voted for.
+  *
+  * @tparam F
+  *   the effect type (e.g., `IO`)
+  * @see
+  *   [[raft.effect.Effect.PersistHardState]] for the effect that triggers
+  *   writes
+  * @see
+  *   [[raft.impl.InMemStableStore]] for an in-memory test implementation
+  */
 trait StableStore[F[_]]:
-  /** Get current term */
+  /** Retrieve the persisted current term.
+    *
+    * @return
+    *   the current term (defaults to [[Term.Zero]] if never set)
+    */
   def currentTerm: F[Term]
-  
-  /** Set current term */
+
+  /** Persist the current term to durable storage.
+    *
+    * Must be flushed before any RPC response is sent.
+    *
+    * @param term
+    *   the term to persist
+    */
   def setCurrentTerm(term: Term): F[Unit]
-  
-  /** Get voted-for candidate in current term */
+
+  /** Retrieve the candidate voted for in the current term.
+    *
+    * @return
+    *   `Some(candidateId)` if a vote was cast, `None` otherwise
+    */
   def votedFor: F[Option[NodeId]]
-  
-  /** Set voted-for candidate */
+
+  /** Persist the voted-for candidate to durable storage.
+    *
+    * @param nodeId
+    *   `Some(candidateId)` when casting a vote, `None` to clear
+    */
   def setVotedFor(nodeId: Option[NodeId]): F[Unit]
 
-/**
- * Factory for creating StableStore instances.
- */
+/** Factory for creating [[StableStore]] instances with proper resource
+  * lifecycle.
+  *
+  * @tparam F
+  *   the effect type (e.g., `IO`)
+  */
 trait StableStoreFactory[F[_]]:
+  /** Create a new stable store as a managed resource.
+    *
+    * @param path
+    *   the storage path for the hard state file
+    * @return
+    *   a managed resource wrapping the created stable store
+    */
   def create(path: String): Resource[F, StableStore[F]]
 
+/** Companion for [[StableStoreFactory]] providing built-in factory
+  * implementations.
+  */
 object StableStoreFactory:
+  /** Create an in-memory [[StableStoreFactory]] (useful for testing).
+    *
+    * @tparam F
+    *   the effect type (requires `Async`)
+    * @return
+    *   a factory that produces [[raft.impl.InMemStableStore]] instances
+    */
   def inMemory[F[_]: Async]: StableStoreFactory[F] = new StableStoreFactory[F]:
     def create(path: String): Resource[F, StableStore[F]] =
       Resource.eval(
