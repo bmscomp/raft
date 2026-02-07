@@ -25,6 +25,10 @@ case class Snapshot[F[_]](
 /** Accumulator for a snapshot being installed incrementally via
   * `InstallSnapshot` RPC (§7).
   *
+  * '''Memory note:''' all chunks are held in JVM heap until [[toSnapshot]] is
+  * called. For very large state machines, callers should check [[totalBytes]]
+  * and reject transfers that exceed a configured limit.
+  *
   * @see
   *   [[Snapshot]] for the finalized snapshot representation
   */
@@ -32,11 +36,16 @@ case class PendingSnapshot(
     lastIncludedIndex: Long,
     lastIncludedTerm: Long,
     offset: Long,
-    chunks: Vector[Array[Byte]]
+    chunks: Vector[Array[Byte]],
+    totalBytes: Long = 0L
 ):
   /** Append a new data chunk and advance the offset. */
   def appendChunk(chunk: Array[Byte]): PendingSnapshot =
-    copy(offset = offset + chunk.length, chunks = chunks :+ chunk)
+    copy(
+      offset = offset + chunk.length,
+      chunks = chunks :+ chunk,
+      totalBytes = totalBytes + chunk.length
+    )
 
   /** Assemble the buffered chunks into a complete [[Snapshot]]. */
   def toSnapshot[F[_]]: Snapshot[F] =

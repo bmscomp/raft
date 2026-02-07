@@ -2,6 +2,7 @@ package raft.storage.mmap
 
 import cats.effect.IO
 import java.nio.file.{Files, Path}
+import scala.jdk.CollectionConverters.*
 
 import raft.storage.{StorageEngine, StorageEngineSpec}
 
@@ -345,6 +346,79 @@ class MmapWalEngineSpec extends StorageEngineSpec:
       yield
         e6 shouldBe defined
         e6.get.term shouldBe 2L
+      test
+    }
+
+    "should overwrite snapshot and clean up old files" in {
+      val test = for
+        tmpDir <- IO(Files.createTempDirectory("raft-wal-snap-gc-"))
+        engine <- MmapWalEngine.open(tmpDir)
+
+        snap1 = raft.state.Snapshot[IO](
+          lastIncludedIndex = 100L,
+          lastIncludedTerm = 3L,
+          data = fs2.Stream.emits("snap-v1".getBytes("UTF-8")).covary[IO]
+        )
+        _ <- engine.saveSnapshot(snap1)
+
+        snap2 = raft.state.Snapshot[IO](
+          lastIncludedIndex = 200L,
+          lastIncludedTerm = 5L,
+          data = fs2.Stream.emits("snap-v2".getBytes("UTF-8")).covary[IO]
+        )
+        _ <- engine.saveSnapshot(snap2)
+
+        snapDir = tmpDir.resolve("snapshots")
+        binFiles <- IO {
+          Files
+            .list(snapDir)
+            .iterator()
+            .asScala
+            .filter(_.toString.endsWith(".bin"))
+            .toList
+        }
+
+        loaded <- engine.loadSnapshot
+        loadedData <- loaded
+          .map(_.data.compile.to(Array))
+          .getOrElse(IO.pure(Array.empty[Byte]))
+
+        _ <- engine.close
+        _ <- IO(deleteRecursive(tmpDir))
+      yield
+        binFiles.size shouldBe 1
+        binFiles.head.getFileName.toString shouldBe "snapshot-000200.bin"
+        loaded shouldBe defined
+        loaded.get.lastIncludedIndex shouldBe 200L
+        loaded.get.lastIncludedTerm shouldBe 5L
+        new String(loadedData) shouldBe "snap-v2"
+      test
+    }
+
+    "should not leave .tmp files after successful snapshot save" in {
+      val test = for
+        tmpDir <- IO(Files.createTempDirectory("raft-wal-snap-tmp-"))
+        engine <- MmapWalEngine.open(tmpDir)
+        snap = raft.state.Snapshot[IO](
+          lastIncludedIndex = 50L,
+          lastIncludedTerm = 2L,
+          data = fs2.Stream.emits("clean-snap".getBytes("UTF-8")).covary[IO]
+        )
+        _ <- engine.saveSnapshot(snap)
+
+        snapDir = tmpDir.resolve("snapshots")
+        tmpFiles <- IO {
+          Files
+            .list(snapDir)
+            .iterator()
+            .asScala
+            .filter(_.toString.endsWith(".tmp"))
+            .toList
+        }
+
+        _ <- engine.close
+        _ <- IO(deleteRecursive(tmpDir))
+      yield tmpFiles.size shouldBe 0
       test
     }
   }

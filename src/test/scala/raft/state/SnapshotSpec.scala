@@ -73,3 +73,20 @@ class SnapshotSpec extends AnyFlatSpec with Matchers:
     val dataBytes = snapshot.data.compile.toVector.toArray
     new String(dataBytes) shouldBe "hello world"
   }
+
+  it should "track totalBytes across appended chunks" in {
+    val pending = PendingSnapshot(
+      lastIncludedIndex = 100,
+      lastIncludedTerm = 5,
+      offset = 0,
+      chunks = Vector.empty
+    )
+    pending.totalBytes shouldBe 0L
+
+    val chunk1 = new Array[Byte](1024)
+    val chunk2 = new Array[Byte](2048)
+    val updated = pending.appendChunk(chunk1).appendChunk(chunk2)
+
+    updated.totalBytes shouldBe 3072L
+    updated.offset shouldBe 3072L
+  }

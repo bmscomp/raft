@@ -8,6 +8,8 @@ import raft.state.{NodeId, Snapshot}
 import raft.spi.RaftTransport
 import fs2.{Chunk, Pull, Stream}
 
+import scala.concurrent.duration.*
+
 /** Handles chunked snapshot transfer from leader to lagging followers.
   *
   * When a follower's log is too far behind (its next index is before the
@@ -23,11 +25,14 @@ import fs2.{Chunk, Pull, Stream}
   *   the transport layer for sending messages
   * @param logger
   *   structured logger
+  * @param chunkTimeout
+  *   maximum time to wait for each chunk send before failing
   */
 class SnapshotTransfer[F[_]: Async](
     chunkSize: Int,
     transport: RaftTransport[F],
-    logger: Logger[F]
+    logger: Logger[F],
+    chunkTimeout: FiniteDuration = 30.seconds
 ):
 
   /** Send a complete snapshot to a follower in chunks.
@@ -74,7 +79,17 @@ class SnapshotTransfer[F[_]: Async](
               s"Sending snapshot chunk ${idx + 1} to ${target.value} (offset=$offset, done=$isLast)"
             )
 
-            Pull.eval(logAction >> transport.send(target, req)) >> {
+            Pull.eval(
+              logAction >> Async[F].timeoutTo(
+                transport.send(target, req),
+                chunkTimeout,
+                Async[F].raiseError(
+                  new java.util.concurrent.TimeoutException(
+                    s"Snapshot chunk ${idx + 1} send to ${target.value} timed out after $chunkTimeout"
+                  )
+                )
+              )
+            ) >> {
               if isLast then Pull.output1(idx + 1)
               else go(tail, idx + 1, offset + chunk.size)
             }
