@@ -46,6 +46,12 @@ Whether you're learning about distributed consensus for the first time or buildi
 | 11 | [Replicated Counter](11-case-distributed-counter.md) | Full cluster simulation, in-memory networking |
 | 12 | [Distributed Transactions](12-case-distributed-transactions.md) | Multi-key atomicity, optimistic concurrency, CAS |
 
+### Part V — Ecosystem
+
+| # | Chapter | Topics |
+|---|---------|--------|
+| 13 | [State of the Art](13-state-of-the-art.md) | Library comparison, feature matrix, strengths/weaknesses, decision guide |
+
 ---
 
 ## Quick Start
