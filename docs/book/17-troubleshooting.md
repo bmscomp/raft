@@ -1,4 +1,4 @@
-# Chapter 16: Troubleshooting & Operational Pitfalls
+# Chapter 17: Troubleshooting & Operational Pitfalls
 
 *Production Raft clusters hit failure modes that don't appear in textbooks. This chapter catalogs the most common operational problems, explains why they happen, and provides concrete diagnostic steps. If you're running Raft in production and something goes wrong, start here.*
 
@@ -108,7 +108,7 @@ This should **not** happen with a correct Raft implementation. If it does, the m
 - Verify your `StableStore` persists to durable storage and survives process restarts
 - Verify `PersistHardState` effects are awaited before sending any responses
 - If using lease reads, increase `maxClockSkew` margin or switch to ReadIndex
-- Run the library's property-based safety tests to verify your integration (see [Chapter 18](18-property-based-testing.md))
+- Run the library's property-based safety tests to verify your integration (see [Chapter 19](19-property-based-testing.md))
 
 ---
 
@@ -217,4 +217,4 @@ When debugging a Raft cluster, check these in order:
 
 ---
 
-*Next: [Chapter 17 — End-to-End Integration](17-end-to-end-integration.md) shows how to wire all the SPIs together into a production-ready `RaftNode` runtime.*
+*Next: [Chapter 18 — End-to-End Integration](18-end-to-end-integration.md) shows how to wire all the SPIs together into a production-ready `RaftNode` runtime.*

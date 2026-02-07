@@ -1,4 +1,4 @@
-# Chapter 18: Property-Based Testing for Raft
+# Chapter 19: Property-Based Testing for Raft
 
 *Raft's correctness rests on a handful of precise safety invariants. This chapter shows how to express those invariants as machine-checkable properties using ScalaCheck, then throw thousands of random message schedules at them. If any schedule violates an invariant, you have a bug — and the test gives you the exact sequence that triggers it.*
 
@@ -228,4 +228,4 @@ Because the logic is pure, this reproduces deterministically. No flaky tests, no
 
 ---
 
-*Next: [Chapter 20 — Multi-Raft Group Design](19-multi-raft-groups.md) discusses how to scale beyond a single Raft group to handle larger datasets and higher throughput.*
+*Next: [Chapter 21 — Multi-Raft Group Design](19-multi-raft-groups.md) discusses how to scale beyond a single Raft group to handle larger datasets and higher throughput.*

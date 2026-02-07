@@ -1,4 +1,4 @@
-# Chapter 19: Jepsen-Style Verification
+# Chapter 20: Jepsen-Style Verification
 
 *You've written unit tests, property-based tests, and debugged your cluster with the troubleshooting checklist. But the most dangerous bugs in distributed systems don't show up in any of these — they emerge only under real-world failure conditions: network partitions healing at exactly the wrong moment, a leader crashing mid-replication, clock skew interacting with lease reads. This chapter introduces Jepsen-style verification — the gold standard for proving that a consensus implementation actually works under chaos.*
 

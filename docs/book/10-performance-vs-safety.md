@@ -464,4 +464,4 @@ quadrantChart
 
 ---
 
-*Next: [Chapter 11 — Case Study: Distributed Key-Value Store](11-case-distributed-kv.md) builds a complete replicated data store using everything we've covered, from command encoding to linearizable reads and snapshot recovery.*
+*Next: [Chapter 11 — Failure Modes: A Practitioner.s Field Guide](11-failure-modes.md) builds a complete replicated data store using everything we've covered, from command encoding to linearizable reads and snapshot recovery.*

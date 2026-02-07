@@ -1,4 +1,4 @@
-# Chapter 13: Case Study — Replicated Counter with Full Cluster Simulation
+# Chapter 14: Case Study — Replicated Counter with Full Cluster Simulation
 
 *The previous case studies focused on individual state machines. This one goes further: we simulate a complete 3-node Raft cluster with in-memory networking, showing how election, replication, and commit work end-to-end. The counter itself is simple — the value is in seeing the full system work together.*
 
@@ -265,4 +265,4 @@ sbt "runMain examples.distributed.DistributedCounterExample"
 
 ---
 
-*Next: [Chapter 14 — Case Study: Distributed Transactions](14-case-distributed-transactions.md) tackles the hardest problem yet — multi-key atomic operations with optimistic concurrency control and serializable isolation.*
+*Next: [Chapter 15 — Case Study: Distributed Transactions](15-case-distributed-transactions.md) tackles the hardest problem yet — multi-key atomic operations with optimistic concurrency control and serializable isolation.*

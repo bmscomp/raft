@@ -1,4 +1,4 @@
-# Chapter 12: Case Study — Distributed Lock Service
+# Chapter 13: Case Study — Distributed Lock Service
 
 *Mutual exclusion across distributed processes is one of the hardest problems in distributed systems. This case study builds a lock service with TTL-based leases, ownership tracking, automatic expiration, and reentrant acquisition — the same primitives that power Google's Chubby and Apache ZooKeeper. The key insight: a Raft-replicated state machine turns lock management from a distributed problem into a sequential one.*
 
@@ -237,4 +237,4 @@ sbt "runMain examples.lock.DistributedLockExample"
 
 ---
 
-*Next: [Chapter 13 — Case Study: Replicated Counter](13-case-distributed-counter.md) goes beyond a single state machine and simulates a complete 3-node Raft cluster with in-memory networking, showing how election, replication, and commit work end-to-end.*
+*Next: [Chapter 14 — Case Study: Replicated Counter](14-case-distributed-counter.md) goes beyond a single state machine and simulates a complete 3-node Raft cluster with in-memory networking, showing how election, replication, and commit work end-to-end.*
