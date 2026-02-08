@@ -25,7 +25,8 @@ case class WorkloadConfig(
 /** Concurrent client pool that generates operations and records history.
   *
   * Each client runs as a fiber, picking random operations and recording them in
-  * the shared HistoryRecorder.
+  * the shared HistoryRecorder. All operations are real atomic primitives — no
+  * fake CAS (which would be a non-atomic read-then-write).
   */
 class ClientPool[F[_]: Async](
     cluster: SimulatedCluster[F],
@@ -33,12 +34,13 @@ class ClientPool[F[_]: Async](
     recorder: HistoryRecorder[F]
 ):
 
+  private val writeCounter = java.util.concurrent.atomic.AtomicLong(0L)
+
   /** Run the workload for the given duration, returning the recorded history.
     */
   def run(duration: FiniteDuration): F[History] =
     for
       random <- Random.scalaUtilRandom[F]
-      // Shared leader cache — all clients try the known leader first
       leaderRef <- Ref.of[F, Option[NodeId]](None)
       fibers <- (0 until config.numClients).toList.traverse { clientId =>
         Async[F].start(runClient(clientId, duration, random, leaderRef))
@@ -47,7 +49,8 @@ class ClientPool[F[_]: Async](
       history <- recorder.snapshot
     yield history
 
-  /** Pick the best node: cached leader if known, otherwise random. */
+  /** Pick the best node: cached leader if known, otherwise discover or random.
+    */
   private def pickNode(
       leaderRef: Ref[F, Option[NodeId]],
       random: Random[F]
@@ -55,7 +58,6 @@ class ClientPool[F[_]: Async](
     leaderRef.get.flatMap {
       case Some(leader) => Async[F].pure(leader)
       case None         =>
-        // Try to discover leader first
         cluster.getLeader.flatMap {
           case Some(leader) =>
             leaderRef.set(Some(leader)).as(leader)
@@ -64,7 +66,7 @@ class ClientPool[F[_]: Async](
         }
     }
 
-  /** Invalidate cached leader on NotLeader responses. */
+  /** Invalidate cached leader on NotLeader/Timeout responses. */
   private def onNotLeader(leaderRef: Ref[F, Option[NodeId]]): F[Unit] =
     leaderRef.set(None)
 
@@ -96,6 +98,7 @@ class ClientPool[F[_]: Async](
 
     loop.handleError(_ => ())
 
+  /** Register workload: 50/50 read/write on a set of keys. */
   private def randomRegisterOp(
       clientId: Int,
       node: NodeId,
@@ -112,6 +115,8 @@ class ClientPool[F[_]: Async](
         else doWrite(clientId, node, key, random, leaderRef)
     yield ()
 
+  /** KV workload: reads and writes (no CAS — we lack an atomic CAS primitive).
+    */
   private def randomKVOp(
       clientId: Int,
       node: NodeId,
@@ -122,13 +127,13 @@ class ClientPool[F[_]: Async](
     for
       keyIdx <- random.nextIntBounded(numKeys)
       key = s"key-$keyIdx"
-      opChoice <- random.nextIntBounded(3)
-      _ <- opChoice match
-        case 0 => doRead(clientId, node, key, leaderRef)
-        case 1 => doWrite(clientId, node, key, random, leaderRef)
-        case _ => doCAS(clientId, node, key, random, leaderRef)
+      isRead <- random.nextBoolean
+      _ <-
+        if isRead then doRead(clientId, node, key, leaderRef)
+        else doWrite(clientId, node, key, random, leaderRef)
     yield ()
 
+  /** Write-only workload: only writes. */
   private def randomWriteOp(
       clientId: Int,
       node: NodeId,
@@ -172,8 +177,8 @@ class ClientPool[F[_]: Async](
       leaderRef: Ref[F, Option[NodeId]]
   ): F[Unit] =
     for
-      valueNum <- random.nextIntBounded(1000)
-      value = s"v$valueNum"
+      seq <- Async[F].delay(writeCounter.getAndIncrement())
+      value = s"c${clientId}_$seq"
       idx <- recorder.invoke(clientId, OpFunction.Write, key, Some(value))
       result <- cluster.submitPut(node, key, value)
       _ <- result match
@@ -187,45 +192,4 @@ class ClientPool[F[_]: Async](
             recorder.info(idx, clientId, OpFunction.Write, key, "not-leader")
         case SubmitResult.Error(msg) =>
           recorder.info(idx, clientId, OpFunction.Write, key, msg)
-    yield ()
-
-  private def doCAS(
-      clientId: Int,
-      node: NodeId,
-      key: String,
-      random: Random[F],
-      leaderRef: Ref[F, Option[NodeId]]
-  ): F[Unit] =
-    for
-      current <- cluster.submitGet(node, key)
-      _ <- current match
-        case ReadResult.Found(Some(oldVal)) =>
-          for
-            valueNum <- random.nextIntBounded(1000)
-            newVal = s"v$valueNum"
-            idx <- recorder.invoke(
-              clientId,
-              OpFunction.CAS,
-              key,
-              Some((oldVal, newVal))
-            )
-            result <- cluster.submitPut(node, key, newVal)
-            _ <- result match
-              case SubmitResult.Success(_) =>
-                recorder.ok(idx, clientId, OpFunction.CAS, key, Some("ok"))
-              case SubmitResult.Timeout =>
-                onNotLeader(leaderRef) *>
-                  recorder.info(idx, clientId, OpFunction.CAS, key, "timeout")
-              case _ =>
-                onNotLeader(leaderRef) *>
-                  recorder.fail(
-                    idx,
-                    clientId,
-                    OpFunction.CAS,
-                    key,
-                    "cas-failed"
-                  )
-          yield ()
-        case _ =>
-          onNotLeader(leaderRef) *> Async[F].unit
     yield ()

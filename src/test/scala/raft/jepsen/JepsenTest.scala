@@ -13,7 +13,7 @@ case class JepsenStats(
     totalOps: Int,
     successfulOps: Int,
     failedOps: Int,
-    timedOutOps: Int,
+    indeterminateOps: Int,
     nemesisEvents: Int,
     durationMs: Long
 )
@@ -39,7 +39,8 @@ case class JepsenResult(
       }\n\n")
 
     sb.append(
-      s"  Operations:    ${stats.totalOps} total, ${stats.successfulOps} ok, ${stats.failedOps} failed, ${stats.timedOutOps} timed out\n"
+      s"  Operations:    ${stats.totalOps} total, ${stats.successfulOps} ok, " +
+        s"${stats.failedOps} failed, ${stats.indeterminateOps} indeterminate\n"
     )
     sb.append(s"  Nemesis:       ${stats.nemesisEvents} events\n")
     sb.append(s"  Duration:      ${stats.durationMs}ms\n")
@@ -52,6 +53,9 @@ case class JepsenResult(
       checkResult.violation.foreach { v =>
         sb.append(s"\n  Violation: ${v.description}\n")
         sb.append(s"  Involved ops: ${v.involvedOps.size}\n")
+        sb.append("\n  Timeline of violating operations:\n")
+        val violation = History(v.involvedOps)
+        sb.append(violation.timeline)
       }
 
     sb.append("\n" + "═" * 60 + "\n")
@@ -74,14 +78,12 @@ case class JepsenTest(
   def run: IO[JepsenResult] =
     val startTime = System.currentTimeMillis()
     for
-      // Create cluster
       cluster <- SimulatedCluster.create[IO](clusterSize)
       _ <- cluster.start
 
-      // Let the cluster elect a leader
-      _ <- IO.sleep(2.seconds)
+      // Poll for leader election instead of fixed sleep
+      _ <- waitForLeader(cluster, maxAttempts = 40, interval = 100.millis)
 
-      // Create workload components
       recorder = new HistoryRecorder[IO]
       pool = new ClientPool[IO](
         cluster,
@@ -102,18 +104,17 @@ case class JepsenTest(
         case None =>
           pool.run(duration).as(Vector.empty[NemesisEvent])
 
-      // Collect history
+      // Grace period: let in-flight ops settle
+      _ <- IO.sleep(500.millis)
+
       history <- recorder.snapshot
 
-      // Check linearizability
       checkResult = LinearizabilityChecker.check(history, model)
 
-      // Stop cluster
       _ <- cluster.stop
 
       elapsed = System.currentTimeMillis() - startTime
 
-      // Build stats
       invocations = history.invocations.size
       oks = history.operations.count(_.opType == OpType.Ok)
       fails = history.operations.count(_.opType == OpType.Fail)
@@ -136,3 +137,19 @@ case class JepsenTest(
 
       _ <- IO.println(result.report)
     yield result
+
+  /** Polls until a leader is elected or max attempts exhausted. */
+  private def waitForLeader(
+      cluster: SimulatedCluster[IO],
+      maxAttempts: Int,
+      interval: FiniteDuration
+  ): IO[Unit] =
+    def poll(remaining: Int): IO[Unit] =
+      if remaining <= 0 then
+        IO.println("  ⚠ No leader elected within timeout, proceeding anyway")
+      else
+        cluster.getLeader.flatMap {
+          case Some(_) => IO.unit
+          case None    => IO.sleep(interval) >> poll(remaining - 1)
+        }
+    poll(maxAttempts)

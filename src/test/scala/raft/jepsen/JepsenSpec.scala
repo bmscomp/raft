@@ -27,6 +27,7 @@ class JepsenSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       model = RegisterModel
     ).run.asserting { result =>
       result.stats.totalOps should be > 0
+      result.stats.successfulOps should be > 0
       result.linearizable shouldBe true
     }
   }
@@ -41,6 +42,7 @@ class JepsenSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       model = RegisterModel
     ).run.asserting { result =>
       result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
       result.linearizable shouldBe true
     }
   }
@@ -55,6 +57,7 @@ class JepsenSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       model = RegisterModel
     ).run.asserting { result =>
       result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
       result.linearizable shouldBe true
     }
   }
@@ -69,6 +72,7 @@ class JepsenSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       model = RegisterModel
     ).run.asserting { result =>
       result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
       result.linearizable shouldBe true
     }
   }
@@ -83,6 +87,7 @@ class JepsenSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       model = RegisterModel
     ).run.asserting { result =>
       result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
       result.linearizable shouldBe true
     }
   }
@@ -94,6 +99,36 @@ class JepsenSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       duration = 10.seconds,
       nemesisSchedule = Some(NemesisSchedule.RandomPartitions(3.seconds)),
       workload = Workload.KVStore(5),
+      model = RegisterModel
+    ).run.asserting { result =>
+      result.stats.totalOps should be > 0
+      result.stats.successfulOps should be > 0
+      result.linearizable shouldBe true
+    }
+  }
+
+  it should "maintain linearizability under leader hunting" taggedAs JepsenTag in {
+    JepsenTest(
+      clusterSize = 5,
+      clients = 3,
+      duration = 10.seconds,
+      nemesisSchedule = Some(NemesisSchedule.LeaderHunter(2.seconds)),
+      workload = Workload.Register(1),
+      model = RegisterModel
+    ).run.asserting { result =>
+      result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
+      result.linearizable shouldBe true
+    }
+  }
+
+  it should "maintain linearizability with write-only workload" taggedAs JepsenTag in {
+    JepsenTest(
+      clusterSize = 3,
+      clients = 3,
+      duration = 5.seconds,
+      nemesisSchedule = None,
+      workload = Workload.WriteOnly(3),
       model = RegisterModel
     ).run.asserting { result =>
       result.stats.totalOps should be > 0

@@ -96,7 +96,13 @@ class SimulatedCluster[F[_]: Async](
         .map(_.headOption)
     }
 
-  /** Submit a write (PUT) command to a specific node. Waits for commit. */
+  /** Submit a write (PUT) command to a specific node.
+    *
+    * Submits to the leader and polls the state machine to confirm commit. Only
+    * records as Success after confirming the value was applied. If confirmation
+    * times out, returns Timeout (recorded as Info/indeterminate by the client —
+    * correct Jepsen semantics for unconfirmed writes).
+    */
   def submitPut(nodeId: NodeId, key: String, value: String): F[SubmitResult] =
     val cmd = KVCommand.Put(key, value)
     val data = KVCommand.encode(cmd)
@@ -106,11 +112,10 @@ class SimulatedCluster[F[_]: Async](
           node
             .submit(data)
             .flatMap { _ =>
-              // Wait for the value to be applied in the state machine
               waitForCommit(nodeId, key, value)
                 .as(SubmitResult.Success("ok"): SubmitResult)
             }
-            .timeoutTo(2.seconds, Async[F].pure(SubmitResult.Timeout))
+            .timeoutTo(3.seconds, Async[F].pure(SubmitResult.Timeout))
             .handleError { e =>
               if e.getMessage != null && e.getMessage.contains("Not leader")
               then SubmitResult.NotLeader(None)
@@ -120,7 +125,9 @@ class SimulatedCluster[F[_]: Async](
           Async[F].pure(SubmitResult.Error(s"Node $nodeId not found"))
     }
 
-  /** Poll the state machine until the key has the expected value. */
+  /** Poll the state machine for the expected value. Uses a short poll interval
+    * with bounded retries.
+    */
   private def waitForCommit(
       nodeId: NodeId,
       key: String,
@@ -128,17 +135,25 @@ class SimulatedCluster[F[_]: Async](
   ): F[Unit] =
     stateMachines.get(nodeId) match
       case Some(sm) =>
-        def poll: F[Unit] =
-          sm.get(key).flatMap {
-            case Some(v) if v == expected => Async[F].unit
-            case _                        => Async[F].sleep(10.millis) >> poll
-          }
-        poll
+        def poll(remaining: Int): F[Unit] =
+          if remaining <= 0 then
+            Async[F].raiseError(
+              new RuntimeException(s"Commit poll exhausted for $key=$expected")
+            )
+          else
+            sm.get(key).flatMap {
+              case Some(v) if v == expected => Async[F].unit
+              case _ => Async[F].sleep(5.millis) >> poll(remaining - 1)
+            }
+        poll(500)
       case None => Async[F].unit
 
-  /** Submit a read (GET) via the node's state machine, but only if the node is
-    * leader. Reading from a follower could return stale data that violates
-    * linearizability.
+  /** Read via the leader's state machine with a read-fence.
+    *
+    * The read-fence checks leadership both before and after reading from the
+    * state machine. If leadership is lost between the two checks, the read is
+    * discarded (returns NotLeader) to prevent returning stale data that would
+    * violate linearizability.
     */
   def submitGet(nodeId: NodeId, key: String): F[ReadResult] =
     nodesRef.get.flatMap { nodes =>
@@ -148,7 +163,15 @@ class SimulatedCluster[F[_]: Async](
             .flatMap {
               case _: NodeState.Leader =>
                 sm.get(key)
-                  .map(v => ReadResult.Found(v): ReadResult)
+                  .flatMap { v =>
+                    // Read-fence: verify still leader after reading
+                    node.getState.map {
+                      case _: NodeState.Leader =>
+                        ReadResult.Found(v): ReadResult
+                      case _ =>
+                        ReadResult.NotLeader(None): ReadResult
+                    }
+                  }
                   .timeoutTo(2.seconds, Async[F].pure(ReadResult.Timeout))
                   .handleError(e => ReadResult.Error(e.getMessage))
               case _ =>
@@ -165,7 +188,8 @@ class SimulatedCluster[F[_]: Async](
       stateRef,
       nodeIds,
       onNodeKill = id => stopNode(id),
-      onNodeRestart = id => restartNode(id)
+      onNodeRestart = id => restartNode(id),
+      onGetLeader = getLeader
     )
 
 object SimulatedCluster:
@@ -178,11 +202,9 @@ object SimulatedCluster:
   /** Create a simulated cluster with specific node IDs. */
   def createWithIds[F[_]: Async](ids: List[NodeId]): F[SimulatedCluster[F]] =
     for
-      // Create partitionable transports
       result <- PartitionableTransport.createCluster[F](ids)
       (transports, stateRef) = result
 
-      // Create storage for each node
       logStores <- ids
         .traverse(id => InMemLogStore[F]().map(id -> _))
         .map(_.toMap)
@@ -190,20 +212,16 @@ object SimulatedCluster:
         .traverse(id => InMemStableStore[F]().map(id -> _))
         .map(_.toMap)
 
-      // Create state machines for each node
       stateMachines <- ids
         .traverse(id => KVStateMachine[F].map(id -> _))
         .map(_.toMap)
 
-      // Create timer services
       timerServices <- ids
         .traverse(id => DefaultTimerService[F].map(id -> _))
         .map(_.toMap)
 
-      // Build cluster config
       clusterConfig = ClusterConfig(ids.map(_ -> NodeRole.Voter).toMap)
 
-      // Create RaftNode instances (use Resource.allocated to manage lifecycle manually)
       nodes <- ids
         .traverse { id =>
           val config = RaftConfig(

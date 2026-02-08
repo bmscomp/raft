@@ -52,9 +52,13 @@ case class History(operations: Vector[Operation]):
   def invocations: Vector[Operation] =
     operations.filter(_.opType == OpType.Invoke)
 
-  /** All completions (Ok or Fail) in this history. */
+  /** All definite completions (Ok or Fail) in this history. */
   def completions: Vector[Operation] =
     operations.filter(op => op.opType == OpType.Ok || op.opType == OpType.Fail)
+
+  /** All completion records including Info (indeterminate). */
+  def allCompletions: Vector[Operation] =
+    operations.filter(_.opType != OpType.Invoke)
 
   /** Pair each invocation with its completion (if any). */
   def pairs: Vector[(Operation, Option[Operation])] =
@@ -73,9 +77,26 @@ case class History(operations: Vector[Operation]):
   /** Number of operations. */
   def size: Int = operations.size
 
-  /** Remove incomplete operations (invocations without completions). */
+  /** Remove Info (indeterminate) operations entirely — both their invocations
+    * and info records. In Jepsen, Info ops represent operations whose outcome
+    * is unknown (timeouts, not-leader), so they must not participate in
+    * linearizability checking.
+    */
+  def withoutInfo: History =
+    val infoIndices = operations
+      .filter(_.opType == OpType.Info)
+      .map(_.index)
+      .toSet
+    History(operations.filter { op =>
+      op.opType != OpType.Info &&
+      !(op.opType == OpType.Invoke && infoIndices.contains(op.index))
+    })
+
+  /** Remove incomplete operations (invocations without any completion). An
+    * invocation is complete if it has an Ok, Fail, or Info record.
+    */
   def trimIncomplete: History =
-    val completedIndices = completions.map(_.index).toSet
+    val completedIndices = allCompletions.map(_.index).toSet
     History(operations.filter { op =>
       op.opType != OpType.Invoke || completedIndices.contains(op.index)
     })

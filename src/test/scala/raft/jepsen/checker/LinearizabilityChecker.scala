@@ -58,15 +58,16 @@ object LinearizabilityChecker:
       timeoutMs: Long = DefaultTimeoutMs
   ): CheckResult =
     val startTime = System.currentTimeMillis()
-    val trimmed = history.trimIncomplete
-    val keys = trimmed.keys
+    // Strip indeterminate (Info) ops first, then remove incomplete pairs
+    val cleaned = history.withoutInfo.trimIncomplete
+    val keys = cleaned.keys
 
     var totalExplored = 0L
     var allWitness = Vector.empty[Operation]
 
     boundary:
       for key <- keys do
-        val keyHistory = trimmed.forKey(key)
+        val keyHistory = cleaned.forKey(key)
         val result = checkSingleKey(keyHistory, model, timeoutMs)
         totalExplored += result.stats.exploredStates
 
@@ -78,7 +79,7 @@ object LinearizabilityChecker:
               witness = None,
               violation = result.violation,
               stats = CheckStats(
-                opsChecked = trimmed.invocations.size,
+                opsChecked = cleaned.invocations.size,
                 keysChecked = keys.size,
                 exploredStates = totalExplored,
                 durationMs = elapsed
@@ -94,7 +95,7 @@ object LinearizabilityChecker:
         witness = Some(allWitness),
         violation = None,
         stats = CheckStats(
-          opsChecked = trimmed.invocations.size,
+          opsChecked = cleaned.invocations.size,
           keysChecked = keys.size,
           exploredStates = totalExplored,
           durationMs = elapsed

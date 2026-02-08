@@ -7,7 +7,8 @@ import raft.jepsen.checker.{Operation, OpType, OpFunction, History}
 /** Thread-safe recorder for building a Jepsen operation history.
   *
   * Records invocations and their completions from concurrent client fibers,
-  * maintaining strict monotonic ordering via atomic Ref updates.
+  * maintaining strict monotonic ordering via atomic Ref updates. Uses
+  * `Async.monotonic` for timestamps to ensure consistency across fibers.
   */
 class HistoryRecorder[F[_]: Async]:
   private val nextIndex = Ref.unsafe[F, Long](0L)
@@ -24,6 +25,7 @@ class HistoryRecorder[F[_]: Async]:
   ): F[Long] =
     for
       idx <- nextIndex.getAndUpdate(_ + 1)
+      ts <- Async[F].monotonic.map(_.toNanos)
       op = Operation(
         idx,
         process,
@@ -32,7 +34,7 @@ class HistoryRecorder[F[_]: Async]:
         key,
         value,
         None,
-        System.nanoTime()
+        ts
       )
       _ <- ops.update(_ :+ op)
     yield idx
@@ -45,17 +47,20 @@ class HistoryRecorder[F[_]: Async]:
       key: String,
       value: Option[Any]
   ): F[Unit] =
-    val op = Operation(
-      index,
-      process,
-      OpType.Ok,
-      function,
-      key,
-      None,
-      value,
-      System.nanoTime()
-    )
-    ops.update(_ :+ op)
+    for
+      ts <- Async[F].monotonic.map(_.toNanos)
+      op = Operation(
+        index,
+        process,
+        OpType.Ok,
+        function,
+        key,
+        None,
+        value,
+        ts
+      )
+      _ <- ops.update(_ :+ op)
+    yield ()
 
   /** Record a failed operation. */
   def fail(
@@ -65,19 +70,22 @@ class HistoryRecorder[F[_]: Async]:
       key: String,
       error: String
   ): F[Unit] =
-    val op = Operation(
-      index,
-      process,
-      OpType.Fail,
-      function,
-      key,
-      None,
-      Some(error),
-      System.nanoTime()
-    )
-    ops.update(_ :+ op)
+    for
+      ts <- Async[F].monotonic.map(_.toNanos)
+      op = Operation(
+        index,
+        process,
+        OpType.Fail,
+        function,
+        key,
+        None,
+        Some(error),
+        ts
+      )
+      _ <- ops.update(_ :+ op)
+    yield ()
 
-  /** Record an informational event (e.g., timeout). */
+  /** Record an informational event (e.g., timeout, not-leader). */
   def info(
       index: Long,
       process: Int,
@@ -85,17 +93,20 @@ class HistoryRecorder[F[_]: Async]:
       key: String,
       msg: String
   ): F[Unit] =
-    val op = Operation(
-      index,
-      process,
-      OpType.Info,
-      function,
-      key,
-      None,
-      Some(msg),
-      System.nanoTime()
-    )
-    ops.update(_ :+ op)
+    for
+      ts <- Async[F].monotonic.map(_.toNanos)
+      op = Operation(
+        index,
+        process,
+        OpType.Info,
+        function,
+        key,
+        None,
+        Some(msg),
+        ts
+      )
+      _ <- ops.update(_ :+ op)
+    yield ()
 
   /** Get the current recorded history. */
   def snapshot: F[History] =
