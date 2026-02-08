@@ -168,3 +168,63 @@ class JepsenStressSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       result.linearizable shouldBe true
     }
   }
+
+  it should "maintain linearizability with CAS workload (baseline)" taggedAs JepsenTag in {
+    JepsenTest(
+      clusterSize = 3,
+      clients = 3,
+      duration = 10.seconds,
+      nemesisSchedule = None,
+      workload = Workload.CASRegister(1),
+      model = RegisterModel
+    ).run.asserting { result =>
+      result.stats.totalOps should be > 0
+      result.stats.successfulOps should be > 0
+      result.linearizable shouldBe true
+    }
+  }
+
+  it should "maintain linearizability with CAS under partitions" taggedAs JepsenTag in {
+    JepsenTest(
+      clusterSize = 5,
+      clients = 5,
+      duration = 15.seconds,
+      nemesisSchedule = Some(NemesisSchedule.RandomPartitions(3.seconds)),
+      workload = Workload.CASRegister(3),
+      model = RegisterModel
+    ).run.asserting { result =>
+      result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
+      result.linearizable shouldBe true
+    }
+  }
+
+  it should "maintain linearizability with CAS under leader hunting" taggedAs JepsenTag in {
+    JepsenTest(
+      clusterSize = 5,
+      clients = 5,
+      duration = 15.seconds,
+      nemesisSchedule = Some(NemesisSchedule.LeaderHunter(2.seconds)),
+      workload = Workload.CASRegister(1),
+      model = RegisterModel
+    ).run.asserting { result =>
+      result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
+      result.linearizable shouldBe true
+    }
+  }
+
+  it should "maintain linearizability with CAS under combined faults" taggedAs JepsenTag in {
+    JepsenTest(
+      clusterSize = 5,
+      clients = 8,
+      duration = 15.seconds,
+      nemesisSchedule = Some(NemesisSchedule.Combined(2.seconds)),
+      workload = Workload.CASRegister(5),
+      model = RegisterModel
+    ).run.asserting { result =>
+      result.stats.nemesisEvents should be > 0
+      result.stats.successfulOps should be > 0
+      result.linearizable shouldBe true
+    }
+  }

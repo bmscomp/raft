@@ -14,6 +14,7 @@ enum Workload:
   case Register(numKeys: Int)
   case KVStore(numKeys: Int)
   case WriteOnly(numKeys: Int)
+  case CASRegister(numKeys: Int)
 
 /** Configuration for client workload generation. */
 case class WorkloadConfig(
@@ -91,6 +92,8 @@ class ClientPool[F[_]: Async](
               randomKVOp(clientId, node, numKeys, random, leaderRef)
             case Workload.WriteOnly(numKeys) =>
               randomWriteOp(clientId, node, numKeys, random, leaderRef)
+            case Workload.CASRegister(numKeys) =>
+              randomCASRegisterOp(clientId, node, numKeys, random, leaderRef)
 
           _ <- Async[F].sleep(config.thinkTime)
           _ <- loop
@@ -115,8 +118,7 @@ class ClientPool[F[_]: Async](
         else doWrite(clientId, node, key, random, leaderRef)
     yield ()
 
-  /** KV workload: reads and writes (no CAS — we lack an atomic CAS primitive).
-    */
+  /** KV workload: reads, writes, and CAS. */
   private def randomKVOp(
       clientId: Int,
       node: NodeId,
@@ -127,10 +129,11 @@ class ClientPool[F[_]: Async](
     for
       keyIdx <- random.nextIntBounded(numKeys)
       key = s"key-$keyIdx"
-      isRead <- random.nextBoolean
-      _ <-
-        if isRead then doRead(clientId, node, key, leaderRef)
-        else doWrite(clientId, node, key, random, leaderRef)
+      choice <- random.nextIntBounded(3)
+      _ <- choice match
+        case 0 => doRead(clientId, node, key, leaderRef)
+        case 1 => doWrite(clientId, node, key, random, leaderRef)
+        case _ => doCAS(clientId, node, key, random, leaderRef)
     yield ()
 
   /** Write-only workload: only writes. */
@@ -190,6 +193,91 @@ class ClientPool[F[_]: Async](
         case SubmitResult.NotLeader(_) =>
           onNotLeader(leaderRef) *>
             recorder.info(idx, clientId, OpFunction.Write, key, "not-leader")
+        case SubmitResult.CasFailed(_) =>
+          recorder.fail(
+            idx,
+            clientId,
+            OpFunction.Write,
+            key,
+            "unexpected-cas-fail"
+          )
         case SubmitResult.Error(msg) =>
           recorder.info(idx, clientId, OpFunction.Write, key, msg)
+    yield ()
+
+  /** CAS-register workload: 40% reads, 30% writes, 30% CAS. */
+  private def randomCASRegisterOp(
+      clientId: Int,
+      node: NodeId,
+      numKeys: Int,
+      random: Random[F],
+      leaderRef: Ref[F, Option[NodeId]]
+  ): F[Unit] =
+    for
+      keyIdx <- random.nextIntBounded(numKeys)
+      key = s"key-$keyIdx"
+      choice <- random.nextIntBounded(10)
+      _ <-
+        if choice < 4 then doRead(clientId, node, key, leaderRef)
+        else if choice < 7 then doWrite(clientId, node, key, random, leaderRef)
+        else doCAS(clientId, node, key, random, leaderRef)
+    yield ()
+
+  /** Atomic CAS: read current value, then CAS(key, current, newValue).
+    *
+    * The input value recorded is (expected, newValue) as a tuple.
+    *   - On CAS success: record Ok with output "ok"
+    *   - On CAS failure (mismatch): record Ok with output "failed" (CAS failure
+    *     is a valid, expected outcome — not an error)
+    *   - On timeout/not-leader: record Info (indeterminate)
+    */
+  private def doCAS(
+      clientId: Int,
+      node: NodeId,
+      key: String,
+      random: Random[F],
+      leaderRef: Ref[F, Option[NodeId]]
+  ): F[Unit] =
+    for
+      currentResult <- cluster.submitGet(node, key)
+      result <- currentResult match
+        case ReadResult.Found(currentOpt) =>
+          val expected = currentOpt.getOrElse("")
+          val seq = writeCounter.getAndIncrement()
+          val newValue = s"c${clientId}_$seq"
+          val casInput: (String, String) = (expected, newValue)
+          for
+            idx <- recorder.invoke(
+              clientId,
+              OpFunction.CAS,
+              key,
+              Some(casInput)
+            )
+            casResult <- cluster.submitCAS(node, key, expected, newValue)
+            _ <- casResult match
+              case SubmitResult.Success(_) =>
+                recorder.ok(idx, clientId, OpFunction.CAS, key, Some("ok"))
+              case SubmitResult.CasFailed(_) =>
+                recorder.ok(idx, clientId, OpFunction.CAS, key, Some("failed"))
+              case SubmitResult.Timeout =>
+                onNotLeader(leaderRef) *>
+                  recorder.info(idx, clientId, OpFunction.CAS, key, "timeout")
+              case SubmitResult.NotLeader(_) =>
+                onNotLeader(leaderRef) *>
+                  recorder.info(
+                    idx,
+                    clientId,
+                    OpFunction.CAS,
+                    key,
+                    "not-leader"
+                  )
+              case SubmitResult.Error(msg) =>
+                recorder.info(idx, clientId, OpFunction.CAS, key, msg)
+          yield ()
+        case ReadResult.NotLeader(_) =>
+          onNotLeader(leaderRef)
+        case ReadResult.Timeout =>
+          onNotLeader(leaderRef)
+        case ReadResult.Error(_) =>
+          Async[F].unit
     yield ()

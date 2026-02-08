@@ -17,6 +17,7 @@ import scala.concurrent.duration.*
 /** Result of submitting a command to the cluster. */
 enum SubmitResult:
   case Success(value: String)
+  case CasFailed(currentValue: Option[String])
   case NotLeader(leader: Option[NodeId])
   case Timeout
   case Error(msg: String)
@@ -147,6 +148,67 @@ class SimulatedCluster[F[_]: Async](
             }
         poll(500)
       case None => Async[F].unit
+
+  /** Submit an atomic CAS (Compare-And-Swap) command.
+    *
+    * The SM atomically checks if key == expected, and if so sets it to
+    * newValue. Returns Success on match, CasFailed on mismatch (with current
+    * value).
+    */
+  def submitCAS(
+      nodeId: NodeId,
+      key: String,
+      expected: String,
+      newValue: String
+  ): F[SubmitResult] =
+    val cmd = KVCommand.CAS(key, expected, newValue)
+    val data = KVCommand.encode(cmd)
+    nodesRef.get.flatMap { nodes =>
+      nodes.get(nodeId) match
+        case Some(node) =>
+          node
+            .submit(data)
+            .flatMap { _ =>
+              waitForCasResult(nodeId, key, expected, newValue)
+            }
+            .timeoutTo(3.seconds, Async[F].pure(SubmitResult.Timeout))
+            .handleError { e =>
+              if e.getMessage != null && e.getMessage.contains("Not leader")
+              then SubmitResult.NotLeader(None)
+              else SubmitResult.Error(e.getMessage)
+            }
+        case None =>
+          Async[F].pure(SubmitResult.Error(s"Node $nodeId not found"))
+    }
+
+  /** Poll SM to detect CAS outcome. CAS succeeded if key == newValue, or failed
+    * if it changed to something else (or stayed at a different value from
+    * expected).
+    */
+  private def waitForCasResult(
+      nodeId: NodeId,
+      key: String,
+      expected: String,
+      newValue: String
+  ): F[SubmitResult] =
+    stateMachines.get(nodeId) match
+      case Some(sm) =>
+        def poll(remaining: Int): F[SubmitResult] =
+          if remaining <= 0 then
+            Async[F].raiseError(
+              new RuntimeException(s"CAS poll exhausted for $key")
+            )
+          else
+            sm.get(key).flatMap { current =>
+              if current.contains(newValue) then
+                Async[F].pure(SubmitResult.Success("ok"))
+              else if current != Some(expected) && current.isDefined then
+                Async[F].pure(SubmitResult.CasFailed(current))
+              else Async[F].sleep(5.millis) >> poll(remaining - 1)
+            }
+        poll(500)
+      case None =>
+        Async[F].pure(SubmitResult.Success("ok"))
 
   /** Read via the leader's state machine with a read-fence.
     *

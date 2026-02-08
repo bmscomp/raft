@@ -23,7 +23,8 @@ import fs2.Stream
 enum KVCommand:
   case Put(key: String, value: String)
   case Delete(key: String)
-  case Get(key: String) // Read-only, handled separately
+  case Get(key: String)
+  case CAS(key: String, expected: String, newValue: String)
 
 object KVCommand:
   private val SEP = "\t"
@@ -33,6 +34,8 @@ object KVCommand:
       s"PUT$SEP$k$SEP$v".getBytes(StandardCharsets.UTF_8)
     case KVCommand.Delete(k) => s"DEL$SEP$k".getBytes(StandardCharsets.UTF_8)
     case KVCommand.Get(k)    => s"GET$SEP$k".getBytes(StandardCharsets.UTF_8)
+    case KVCommand.CAS(k, expected, newVal) =>
+      s"CAS$SEP$k$SEP$expected$SEP$newVal".getBytes(StandardCharsets.UTF_8)
 
   def decode(data: Array[Byte]): Either[String, KVCommand] =
     val str = new String(data, StandardCharsets.UTF_8)
@@ -40,7 +43,9 @@ object KVCommand:
       case "PUT" :: key :: value :: Nil => Right(KVCommand.Put(key, value))
       case "DEL" :: key :: Nil          => Right(KVCommand.Delete(key))
       case "GET" :: key :: Nil          => Right(KVCommand.Get(key))
-      case _                            => Left(s"Invalid command: $str")
+      case "CAS" :: key :: expected :: newVal :: Nil =>
+        Right(KVCommand.CAS(key, expected, newVal))
+      case _ => Left(s"Invalid command: $str")
 
 /** Result types returned by the key-value state machine after command
   * application.
@@ -49,6 +54,8 @@ object KVCommand:
 enum KVResult:
   case Ok
   case Value(v: Option[String])
+  case CasOk
+  case CasFailed(currentValue: Option[String])
   case Error(msg: String)
 
 /** In-memory key-value state machine implementing [[raft.spi.StateMachine]].
@@ -75,6 +82,15 @@ class KVStateMachine[F[_]: Sync](
 
       case Right(KVCommand.Get(key)) =>
         store.get.map(m => KVResult.Value(m.get(key)))
+
+      case Right(KVCommand.CAS(key, expected, newValue)) =>
+        store.modify { m =>
+          m.get(key) match
+            case Some(v) if v == expected =>
+              (m.updated(key, newValue), KVResult.CasOk)
+            case current =>
+              (m, KVResult.CasFailed(current))
+        }
 
       case Left(err) =>
         Sync[F].pure(KVResult.Error(err))
