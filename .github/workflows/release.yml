@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    name: Publish release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Set version in build
+        run: |
+          sed -i "s/version := .*/version := \"${{ steps.version.outputs.VERSION }}\",/" build.sbt
+
+      - name: Compile
+        run: sbt compile
+
+      - name: Run tests
+        run: sbt test
+
+      - name: Run Jepsen verification
+        run: sbt jepsen
+
+      - name: Package JAR
+        run: sbt package
+
+      - name: Publish to GitHub Packages
+        run: sbt publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine prerelease
+        id: prerelease
+        run: |
+          if echo "${{ steps.version.outputs.VERSION }}" | grep -qE '(RC|alpha|beta|SNAPSHOT)'; then
+            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
+          else
+            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.version.outputs.VERSION }}
+          generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.IS_PRERELEASE }}
+          files: |
+            target/scala-3.3.7/raft_3-${{ steps.version.outputs.VERSION }}.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

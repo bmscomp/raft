@@ -4,8 +4,20 @@ lazy val root = project
   .in(file("."))
   .settings(
     name := "raft",
+    organization := "com.github.bmscomp",
     version := "0.1.0-SNAPSHOT",
     scalaVersion := scala3Version,
+
+    publishMavenStyle := true,
+    publishTo := Some(
+      "GitHub Packages" at s"https://maven.pkg.github.com/bmscomp/raft"
+    ),
+    credentials += Credentials(
+      "GitHub Package Registry",
+      "maven.pkg.github.com",
+      "bmscomp",
+      sys.env.getOrElse("GITHUB_TOKEN", "")
+    ),
 
     // Fork for running examples (avoids Cats Effect warnings)
     Compile / run / fork := true,
