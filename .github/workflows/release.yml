@@ -44,7 +44,12 @@ jobs:
         run: sbt jepsen
 
       - name: Package JAR
-        run: sbt package
+        id: jar
+        run: |
+          sbt package
+          JAR_PATH=$(find target -name "raft*.jar" -not -path "*/test-classes/*" | head -1)
+          echo "JAR_PATH=$JAR_PATH" >> $GITHUB_OUTPUT
+          echo "Found JAR: $JAR_PATH"
 
       - name: Publish to GitHub Packages
         run: sbt publish
@@ -66,7 +71,6 @@ jobs:
           name: v${{ steps.version.outputs.VERSION }}
           generate_release_notes: true
           prerelease: ${{ steps.prerelease.outputs.IS_PRERELEASE }}
-          files: |
-            target/scala-3.3.7/raft_3-${{ steps.version.outputs.VERSION }}.jar
+          files: ${{ steps.jar.outputs.JAR_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
