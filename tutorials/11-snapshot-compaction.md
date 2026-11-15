@@ -187,6 +187,31 @@ The receiving node assembles chunks, then:
 3. Loads the cluster configuration from the snapshot metadata
 4. Begins accepting log entries from `lastIncludedIndex + 1`
 
+### Turnkey Runtime Compaction & Chunked Transfer in `RaftNode[F]`
+
+When using `raft-runtime`, you do not need to wire `CompactionManager` or `SnapshotTransfer` manually — pass a `SnapshotStore[F]` (such as `InMemSnapshotStore` for tests or `StorageBackedSnapshotStore` over `MmapWalEngine` in production) and configure `CompactionConfig` on `RaftConfig`:
+
+```mermaid
+sequenceDiagram
+    participant L as "Leader RaftNode[F]"
+    participant CM as "CompactionManager"
+    participant ST as "SnapshotTransfer"
+    participant F as "Lagging Follower"
+
+    L->>CM: "maybeCompact(lastApplied, approxLogSize)"
+    CM->>CM: "Save Snapshot(idx, term, data, Some(cluster)) + discardBefore"
+    Note over L,F: "Follower requests safeFrom <= lastIncludedIndex (entry compacted)"
+    L->>ST: "Background fiber: sendSnapshot(leaderTerm=L.term, RSNP envelope)"
+    ST->>F: "InstallSnapshotRequest(term=L.term, offset=0..N, done=true)"
+    F->>F: "Decode RSNP (ClusterConfig + stateBytes), restore SM, clear obsolete log"
+    F-->>L: "InstallSnapshotResponse(success=true, matchIndex=idx)"
+    L->>F: "AppendEntries(prevLogIndex=idx, prevLogTerm=snapTerm, entries=[idx+1..])"
+```
+
+Two subtle protocol invariants handled automatically by this pipeline:
+1. **`leaderTerm` vs. `lastIncludedTerm`**: `InstallSnapshotRequest.term` carries the leader's **current** term (`leader.term`), while `lastIncludedTerm` carries the historical term of the compacted entry. Sending `lastIncludedTerm` in `term` would cause followers in higher terms to reject valid snapshots!
+2. **Non-Blocking Background Transfer**: `RaftNode` tracks per-peer in-flight transfers (`snapshotInFlightRef`) and streams chunks on a background fiber outside the consensus `Mutex[F]`, so multi-megabyte snapshot transfers never stall heartbeats or client proposals for healthy followers.
+
 ## Compaction Safety Rules
 
 ### Never compact uncommitted entries

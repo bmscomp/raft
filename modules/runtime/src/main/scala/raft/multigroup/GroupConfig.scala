@@ -1,7 +1,13 @@
 package raft.multigroup
 
-import raft.state.{RaftConfig, ClusterConfig}
-import raft.spi.{LogStore, StableStore, StateMachine, TimerService}
+import raft.state.{ClusterConfig, RaftConfig}
+import raft.spi.{
+  LogStore,
+  SnapshotStore,
+  StableStore,
+  StateMachine,
+  TimerService
+}
 import raft.metrics.RaftMetrics
 
 /** Per-group configuration that bundles all dependencies needed to run a single
@@ -14,7 +20,8 @@ final case class GroupConfig[F[_]](
     stableStore: StableStore[F],
     stateMachine: StateMachine[F, ?],
     timerService: TimerService[F],
-    metrics: Option[RaftMetrics[F]] = None
+    metrics: Option[RaftMetrics[F]] = None,
+    snapshotStore: Option[SnapshotStore[F]] = None
 )
 
 object GroupConfig:
@@ -34,5 +41,6 @@ object GroupConfig:
       stableStore,
       stateMachine,
       timerService,
-      Some(metrics)
+      Some(metrics),
+      None
     )

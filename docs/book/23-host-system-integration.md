@@ -64,7 +64,34 @@ If your service is already built on Typelevel Cats Effect 3 and FS2, `raft-runti
 - **`Transport[F, Wire]`**: Backed by `raft-transport-grpc`, HTTP/2, WebSockets, or `MultiGroupTransport[F]` for multi-group multiplexing.
 - **`StateMachine[F, R]`**: Streaming `snapshot: F[Stream[F, Byte]]` and `restore(data: Stream[F, Byte]): F[Unit]` so large state snapshots never require contiguous heap arrays.
 
-Typed consensus errors (`RaftError.NotLeader(leaderHint)`, `RaftError.ElectionInProgress`, `RaftError.LeadershipTransferInProgress(target)`) let your RPC gateway route or retry client requests deterministically without string parsing.
+Typed consensus errors (`RaftError.NotLeader(leaderHint)`, `RaftError.ElectionInProgress`, `RaftError.LeadershipTransferInProgress(target)`, `RaftError.LeaderNotReadyInTerm(term)`, `RaftError.ConfigurationChangeInProgress(pending)`) let your RPC gateway route or retry client requests deterministically without string parsing.
+
+### End-to-End `RaftNode[F]` Coordination Lifecycle
+
+`RaftNode[F]` serializes state transitions under an internal `Mutex[F]` while suspending client fibers **outside** the lock via cancellable `Deferred` promises:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Node as "RaftNode[F]"
+    participant Logic as "RaftLogic (Pure)"
+    participant Peers as "Follower Quorum"
+
+    Client->>Node: "proposeAndCommit(cmd) / readIndex / proposeConfChange(C_new)"
+    Node->>Logic: "Append or onMessage (with Snapshot-aware termAt)"
+    Logic-->>Node: "Effects (PersistHardState, SendMessage)"
+    Note over Client,Node: "Client fiber awaits Deferred outside Mutex"
+    Node->>Peers: "AppendEntries / Heartbeat / InstallSnapshot"
+    Peers-->>Node: "AppendEntriesResponse(success=true)"
+    Node->>Node: "Apply [lastApplied+1 .. commitIndex] to StateMachine"
+    Node->>Node: "If C_old,new committed -> auto-append & replicate C_new"
+    Node-->>Client: "Complete Deferred (LogId / linearizable ReadIndex)"
+```
+
+Key runtime invariants handled automatically by `RaftNode[F]`:
+- **Two-Stage `ReadIndex` Barrier**: `node.readIndex` first awaits quorum heartbeat confirmation (`Effect.ReadIndexReady(id, commitIdx)`) and then suspends in `readApplyWaiters` until `lastApplied >= commitIdx`, ensuring the local `StateMachine` reflects all writes committed before the read started.
+- **Zero-RTT Monotonic `leaseRead`**: When `leaseReadEnabled = true` and `checkQuorumEnabled = true`, quorum `AppendEntriesResponse` ACKs extend a monotonic `Clock[F].monotonic` deadline by `leaderLeaseDuration`; `node.leaseRead` returns `Some(commitIndex)` locally while the lease is valid and `None` upon expiry so callers can seamlessly fall back to `node.readIndex`.
+- **Automatic Joint Consensus Finalization & Self-Removal Step-Down**: Calling `node.proposeConfChange(targetCluster)` automatically enters `C_old,new` when voter sets change, appends and commits `C_new` once `C_old,new` commits, steps down immediately if `C_new` removes the active leader from `voters`, and resolves the caller's `F[LogId]` once `C_new` is durably committed.
 
 ---
 

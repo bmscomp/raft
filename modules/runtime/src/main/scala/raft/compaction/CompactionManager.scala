@@ -4,9 +4,16 @@ import cats.effect.{Async, Ref}
 import cats.syntax.all.*
 import org.typelevel.log4cats.Logger
 import raft.spi.{CompactionPolicy, LogStore, SnapshotStore, StateMachine}
-import raft.state.{CompactionConfig, LogIndex, Snapshot, resolvePolicy}
+import raft.state.{
+  ClusterConfig,
+  CompactionConfig,
+  LogIndex,
+  NodeId,
+  Snapshot,
+  SnapshotMetadata as CoreSnapshotMetadata,
+  resolvePolicy
+}
 import raft.metrics.RaftMetrics
-import raft.state.NodeId
 
 /** Orchestrates the log compaction lifecycle.
   *
@@ -51,7 +58,9 @@ class CompactionManager[F[_]: Async](
     nodeId: NodeId,
     lastSnapshotIndexRef: Ref[F, Long],
     metrics: RaftMetrics[F],
-    logger: Logger[F]
+    logger: Logger[F],
+    clusterProvider: Option[F[Option[ClusterConfig]]] = None,
+    onCompacted: Option[CoreSnapshotMetadata => F[Unit]] = None
 ):
 
   /** Check the compaction policy and execute a snapshot if warranted.
@@ -86,11 +95,15 @@ class CompactionManager[F[_]: Async](
       )
       termAtIdx <- logStore.termAt(LogIndex.unsafeFrom(compactionIdx))
       term = termAtIdx.map(_.value).getOrElse(0L)
+      clusterOpt <- clusterProvider.getOrElse(Async[F].pure(None))
       data <- stateMachine.snapshot
-      snapshot = Snapshot(compactionIdx, term, data)
+      snapshot = Snapshot(compactionIdx, term, data, clusterOpt)
       _ <- snapshotStore.save(snapshot)
       _ <- lastSnapshotIndexRef.set(compactionIdx)
-      discardIdx = math.max(1, compactionIdx - config.retainedEntries)
+      _ <- onCompacted.traverse_(
+        _.apply(CoreSnapshotMetadata(compactionIdx, term, clusterOpt))
+      )
+      discardIdx = math.max(1L, compactionIdx - config.retainedEntries)
       _ <- logStore.discardBefore(LogIndex.unsafeFrom(discardIdx))
       _ <- metrics.onSnapshotTaken(nodeId, compactionIdx)
       _ <- logger.info(
@@ -101,23 +114,6 @@ class CompactionManager[F[_]: Async](
 object CompactionManager:
 
   /** Create a [[CompactionManager]] with its internal snapshot index reference.
-    *
-    * @param config
-    *   compaction configuration
-    * @param logStore
-    *   the log for truncation
-    * @param snapshotStore
-    *   snapshot persistence backend
-    * @param stateMachine
-    *   the state machine to snapshot
-    * @param nodeId
-    *   this node's id
-    * @param metrics
-    *   metrics hooks
-    * @param logger
-    *   structured logger
-    * @return
-    *   a configured `CompactionManager`, wrapped in `F`
     */
   def create[F[_]: Async](
       config: CompactionConfig,
@@ -126,7 +122,9 @@ object CompactionManager:
       stateMachine: StateMachine[F, ?],
       nodeId: NodeId,
       metrics: RaftMetrics[F],
-      logger: Logger[F]
+      logger: Logger[F],
+      clusterProvider: Option[F[Option[ClusterConfig]]] = None,
+      onCompacted: Option[CoreSnapshotMetadata => F[Unit]] = None
   ): F[CompactionManager[F]] =
     for
       lastSnapshotIdx <- snapshotStore.loadLatest.map(
@@ -143,5 +141,7 @@ object CompactionManager:
       nodeId,
       ref,
       metrics,
-      logger
+      logger,
+      clusterProvider,
+      onCompacted
     )

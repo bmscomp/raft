@@ -1,9 +1,24 @@
 package raft.impl
 
+import cats.Functor
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all.*
-import raft.state.{Log, LogIndex, NodeId, Term}
-import raft.spi.{LogStore, StableStore}
+import fs2.{Chunk, Stream}
+import raft.state.{
+  ClusterConfig,
+  HardState,
+  Log,
+  LogIndex,
+  NodeId,
+  Snapshot,
+  Term
+}
+import raft.spi.{
+  LogStore,
+  SnapshotMetadata as StoredSnapshotMetadata,
+  SnapshotStore,
+  StableStore
+}
 
 /** In-memory [[LogStore]] implementation for testing and prototyping.
   *
@@ -86,15 +101,19 @@ object InMemLogStore:
   *   [[raft.spi.StableStoreFactory.inMemory]] for creating instances via the
   *   factory pattern
   */
-class InMemStableStore[F[_]] private (
-    termRef: Ref[F, Term],
-    votedForRef: Ref[F, Option[NodeId]]
+class InMemStableStore[F[_]: Functor] private (
+    stateRef: Ref[F, HardState]
 ) extends StableStore[F]:
 
-  def currentTerm: F[Term] = termRef.get
-  def setCurrentTerm(term: Term): F[Unit] = termRef.set(term)
-  def votedFor: F[Option[NodeId]] = votedForRef.get
-  def setVotedFor(nodeId: Option[NodeId]): F[Unit] = votedForRef.set(nodeId)
+  def currentTerm: F[Term] = stateRef.get.map(_.currentTerm)
+  def setCurrentTerm(term: Term): F[Unit] =
+    stateRef.update(_.copy(term = term.value))
+  def votedFor: F[Option[NodeId]] = stateRef.get.map(_.votedFor)
+  def setVotedFor(nodeId: Option[NodeId]): F[Unit] =
+    stateRef.update(_.copy(votedFor = nodeId))
+  def hardState: F[HardState] = stateRef.get
+  def setHardState(term: Term, votedFor: Option[NodeId]): F[Unit] =
+    stateRef.set(HardState(term.value, votedFor))
 
 /** Companion for [[InMemStableStore]] providing a factory method. */
 object InMemStableStore:
@@ -106,7 +125,58 @@ object InMemStableStore:
     *   a new in-memory stable store, wrapped in `F`
     */
   def apply[F[_]: Async](): F[InMemStableStore[F]] =
-    for
-      term <- Ref.of[F, Term](Term.Zero)
-      votedFor <- Ref.of[F, Option[NodeId]](None)
-    yield new InMemStableStore[F](term, votedFor)
+    Ref.of[F, HardState](HardState.Empty).map(new InMemStableStore[F](_))
+
+/** Replayable in-memory [[SnapshotStore]] implementation for testing and
+  * prototyping.
+  *
+  * Materializes snapshot streams into immutable byte arrays in a single `Ref`
+  * so [[loadLatest]] can be re-read multiple times safely (e.g., when streaming
+  * to several lagging followers).
+  */
+class InMemSnapshotStore[F[_]: Async] private (
+    snapshotsRef: Ref[
+      F,
+      Map[Long, (Long, Option[ClusterConfig], Array[Byte])]
+    ]
+) extends SnapshotStore[F]:
+
+  def save(snapshot: Snapshot[F]): F[Unit] =
+    snapshot.data.compile.to(Array).flatMap { bytes =>
+      snapshotsRef.update(
+        _.updated(
+          snapshot.lastIncludedIndex,
+          (snapshot.lastIncludedTerm, snapshot.config, bytes)
+        )
+      )
+    }
+
+  def loadLatest: F[Option[Snapshot[F]]] =
+    snapshotsRef.get.map { m =>
+      m.maxByOption(_._1).map { case (idx, (term, cfg, bytes)) =>
+        Snapshot[F](
+          lastIncludedIndex = idx,
+          lastIncludedTerm = term,
+          data = Stream.chunk(Chunk.array(bytes)).covary[F],
+          config = cfg
+        )
+      }
+    }
+
+  def list: F[Vector[StoredSnapshotMetadata]] =
+    snapshotsRef.get.map { m =>
+      m.toVector
+        .sortBy(_._1)
+        .map { case (idx, (term, _, bytes)) =>
+          StoredSnapshotMetadata(idx, term, bytes.length.toLong)
+        }
+    }
+
+  def delete(index: Long): F[Unit] =
+    snapshotsRef.update(_ - index)
+
+object InMemSnapshotStore:
+  def apply[F[_]: Async](): F[InMemSnapshotStore[F]] =
+    Ref
+      .of[F, Map[Long, (Long, Option[ClusterConfig], Array[Byte])]](Map.empty)
+      .map(new InMemSnapshotStore[F](_))

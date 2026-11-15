@@ -2,7 +2,7 @@ package raft.spi
 
 import cats.effect.kernel.{Async, Resource}
 import cats.syntax.all.*
-import raft.state.{NodeId, Term}
+import raft.state.{HardState, NodeId, Term}
 
 /** Stable storage for RAFT hard state (current term and voted-for candidate).
   *
@@ -58,6 +58,21 @@ trait StableStore[F[_]]:
     *   `Some(candidateId)` when casting a vote, `None` to clear
     */
   def setVotedFor(nodeId: Option[NodeId]): F[Unit]
+
+  /** Atomically read both `currentTerm` and `votedFor` as a single
+    * [[raft.state.HardState]] snapshot.
+    */
+  def hardState: F[HardState]
+
+  /** Atomically persist both `currentTerm` and `votedFor` in a single durable
+    * flush (`fsync` / `msync`).
+    *
+    * Persisting both fields together closes the crash-recovery window between
+    * separate `setCurrentTerm` and `setVotedFor` calls — preventing a crashed
+    * node from recovering `(newTerm, oldVotedFor)` and voting twice in
+    * `newTerm` (§5.2 Election Safety).
+    */
+  def setHardState(term: Term, votedFor: Option[NodeId]): F[Unit]
 
 /** Factory for creating [[StableStore]] instances with proper resource
   * lifecycle.

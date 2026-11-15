@@ -62,8 +62,11 @@ class SnapshotTransfer[F[_]: Async](
   def sendSnapshot(
       leaderId: NodeId,
       target: NodeId,
-      snapshot: Snapshot[F]
+      snapshot: Snapshot[F],
+      leaderTerm: Long = -1L
   ): F[Int] =
+    val effectiveTerm =
+      if leaderTerm >= 0L then leaderTerm else snapshot.lastIncludedTerm
     val chunks = snapshot.data.chunkN(chunkSize)
 
     def go(
@@ -76,7 +79,7 @@ class SnapshotTransfer[F[_]: Async](
           tail.pull.peek1.flatMap { nextOpt =>
             val isLast = nextOpt.isEmpty
             val req = InstallSnapshotRequest(
-              term = snapshot.lastIncludedTerm,
+              term = effectiveTerm,
               leaderId = leaderId,
               lastIncludedIndex = snapshot.lastIncludedIndex,
               lastIncludedTerm = snapshot.lastIncludedTerm,
@@ -108,7 +111,7 @@ class SnapshotTransfer[F[_]: Async](
           if idx == 0 then
             // Empty snapshot: send one empty chunk with done=true
             val req = InstallSnapshotRequest(
-              term = snapshot.lastIncludedTerm,
+              term = effectiveTerm,
               leaderId = leaderId,
               lastIncludedIndex = snapshot.lastIncludedIndex,
               lastIncludedTerm = snapshot.lastIncludedTerm,
@@ -140,14 +143,19 @@ class SnapshotTransfer[F[_]: Async](
     *   the receiving follower's node id
     * @param snapshot
     *   the snapshot to transfer
+    * @param leaderTerm
+    *   optional current leader term (defaults to `snapshot.lastIncludedTerm`)
     * @return
     *   the total number of chunks sent
     */
   def sendSnapshotPipelined(
       leaderId: NodeId,
       target: NodeId,
-      snapshot: Snapshot[F]
+      snapshot: Snapshot[F],
+      leaderTerm: Long = -1L
   ): F[Int] =
+    val effectiveTerm =
+      if leaderTerm >= 0L then leaderTerm else snapshot.lastIncludedTerm
     snapshot.data
       .chunkN(chunkSize)
       .compile
@@ -155,7 +163,7 @@ class SnapshotTransfer[F[_]: Async](
       .flatMap { allChunks =>
         if allChunks.isEmpty then
           val req = InstallSnapshotRequest(
-            term = snapshot.lastIncludedTerm,
+            term = effectiveTerm,
             leaderId = leaderId,
             lastIncludedIndex = snapshot.lastIncludedIndex,
             lastIncludedTerm = snapshot.lastIncludedTerm,
@@ -171,7 +179,7 @@ class SnapshotTransfer[F[_]: Async](
             val off = currentOffset
             val isDone = idx == allChunks.size - 1
             val req = InstallSnapshotRequest(
-              term = snapshot.lastIncludedTerm,
+              term = effectiveTerm,
               leaderId = leaderId,
               lastIncludedIndex = snapshot.lastIncludedIndex,
               lastIncludedTerm = snapshot.lastIncludedTerm,
