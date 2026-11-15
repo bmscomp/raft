@@ -148,17 +148,24 @@ RaftConfig(
 ## Log Entry Types
 
 ```scala
-enum Log:
-  case Command(index: Long, term: Long, data: Array[Byte])
-  case NoOp(index: Long, term: Long)
-  case Configuration(index: Long, term: Long, config: ClusterConfig)
+case class Log(
+  index: Long,
+  term: Long,
+  logType: LogType = LogType.Command,
+  data: Array[Byte] = Array.empty
+)
+
+enum LogType:
+  case Command
+  case NoOp
+  case Configuration
 ```
 
 | Type | Created By | Applied to StateMachine? |
 |------|-----------|------------------------|
-| `Command` | Client writes | Yes |
-| `NoOp` | New leader (one per term) | No |
-| `Configuration` | Membership changes | No (handled internally) |
+| `Command` | Client writes (`Log.command`) | Yes |
+| `NoOp` | New leader (`Log.noOp`, one per term) | No |
+| `Configuration` | Membership changes (`Log.configuration`) | No (handled internally) |
 
 ---
 
@@ -194,9 +201,13 @@ case class ClusterConfig(
 
 ## Key API Entry Points
 
-| Function | Signature | Purpose |
-|----------|-----------|---------|
-| `RaftLogic.onMessage` | `(state, message, config, lastLogIndex, lastLogTerm, clusterSize) → Transition` | Process any Raft event |
-| `RaftLogic.onVoteResponse` | `(candidate, from, response, config, clusterSize) → Transition` | Handle vote response |
-| `RaftLogic.calculateCommitIndex` | `(leader, clusterSize, getTermAt) → Option[Long]` | Compute new commit index |
-| `RaftNode.create` | `(config, transport, logStore, ...) → F[RaftNode[F, M]]` | Create a running node |
+| API | Module | Signature / Role | Purpose |
+|-----|--------|-----------------|---------|
+| `RawNode` | `raft-core` | `tick()`, `step(from, msg)`, `propose(bytes)`, `ready()`, `advance(rd)` | Sans-I/O consensus driver (`tikv/raft-rs` style, zero dependencies) |
+| `Ready` / `LightReady` | `raft-core` | `hardState`, `entries`, `snapshot`, `messages`, `persistedMessages`, `committedEntries`, `readStates` | Atomic persistence, network, and FSM work batch |
+| `RaftStorage` / `MemStorage` | `raft-core` | `initialState`, `entries(low, high, maxBytes)`, `term(idx)`, `firstIndex`, `lastIndex` | Read-only storage view consumed by `RawNode` |
+| `ProgressTracker` | `raft-core` | `Probe`, `Replicate`, `Snapshot` + bounded `Inflights` ring | Per-follower replication state & Joint Consensus dual quorum |
+| `RaftLogic.onMessage` | `raft-core` | `(state, message, config, lastLogIndex, lastLogTerm, clusterSize, getTermAt, sender, clusterOpt) → Transition` | Stateless functional transition core |
+| `RaftNode` | `raft-runtime` | `Resource[F, RaftNode[F]]` | Optional Cats Effect + FS2 concurrent runtime adapter |
+| `MmapWalEngine` | `raft-storage-mmap` | `MmapWalEngine.open[F](dir, segmentSize)` | JDK 22+ FFM off-heap memory-mapped WAL engine |
+| `GrpcTransport` | `raft-transport-grpc` | `GrpcTransport.resource[F](grpcConfig, transportConfig)` | Netty HTTP/2 + ScalaPB wire transport |

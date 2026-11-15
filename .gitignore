@@ -10,6 +10,10 @@ project/project/
 .metals/
 .bloop/
 .bsp/
+project/metals.sbt
+
+# Multi-module targets
+**/target/
 
 # OS
 .DS_Store

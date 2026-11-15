@@ -11,15 +11,19 @@ This is the single function that drives the entire Raft protocol. Every event â€
 ```scala
 object RaftLogic:
   def onMessage(
-    state: NodeState,          // current node state (Follower, Candidate, Leader, etc.)
-    msg: RaftMessage,          // the incoming event
-    config: RaftConfig,        // static configuration for this node
-    lastLogIndex: Long,        // index of the last entry in the log
-    lastLogTerm: Long,         // term of the last entry in the log
-    clusterSize: Int,          // total number of nodes in the cluster
-    getTermAt: Long => Option[Long] = _ => None  // function to look up a log entry's term
+    state: NodeState,                       // current node role (Follower, PreCandidate, Candidate, Leader)
+    message: RaftMessage,                   // incoming RPC or logical timeout event
+    config: RaftConfig,                     // local node protocol configuration
+    lastLogIndex: Long,                     // index of the last entry in the local log
+    lastLogTerm: Long,                      // term of the last entry in the local log
+    clusterSize: Int,                       // voting cluster size
+    getTermAt: Long => Option[Long] = _ => None, // synchronous term lookup at log index
+    sender: Option[NodeId] = None,          // authenticated sender NodeId for vote/append tracking
+    clusterOpt: Option[ClusterConfig] = None // optional full ClusterConfig (Joint Consensus, Learners, Witnesses)
   ): Transition
 ```
+
+> **Note â€” Two ways to drive `raft-core`:** You can invoke stateless `RaftLogic.onMessage` directly when managing state transitions yourself, or drive the higher-level Sans-I/O [`RawNode`](22-sans-io-rawnode-ready.md) (`tick` / `step` / `propose` / `ready` / `advance`), which pairs `RaftLogic` with `ProgressTracker` (`Probe` / `Replicate` / `Snapshot` + `Inflights`) and an unstable log overlay while keeping **zero external dependencies**.
 
 And it returns a `Transition`:
 
@@ -328,14 +332,14 @@ Log entries are the fundamental unit of replicated data:
 case class Log(
   index: Long,
   term: Long,
-  data: Array[Byte],
-  entryType: EntryType
+  logType: LogType = LogType.Command,
+  data: Array[Byte] = Array.empty
 )
 
-enum EntryType:
+enum LogType:
   case Command        // a client-submitted command
   case NoOp           // leader's initial no-op entry (see Chapter 2)
-  case Configuration  // a membership change entry
+  case Configuration  // a membership change entry (ClusterConfig)
 ```
 
 Factory methods make entry creation clear and intentional:

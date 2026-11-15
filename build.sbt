@@ -1,69 +1,167 @@
-val scala3Version = "3.3.7"
+val scala3Version = "3.3.9"
 
-lazy val root = project
-  .in(file("."))
+val catsEffectVersion = "3.7.1"
+val fs2Version = "3.14.0"
+val log4catsVersion = "2.8.0"
+val logbackVersion = "1.6.7"
+val grpcVersion = "1.85.1"
+val scalatestVersion = "3.2.20"
+val scalatestScalaCheckVersion = "3.2.20.0"
+val catsEffectTestingVersion = "1.8.0"
+
+ThisBuild / organization := "com.github.bmscomp"
+ThisBuild / scalaVersion := scala3Version
+ThisBuild / dynverSeparator := "-"
+
+lazy val commonScalacOptions = Seq(
+  "-encoding",
+  "utf8",
+  "-deprecation",
+  "-feature",
+  "-unchecked",
+  "-Wunused:all",
+  "-Werror",
+  "-Wconf:src=src_managed/.*:silent"
+)
+
+lazy val strictMainScalacOptions = Seq(
+  "-Wvalue-discard",
+  "-Wnonunit-statement"
+)
+
+lazy val strictMainSettings = Seq(
+  Compile / scalacOptions ++= strictMainScalacOptions,
+  Test / scalacOptions ~= (_.filterNot(strictMainScalacOptions.toSet))
+)
+
+lazy val publishSettings = Seq(
+  publishMavenStyle := true,
+  publishTo := Some(
+    "GitHub Packages" at "https://maven.pkg.github.com/bmscomp/raft"
+  ),
+  credentials += Credentials(
+    "GitHub Package Registry",
+    "maven.pkg.github.com",
+    "bmscomp",
+    sys.env.getOrElse("GITHUB_TOKEN", "")
+  )
+)
+
+lazy val commonTestDependencies = Seq(
+  "org.scalatest" %% "scalatest" % scalatestVersion % Test,
+  "org.scalatestplus" %% "scalacheck-1-19" % scalatestScalaCheckVersion % Test
+)
+
+lazy val effectTestDependencies = commonTestDependencies ++ Seq(
+  "org.typelevel" %% "cats-effect-testing-scalatest" % catsEffectTestingVersion % Test,
+  "org.typelevel" %% "log4cats-slf4j" % log4catsVersion % Test,
+  "ch.qos.logback" % "logback-classic" % logbackVersion % Test
+)
+
+lazy val core = project
+  .in(file("modules/core"))
+  .settings(publishSettings, strictMainSettings)
   .settings(
-    name := "raft",
-    organization := "com.github.bmscomp",
-    version := "0.1.0-SNAPSHOT",
-    scalaVersion := scala3Version,
+    name := "raft-core",
+    scalacOptions ++= commonScalacOptions ++ Seq("-java-output-version", "21"),
+    libraryDependencies ++= commonTestDependencies
+  )
 
-    publishMavenStyle := true,
-    publishTo := Some(
-      "GitHub Packages" at s"https://maven.pkg.github.com/bmscomp/raft"
-    ),
-    credentials += Credentials(
-      "GitHub Package Registry",
-      "maven.pkg.github.com",
-      "bmscomp",
-      sys.env.getOrElse("GITHUB_TOKEN", "")
-    ),
-
-    // Fork for running examples (avoids Cats Effect warnings)
-    Compile / run / fork := true,
-
-    // Compiler options
-    scalacOptions ++= Seq(
-      "-encoding",
-      "utf8",
-      "-deprecation",
-      "-feature",
-      "-unchecked"
-    ),
-
-    // Exclude Jepsen-tagged tests from `sbt test`
-    Test / testOptions += Tests
-      .Argument(TestFrameworks.ScalaTest, "-l", "Jepsen"),
-
-    // Dependencies
+lazy val runtime = project
+  .in(file("modules/runtime"))
+  .dependsOn(core)
+  .settings(publishSettings, strictMainSettings)
+  .settings(
+    name := "raft-runtime",
+    scalacOptions ++= commonScalacOptions ++ Seq("-java-output-version", "21"),
     libraryDependencies ++= Seq(
-      // Effect system
-      "org.typelevel" %% "cats-effect" % "3.6.3",
+      "org.typelevel" %% "cats-effect" % catsEffectVersion,
+      "co.fs2" %% "fs2-core" % fs2Version,
+      "co.fs2" %% "fs2-io" % fs2Version,
+      "org.typelevel" %% "log4cats-core" % log4catsVersion
+    ) ++ effectTestDependencies
+  )
 
-      // Streaming
-      "co.fs2" %% "fs2-core" % "3.12.2",
-      "co.fs2" %% "fs2-io" % "3.12.2",
+lazy val storageMmap = project
+  .in(file("modules/storage-mmap"))
+  .dependsOn(runtime)
+  .settings(publishSettings, strictMainSettings)
+  .settings(
+    name := "raft-storage-mmap",
+    scalacOptions ++= commonScalacOptions,
+    libraryDependencies ++= effectTestDependencies
+  )
 
-      // Logging
-      "org.typelevel" %% "log4cats-slf4j" % "2.7.1",
-      "ch.qos.logback" % "logback-classic" % "1.5.27" % Runtime,
+lazy val transportGrpc = project
+  .in(file("modules/transport-grpc"))
+  .dependsOn(runtime)
+  .settings(publishSettings, strictMainSettings)
+  .settings(
+    name := "raft-transport-grpc",
+    scalacOptions ++= commonScalacOptions,
+    coverageExcludedFiles := ".*src_managed.*",
+    Compile / PB.targets := Seq(
+      scalapb.gen(
+        grpc = true,
+        flatPackage = true
+      ) -> (Compile / sourceManaged).value / "scalapb"
+    ),
+    libraryDependencies ++= Seq(
+      "io.grpc" % "grpc-netty-shaded" % grpcVersion,
+      "io.grpc" % "grpc-protobuf" % grpcVersion,
+      "io.grpc" % "grpc-stub" % grpcVersion,
+      "com.thesamet.scalapb" %% "scalapb-runtime" % scalapb.compiler.Version.scalapbVersion % "protobuf",
+      "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % scalapb.compiler.Version.scalapbVersion
+    ) ++ effectTestDependencies
+  )
 
-      // gRPC
-      "io.grpc" % "grpc-netty-shaded" % "1.72.0",
-      "io.grpc" % "grpc-protobuf" % "1.72.0",
-      "io.grpc" % "grpc-stub" % "1.72.0",
-      "com.thesamet.scalapb" %% "scalapb-runtime" % "0.11.17",
-      "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % "0.11.17",
-
-      // Testing
-      "org.scalatest" %% "scalatest" % "3.2.19" % Test,
-      "org.scalatestplus" %% "scalacheck-1-18" % "3.2.19.0" % Test,
-      "org.typelevel" %% "cats-effect-testing-scalatest" % "1.7.0" % Test
+lazy val jepsen = project
+  .in(file("modules/jepsen"))
+  .dependsOn(runtime)
+  .settings(
+    name := "raft-jepsen",
+    publish / skip := true,
+    coverageEnabled := false,
+    scalacOptions ++= commonScalacOptions,
+    Test / test / testOptions += Tests
+      .Argument(TestFrameworks.ScalaTest, "-l", "Jepsen"),
+    libraryDependencies ++= Seq(
+      "org.scalatest" %% "scalatest" % scalatestVersion,
+      "org.typelevel" %% "cats-effect-testing-scalatest" % catsEffectTestingVersion % Test,
+      "org.typelevel" %% "log4cats-slf4j" % log4catsVersion % Test,
+      "ch.qos.logback" % "logback-classic" % logbackVersion % Test
     )
   )
 
-// Run only Jepsen verification tests: `sbt jepsen`
+lazy val examples = project
+  .in(file("modules/examples"))
+  .dependsOn(core, runtime, storageMmap, transportGrpc)
+  .settings(
+    name := "raft-examples",
+    publish / skip := true,
+    coverageEnabled := false,
+    Compile / run / fork := true,
+    scalacOptions ++= commonScalacOptions,
+    libraryDependencies ++= Seq(
+      "org.typelevel" %% "log4cats-slf4j" % log4catsVersion,
+      "ch.qos.logback" % "logback-classic" % logbackVersion
+    ) ++ effectTestDependencies
+  )
+
+lazy val root = project
+  .in(file("."))
+  .aggregate(core, runtime, storageMmap, transportGrpc, jepsen, examples)
+  .settings(
+    name := "raft-root",
+    publish / skip := true,
+    coverageEnabled := false
+  )
+
 addCommandAlias(
-  "jepsen",
-  """set Test / testOptions := Seq(Tests.Argument(TestFrameworks.ScalaTest, "-n", "Jepsen")); test"""
+  "jepsenSmoke",
+  "jepsen/testOnly raft.jepsen.checker.LinearizabilityCheckerSpec raft.jepsen.JepsenSpec"
+)
+addCommandAlias(
+  "jepsenStress",
+  "jepsen/testOnly raft.jepsen.JepsenStressSpec"
 )

@@ -208,9 +208,9 @@ When the commit index advances, the protocol logic emits a `CommitEntries` effec
 case CommitEntries(upToIndex) =>
   for
     currentApplied <- appliedIndexRef.get
-    entries        <- logStore.getRange(currentApplied + 1, upToIndex)
-    _              <- entries.traverse(stateMachine.apply)
-    _              <- appliedIndexRef.set(upToIndex)
+    entries        <- logStore.getRange(LogIndex.unsafeFrom(currentApplied + 1), upToIndex)
+    _              <- entries.traverse_(stateMachine.apply)
+    _              <- appliedIndexRef.set(upToIndex.value)
   yield ()
 ```
 

@@ -11,58 +11,42 @@ permissions:
 
 jobs:
   release:
+    name: Verify & Publish Release (JDK 25)
     runs-on: ubuntu-latest
-    name: Publish release
-
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up JDK 21
+      - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          java-version: '25'
           distribution: 'temurin'
+          cache: 'sbt'
 
       - name: Set up sbt
         uses: sbt/setup-sbt@v1
 
       - name: Extract version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Set version in build
-        run: |
-          sed -i "s/version := .*/version := \"${{ steps.version.outputs.VERSION }}\",/" build.sbt
+      - name: Verify formatting, docs, unit tests & Jepsen linearizability
+        run: sbt -batch scalafmtCheckAll scalafmtSbtCheck doc test jepsenSmoke
 
-      - name: Compile
-        run: sbt compile
-
-      - name: Run tests
-        run: sbt test
-
-      - name: Run Jepsen verification
-        run: sbt jepsen
-
-      - name: Package JAR
-        id: jar
-        run: |
-          sbt package
-          JAR_PATH=$(find target -name "raft*.jar" -not -path "*/test-classes/*" | head -1)
-          echo "JAR_PATH=$JAR_PATH" >> $GITHUB_OUTPUT
-          echo "Found JAR: $JAR_PATH"
-
-      - name: Publish to GitHub Packages
-        run: sbt publish
+      - name: Package & publish module artifacts
+        run: sbt -batch package publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine prerelease
+      - name: Determine prerelease flag
         id: prerelease
         run: |
-          if echo "${{ steps.version.outputs.VERSION }}" | grep -qE '(RC|alpha|beta|SNAPSHOT)'; then
-            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
+          if echo "${{ steps.version.outputs.VERSION }}" | grep -qE '(RC|alpha|beta|M[0-9]+|SNAPSHOT)'; then
+            echo "IS_PRERELEASE=true" >> "$GITHUB_OUTPUT"
           else
-            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+            echo "IS_PRERELEASE=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create GitHub Release
@@ -71,6 +55,10 @@ jobs:
           name: v${{ steps.version.outputs.VERSION }}
           generate_release_notes: true
           prerelease: ${{ steps.prerelease.outputs.IS_PRERELEASE }}
-          files: ${{ steps.jar.outputs.JAR_PATH }}
+          files: |
+            modules/core/target/scala-3.3.9/raft-core_*.jar
+            modules/runtime/target/scala-3.3.9/raft-runtime_*.jar
+            modules/storage-mmap/target/scala-3.3.9/raft-storage-mmap_*.jar
+            modules/transport-grpc/target/scala-3.3.9/raft-transport-grpc_*.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
