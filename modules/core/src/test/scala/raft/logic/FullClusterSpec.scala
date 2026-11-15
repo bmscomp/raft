@@ -1,7 +1,6 @@
-package raft.integration
+package raft.logic
 
-import cats.effect.testing.scalatest.AsyncIOSpec
-import org.scalatest.flatspec.AsyncFlatSpec
+import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scala.concurrent.duration.*
 
@@ -9,14 +8,12 @@ import raft.state.*
 import raft.state.NodeState.*
 import raft.message.*
 import raft.message.RaftMessage.*
-import raft.logic.RaftLogic
 import raft.effect.Effect.*
 
-/** Full Cluster Integration Tests
-  *
-  * Tests end-to-end RAFT behavior with 3-node cluster.
+/** Pure 3-node state-machine transition tests for election, replication, and
+  * step-down.
   */
-class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
+class FullClusterSpec extends AnyFlatSpec with Matchers:
 
   val baseConfig = RaftConfig(
     localId = NodeId("node-1"),
@@ -29,7 +26,6 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
     val config = baseConfig.copy(localId = NodeId("node-1"))
     val follower = Follower(0, None, None)
 
-    // Simulate election timeout (with pre-vote enabled by default)
     val transition = RaftLogic.onMessage(
       follower,
       ElectionTimeout,
@@ -39,11 +35,9 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       clusterSize = 3
     )
 
-    // Should become PreCandidate first (pre-vote phase)
     transition.state shouldBe a[PreCandidate]
-    transition.state.term shouldBe 0 // Term not incremented during pre-vote
+    transition.state.term shouldBe 0
 
-    // Should broadcast pre-vote requests
     val broadcasts = transition.effects.collect { case Broadcast(msg) => msg }
     broadcasts should not be empty
     broadcasts.head.asInstanceOf[RequestVoteRequest].isPreVote shouldBe true
@@ -53,14 +47,12 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
     val config = baseConfig.copy(localId = NodeId("candidate"))
     val candidate: Candidate = Candidate(
       term = 5,
-      votesReceived = Set(NodeId("candidate")) // Self-vote
+      votesReceived = Set(NodeId("candidate"))
     )
 
-    // Receive vote from node-2
     val voteResp: RequestVoteResponse =
       RequestVoteResponse(term = 5, voteGranted = true, isPreVote = false)
 
-    // Use onVoteResponse for proper voter tracking
     val transition = RaftLogic.onVoteResponse(
       candidate,
       NodeId("node-2"),
@@ -69,10 +61,7 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       clusterSize = 3
     )
 
-    // Now has 2 votes out of 3 = majority
     transition.state shouldBe a[Leader]
-
-    // Should have BecomeLeader effect
     transition.effects should contain(BecomeLeader)
   }
 
@@ -97,7 +86,6 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       clusterSize = 3
     )
 
-    // Should grant vote - candidate's log is more up-to-date
     transition.state shouldBe a[Follower]
     transition.state.asInstanceOf[Follower].votedFor shouldBe Some(
       NodeId("candidate")
@@ -128,7 +116,6 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       clusterSize = 3
     )
 
-    // Should broadcast heartbeat
     val heartbeat = transition.effects.collectFirst {
       case Broadcast(ae: AppendEntriesRequest) => ae
     }
@@ -157,7 +144,6 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       leaderCommit = 8
     )
 
-    // Mock log match
     val getTermAt: Long => Option[Long] = {
       case 10 => Some(4L)
       case _  => None
@@ -173,7 +159,6 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       getTermAt = getTermAt
     )
 
-    // Should have AppendLogs effect
     val appendEffect = transition.effects.collectFirst {
       case AppendLogs(logs) => logs
     }
@@ -181,22 +166,20 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
     appendEffect shouldBe defined
     appendEffect.get.size shouldBe 2
 
-    // Should reply with success
     val response = transition.effects.collectFirst {
       case SendMessage(_, resp: AppendEntriesResponse) => resp
     }
     response shouldBe defined
     response.get.success shouldBe true
-    response.get.matchIndex shouldBe 12 // 10 + 2 entries
+    response.get.matchIndex shouldBe 12
   }
 
   "Node stepping down" should "higher term causes step down" in {
     val config = baseConfig.copy(localId = NodeId("leader"))
     val leader = Leader(term = 5)
 
-    // Receive AppendEntries from higher term leader
     val appendReq = AppendEntriesRequest(
-      term = 7, // Higher term
+      term = 7,
       leaderId = NodeId("new-leader"),
       prevLogIndex = 0,
       prevLogTerm = 0,
@@ -213,7 +196,6 @@ class FullClusterSpec extends AsyncFlatSpec with AsyncIOSpec with Matchers:
       clusterSize = 3
     )
 
-    // Should step down to follower
     transition.state shouldBe a[Follower]
     transition.state.term shouldBe 7
   }

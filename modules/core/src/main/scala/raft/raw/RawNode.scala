@@ -261,7 +261,7 @@ final class RawNode(
           )
         else
           transferElapsed = 0
-          roleState = l.copy(transferTarget = Some(transferee))
+          roleState = l.copy(transferTarget = Some(transferee), leaseUntil = 0L)
           val matched =
             tracker.progress.get(transferee).map(_.matched).getOrElse(0L)
           if matched >= lastLogIndex then
@@ -694,7 +694,9 @@ final class RawNode(
         val prevTermOpt = termAt(prevIdx)
         val firstAvail = storage.firstIndex
 
-        if pr.nextIdx < firstAvail && prevTermOpt.isEmpty then
+        if (pr.nextIdx < firstAvail || prevTermOpt.isEmpty) &&
+          storage.snapshotMetadata.isDefined
+        then
           // Follower lags behind compacted log; transition to Snapshot state
           storage.snapshotMetadata.foreach { snap =>
             tracker = tracker.updateProgress(
@@ -1004,6 +1006,7 @@ final class RawNode(
 
           if resp.success then
             var advanced = false
+            var retryDroppedSnapshot = false
             tracker = tracker.updateProgress(
               from,
               pr => {
@@ -1015,9 +1018,16 @@ final class RawNode(
                   case ProgressState.Replicate
                       if !moved && updated0.matched < lastLogIndex =>
                     updated0.becomeProbe()
-                  case ProgressState.Snapshot(snapIdx)
-                      if updated0.matched >= snapIdx =>
-                    updated0.becomeProbe()
+                  case ProgressState.Snapshot(snapIdx) =>
+                    if updated0.matched >= snapIdx then updated0.becomeProbe()
+                    else
+                      retryDroppedSnapshot = true
+                      updated0.copy(
+                        state = ProgressState.Probe,
+                        nextIdx = math.max(1L, updated0.matched + 1L),
+                        probeSent = false,
+                        inflights = updated0.inflights.reset
+                      )
                   case _ => updated0
                 updated1
               }
@@ -1037,7 +1047,8 @@ final class RawNode(
                     val m =
                       tracker.progress.get(target).map(_.matched).getOrElse(0L)
                     if m >= lastLogIndex then
-                      roleState = lAfter.copy(transferTarget = None)
+                      roleState =
+                        lAfter.copy(transferTarget = None, leaseUntil = 0L)
                       sendOrigin(
                         target,
                         TimeoutNowRequest(lAfter.term, config.localId),
@@ -1045,7 +1056,9 @@ final class RawNode(
                       )
                     else sendAppend(from, forceSendEmpty = false)
                   case _ =>
-                    if tracker.progress
+                    if retryDroppedSnapshot then
+                      sendAppend(from, forceSendEmpty = true)
+                    else if tracker.progress
                         .get(from)
                         .exists(p => p.nextIdx <= lastLogIndex && !p.isPaused)
                     then sendAppend(from, forceSendEmpty = false)
@@ -1176,10 +1189,12 @@ final class RawNode(
           decodedCfg,
           stateBytes
         )
+        val matchingExistingPrefix =
+          termAt(req.lastIncludedIndex).contains(req.lastIncludedTerm)
         pendingSnapshotMeta = Some(meta)
         decodedCfg.foreach(applyClusterConfig)
 
-        if termAt(req.lastIncludedIndex).contains(req.lastIncludedTerm) then
+        if matchingExistingPrefix then
           unstableEntries =
             unstableEntries.dropWhile(_.index <= req.lastIncludedIndex)
         else
