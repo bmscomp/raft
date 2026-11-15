@@ -92,7 +92,7 @@ jobs:
         run: sbt -batch coverage test coverageAggregate
 
       - name: Upload coverage report to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: target/scala-3.3.9/scoverage-report/scoverage.xml
           fail_ci_if_error: false
