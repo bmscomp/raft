@@ -1,4 +1,4 @@
-# Chapter 17: Multi-Raft Group Design
+# Chapter 21: Multi-Raft Group Design
 
 *A single Raft group provides strong consistency for a replicated state machine, but it has inherent scalability limits: all writes go through one leader, the entire dataset must fit on every node, and throughput is bounded by the slowest majority member. This chapter discusses how to scale beyond those limits by partitioning data across multiple independent Raft groups — a pattern used by CockroachDB, TiKV, Yugabyte, and most production distributed databases.*
 
@@ -11,7 +11,7 @@ A single Raft group has three fundamental bottlenecks:
 ```mermaid
 flowchart LR
     subgraph Single["Single Raft Group"]
-        L["Leader\n(all writes)"]
+        L["Leader (All Writes)"]
         F1["Follower"]
         F2["Follower"]
     end
@@ -36,21 +36,21 @@ The solution is **sharding**: partition the dataset across multiple independent 
 ```mermaid
 flowchart TB
     subgraph Node1["Physical Node 1"]
-        G1L["Group 1\n(Leader)"]
-        G2F["Group 2\n(Follower)"]
-        G3F["Group 3\n(Follower)"]
+        G1L["Group 1 (Leader)"]
+        G2F["Group 2 (Follower)"]
+        G3F["Group 3 (Follower)"]
     end
 
     subgraph Node2["Physical Node 2"]
-        G1F1["Group 1\n(Follower)"]
-        G2L["Group 2\n(Leader)"]
-        G3F2["Group 3\n(Follower)"]
+        G1F1["Group 1 (Follower)"]
+        G2L["Group 2 (Leader)"]
+        G3F2["Group 3 (Follower)"]
     end
 
     subgraph Node3["Physical Node 3"]
-        G1F2["Group 1\n(Follower)"]
-        G2F2["Group 2\n(Follower)"]
-        G3L["Group 3\n(Leader)"]
+        G1F2["Group 1 (Follower)"]
+        G2F2["Group 2 (Follower)"]
+        G3L["Group 3 (Leader)"]
     end
 
     G1L <--> G1F1
@@ -111,7 +111,7 @@ flowchart LR
     R --> G2["Group 2 Leader"]
     R --> G3["Group 3 Leader"]
 
-    RT["Routing Table\n(key → group → leader)"]
+    RT["Routing Table (key -> group -> leader)"]
     R -.-> RT
 ```
 
@@ -145,11 +145,28 @@ If all group leaders land on the same physical node, you've recreated the single
 
 With *N* groups and *M* physical nodes, there are potentially `N × (M-1)` logical connections. This is wasteful — you should multiplex multiple Raft groups over a single physical connection per node pair:
 
-```
-Physical Node 1 ←→ Physical Node 2
-  └─ Group 1 messages
-  └─ Group 2 messages
-  └─ Group 3 messages
+```mermaid
+flowchart LR
+    subgraph N1["Physical Node 1"]
+        N1G1["Group 1"]
+        N1G2["Group 2"]
+        N1G3["Group 3"]
+    end
+
+    MUX1["MultiGroupTransport (Single HTTP/2 Channel)"]
+
+    subgraph N2["Physical Node 2"]
+        N2G1["Group 1"]
+        N2G2["Group 2"]
+        N2G3["Group 3"]
+    end
+
+    N1G1 --> MUX1
+    N1G2 --> MUX1
+    N1G3 --> MUX1
+    MUX1 -->|"GroupEnvelope(groupId, msg)"| N2G1
+    MUX1 -->|"GroupEnvelope(groupId, msg)"| N2G2
+    MUX1 -->|"GroupEnvelope(groupId, msg)"| N2G3
 ```
 
 This requires a transport layer that routes messages to the correct group based on a group ID in the message header.
@@ -241,5 +258,5 @@ Running many groups on one node introduces resource management concerns:
 
 ---
 
-*Next: [Appendix A — Quick Reference](appendix-a-quick-reference.md) provides a one-page lookup for all types, effects, messages, and configuration parameters in the library.*
+*Next: [Chapter 22 — Sans-I/O `RawNode` & `Ready` Protocol](22-sans-io-rawnode-ready.md) dives into the zero-dependency consensus core modeled after `tikv/raft-rs` and `etcd/raft`.*
 

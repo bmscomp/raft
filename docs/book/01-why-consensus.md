@@ -20,11 +20,19 @@ The moment you have more than one copy of the data, you need those copies to **a
 
 Consider this scenario:
 
-```
-Time 0: Server A holds x = 3, Server B holds x = 3  (in sync)
-Time 1: Client-1 sends "SET x = 5" to Server A
-Time 2: Client-2 sends "SET x = 7" to Server B
-Time 3: The network link between A and B drops
+```mermaid
+sequenceDiagram
+    participant C1 as Client-1
+    participant SA as Server A
+    participant SB as Server B
+    participant C2 as Client-2
+
+    Note over SA,SB: Time 0: Both servers hold x = 3 (in sync)
+    C1->>SA: Time 1: SET x = 5
+    Note over SA: x = 5
+    C2->>SB: Time 2: SET x = 7
+    Note over SB: x = 7
+    Note over SA,SB: Time 3: Network link between A and B drops (Split-Brain)
 ```
 
 Now what? Server A thinks `x = 5`. Server B thinks `x = 7`. Neither knows about the other's update. Clients connecting to different servers will see different values. This is called a **split-brain**, and it's one of the most dangerous failure modes in distributed computing.

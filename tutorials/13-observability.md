@@ -115,52 +115,50 @@ def logRaftEvent(logger: Logger[IO])(event: String, details: Map[String, String]
 
 ### Panel 2: Replication Health
 
+```mermaid
+xychart-beta
+    title "Follower Replication Lag (Entries Behind Leader)"
+    x-axis ["node-2", "node-3", "node-4"]
+    y-axis "Lag (Entries)" 0 --> 400
+    bar [12, 350, 8]
 ```
-┌──────────────────────────────────────────────────────┐
-│  Follower Replication Lag                             │
-│                                                      │
-│  node-2  ████████░░░░░░░░░░░░░░░░  lag: 12 entries  │
-│  node-3  ████████████████░░░░░░░░  lag: 350 entries  │
-│  node-4  ████████░░░░░░░░░░░░░░░░  lag: 8 entries   │
-│                                                      │
-│  [■ < 100]  [■ 100-1000]  [■ > 1000 ALERT]          │
-└──────────────────────────────────────────────────────┘
-```
+
+- **Healthy**: `< 100` entries (`node-2`, `node-4`)
+- **Elevated**: `100–1,000` entries (`node-3` at `350` entries — monitor disk/network)
+- **Alert**: `> 1,000` entries (risk of snapshot fallback or quorum stall if another node fails)
 
 ### Panel 3: Latency Breakdown
 
+```mermaid
+flowchart LR
+    Prop["Client Proposal"]
+    Commit["WAL + Quorum AppendEntries (P50: 2ms / P99: 15ms)"]
+    Apply["StateMachine Apply (P50: 0.1ms / P99: 0.5ms)"]
+    Ack["Client Write ACK (Total P50: 2.1ms / P99: 15.5ms)"]
+
+    Prop --> Commit --> Apply --> Ack
 ```
-┌──────────────────────────────────────────────────────┐
-│  Write Path Latency (P50 / P99 / P999)               │
-│                                                      │
-│  Proposal → Commit:    2ms  /   15ms  /   45ms      │
-│  Commit → Apply:       0.1ms /  0.5ms /   2ms       │
-│  Total Write:          2.1ms / 15.5ms /  47ms       │
-│                                                      │
-│  Read Path Latency                                   │
-│  ReadIndex:            1ms  /   8ms   /   25ms      │
-│  Lease Read:           0.01ms/ 0.05ms /  0.1ms      │
-└──────────────────────────────────────────────────────┘
-```
+
+| Path | P50 | P99 | P999 |
+|------|-----|-----|------|
+| **Proposal -> Commit** | `2.0 ms` | `15.0 ms` | `45.0 ms` |
+| **Commit -> Apply** | `0.1 ms` | `0.5 ms` | `2.0 ms` |
+| **Total Write** | `2.1 ms` | `15.5 ms` | `47.0 ms` |
+| **ReadIndex Read** | `1.0 ms` | `8.0 ms` | `25.0 ms` |
+| **Lease Read** | `0.01 ms` | `0.05 ms` | `0.1 ms` |
 
 ### Panel 4: Resource Usage
 
-```
-┌──────────────────────────────────────────────────────┐
-│  Log & Storage                                       │
-│                                                      │
-│  Log entries:          42,000                        │
-│  Log size on disk:     128 MB                        │
-│  Last snapshot index:  40,000                        │
-│  Snapshot size:        12 MB                         │
-│  Disk free:            45 GB (82%)                   │
-│                                                      │
-│  Network                                             │
-│  Replication in:       2.3 MB/s                      │
-│  Replication out:      4.6 MB/s                      │
-│  Heartbeat rate:       5 req/s per follower          │
-└──────────────────────────────────────────────────────┘
-```
+| Subsystem | Metric | Sample Value |
+|-----------|--------|--------------|
+| **Log & Storage** | Log entries | `42,000` |
+| **Log & Storage** | Log size on disk | `128 MB` |
+| **Log & Storage** | Last snapshot index | `40,000` |
+| **Log & Storage** | Snapshot size | `12 MB` |
+| **Log & Storage** | Disk free | `45 GB (82%)` |
+| **Network** | Replication inbound | `2.3 MB/s` |
+| **Network** | Replication outbound | `4.6 MB/s` |
+| **Network** | Heartbeat rate | `5 req/s per follower` |
 
 ## Alert Rules
 

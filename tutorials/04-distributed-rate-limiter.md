@@ -37,23 +37,28 @@ Raft provides both:
 
 ## Architecture
 
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                     Rate Limiter Cluster                          │
-│                                                                   │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐                      │
-│  │ Node 1  │◄──►│ Node 2  │◄──►│ Node 3  │  (Raft)             │
-│  │(Leader) │    │(Follower)│    │(Follower)│                      │
-│  └────▲────┘    └─────────┘    └─────────┘                      │
-│       │                                                           │
-└───────┼───────────────────────────────────────────────────────────┘
-        │  (lease reads for checks, batched writes for recording)
-   ╔════╧═══════════════════════════════════════╗
-   ║              API Gateways                   ║
-   ║  ┌─────┐ ┌─────┐ ┌─────┐      ┌─────┐    ║
-   ║  │ GW1 │ │ GW2 │ │ GW3 │ ···  │GW20 │    ║
-   ║  └─────┘ └─────┘ └─────┘      └─────┘    ║
-   ╚════════════════════════════════════════════╝
+```mermaid
+flowchart TD
+    subgraph Gateways["API Gateway Fleet (20 Stateless Instances)"]
+        GW1["GW-1"]
+        GW2["GW-2"]
+        GW3["GW-3"]
+        GW20["GW-20"]
+    end
+
+    subgraph Cluster["Rate Limiter Raft Cluster"]
+        N1["Node 1 (Leader)"]
+        N2["Node 2 (Follower)"]
+        N3["Node 3 (Follower)"]
+        N1 <--> N2
+        N2 <--> N3
+        N1 <--> N3
+    end
+
+    GW1 -->|"0-RTT Lease Check + Batched Record"| N1
+    GW2 -->|"0-RTT Lease Check + Batched Record"| N1
+    GW3 -->|"0-RTT Lease Check + Batched Record"| N1
+    GW20 -->|"0-RTT Lease Check + Batched Record"| N1
 ```
 
 ## Sliding Window Algorithm
@@ -328,21 +333,31 @@ With batching, 20 gateways × 1,000 req/s = 20,000 events/s become ~400 batched 
 
 ### Scenario 1: Leader fails during burst
 
-```
-t=0    User at 950/1000 requests. Leader crashes.
-t=2    New leader elected. State machine shows 950 requests.
-t=2.1  User sends 50 more requests → correctly limited at 1000.
+```mermaid
+sequenceDiagram
+    participant GW as API Gateway
+    participant N1 as Node 1 (Old Leader)
+    participant N2 as Node 2 (New Leader)
+
+    Note over N1,N2: t=0s: User at 950/1000 committed requests -> Node 1 crashes!
+    Note over N2: t=2s: Node 2 elected Leader (replicated state = 950/1000)
+    GW->>N2: t=2.1s: Record +50 requests
+    N2-->>GW: Throttled accurately at 1000/1000
 ```
 
 **What happens**: The committed state (950 requests) survives leadership change. No requests are "forgotten" — the new leader has the exact same state machine.
 
 ### Scenario 2: Network partition — gateway talks to minority
 
-```
-t=0    Gateway connected to Node 1 (partitioned minority)
-t=1    Gateway's RecordRequests writes are not committed (no quorum)
-t=5    Gateway's propose calls time out
-t=5.1  Gateway falls back to local-only tracking (degraded mode)
+```mermaid
+sequenceDiagram
+    participant GW as API Gateway
+    participant N1 as Node 1 (Partitioned Minority)
+
+    GW->>N1: t=0s: RecordRequests batch
+    Note over N1: t=1s: Cannot reach quorum -> uncommitted
+    N1--xGW: t=5s: Propose timeout
+    Note over GW: t=5.1s: Fallback to conservative local token bucket (globalLimit / 20)
 ```
 
 **Mitigation**: Gateways should detect write failures and switch to a local token bucket as a fallback. The local limit should be set to `globalLimit / numGateways` — conservative but safe.

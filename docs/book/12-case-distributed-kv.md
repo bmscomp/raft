@@ -24,27 +24,21 @@ With Raft, writes are replicated to a **majority before being acknowledged**. If
 
 The architecture has three layers:
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                       Client API                             │
-│   put(key, value) → "OK"                                     │
-│   get(key)        → value | "(not found)"                    │
-│   delete(key)     → "OK"                                     │
-├──────────────────────────────────────────────────────────────┤
-│                    Command Encoding                          │
-│   KVCommand ──encode──→ Array[Byte] ──→ Log entry            │
-│   Array[Byte] ──decode──→ KVCommand                          │
-│                                                              │
-│   Commands are opaque bytes to the Raft layer — it replicates│
-│   them without inspecting the contents.                      │
-├──────────────────────────────────────────────────────────────┤
-│                   KVStateMachine                             │
-│   implements StateMachine[F, String]                         │
-│                                                              │
-│   apply(log) → decode command → mutate Ref[Map] → return     │
-│   snapshot()  → serialize Map to bytes                       │
-│   restore()   → deserialize bytes to Map                     │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph API["1. Client API"]
+        OP["put(key, value) · get(key) · delete(key)"]
+    end
+
+    subgraph Codec["2. Command Encoding"]
+        ENC["KVCommand <-> Array[Byte] (Opaque Log Entry Payload)"]
+    end
+
+    subgraph FSM["3. KVStateMachine (StateMachine[F, String])"]
+        APP["apply(log) -> Mutate Ref[Map] · snapshot() · restore()"]
+    end
+
+    API --> Codec --> FSM
 ```
 
 The key insight is the clean separation of concerns. The Raft layer handles replication and ordering. The command encoding layer handles serialization. The state machine handles domain logic. Each layer knows nothing about the others' internals.
@@ -259,30 +253,23 @@ The beauty of this approach: the recovering node doesn't need to replay millions
 
 Here's the complete data flow from client request to response:
 
-```
-Client Request: PUT user:1 Alice
-        │
-        ▼
-   ┌───────────┐
-   │  Leader   │   1. Encode: KVCommand.Put("user:1", "Alice") → bytes
-   │ (Node-1)  │   2. Create: Log.command(idx=1, term=1, data=bytes)
-   │           │   3. Append to local log (durable write)
-   │           │   4. Send AppendEntries to all followers
-   └─────┬─────┘
-         │
-   ┌─────┴───────────────────┐
-   │  AppendEntriesRequest   │
-   │  entries=[{PUT user:1}] │──→ Follower-2 (accepts, matchIndex=1)
-   │                         │──→ Follower-3 (accepts, matchIndex=1)
-   └─────────────────────────┘
-         │
-         ▼  Majority replicated (3/3) → commitIndex advances to 1
-         │
-   ┌─────┴────────────┐
-   │   All nodes      │
-   │   apply(entry)   │ → store.update(_.updated("user:1", "Alice"))
-   │   return "OK"    │ → leader sends "OK" to client
-   └──────────────────┘
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader (Node-1)
+    participant F2 as Follower-2
+    participant F3 as Follower-3
+
+    C->>L: PUT user:1 Alice
+    Note over L: 1. Encode KVCommand.Put("user:1", "Alice") -> bytes
+    Note over L: 2-3. Append Log(idx=1, term=1) to local durable log
+    L->>F2: 4. AppendEntries(entries=[PUT user:1 Alice])
+    L->>F3: 4. AppendEntries(entries=[PUT user:1 Alice])
+    F2-->>L: AppendEntriesResponse(success=true, matchIndex=1)
+    F3-->>L: AppendEntriesResponse(success=true, matchIndex=1)
+    Note over L: Majority replicated (3/3) -> commitIndex = 1
+    Note over L,F3: All nodes apply(entry) -> store.updated("user:1", "Alice")
+    L-->>C: "OK"
 ```
 
 ## Run the Example

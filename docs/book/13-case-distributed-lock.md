@@ -50,6 +50,16 @@ enum LockCommand:
 
 The **Heartbeat** command is a lease renewal mechanism. Clients send heartbeats periodically (at intervals shorter than the TTL) to keep their lock alive. If a client crashes or is partitioned away, its heartbeats stop, and the lock expires after the TTL. This is the same pattern used by ZooKeeper session keepalives and Chubby's lease mechanism.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Free
+    Free --> Held: Acquire(lockId, clientA, ttl) -> Acquired
+    Held --> Held: Heartbeat(clientA) / Reentrant Acquire(clientA) -> Renewed
+    Held --> Held: Acquire(clientB) while now < expiresAt -> Denied
+    Held --> Free: Release(clientA) -> Released
+    Held --> Held: Acquire(clientB) when now >= expiresAt -> Acquired (TTL Expired)
+```
+
 ## Step 1: Command Encoding
 
 ```scala

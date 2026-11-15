@@ -8,13 +8,16 @@
 
 Consider this sequence:
 
-```
-t=0   Client sends "transfer $100 from Alice to Bob"
-t=1   Leader commits the transfer
-t=2   Leader sends response to client
-t=3   Network drops the response — client never receives it
-t=4   Client retries: "transfer $100 from Alice to Bob"
-t=5   Leader commits the transfer AGAIN — Alice loses $200
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Raft Leader
+
+    C->>L: t=0: "transfer 100 USD from Alice to Bob"
+    Note over L: t=1: Committed & applied (-100 USD)
+    L--xC: t=2..3: Response dropped by network!
+    C->>L: t=4: Retry "transfer 100 USD from Alice to Bob"
+    Note over L: t=5: Committed & applied AGAIN (Alice loses 200 USD!)
 ```
 
 The Raft consensus layer guarantees that committed commands are durable and applied exactly once **within the cluster**. But the client doesn't know whether its command was committed or not. Its only safe option is to retry — and retries cause duplicates.
@@ -23,18 +26,26 @@ This isn't a theoretical concern. Every production Raft system (etcd, CockroachD
 
 ## The Session Table Pattern
 
-The idea is simple: track what the cluster has already done for each client.
+The idea is simple: track what the cluster has already done for each client inside the replicated state machine.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ Session Table (part of the replicated state machine)      │
-│                                                          │
-│ ClientId      LastSeqNum    LastResult                    │
-│ ─────────     ──────────    ──────────                    │
-│ client-A      42            "OK:transferred $100"         │
-│ client-B      17            "OK:balance=$350"             │
-│ client-C      3             "ERR:insufficient funds"      │
-└──────────────────────────────────────────────────────────┘
+| `ClientId` | `LastSeqNum` | `LastResult` |
+|------------|--------------|--------------|
+| `client-A` | `42` | `"OK:transferred \$100"` |
+| `client-B` | `17` | `"OK:balance=\$350"` |
+| `client-C` | `3` | `"ERR:insufficient funds"` |
+
+```mermaid
+flowchart TD
+    Cmd["Incoming TaggedCommand (clientId, seqNum, payload)"]
+    Lookup{"Compare seqNum vs SessionEntry.lastSeqNum"}
+    NewCmd["Execute inner.apply(payload) & Update SessionEntry"]
+    RetryCmd["Return Cached lastResult (Zero Side Effects)"]
+    StaleCmd["Reject as STALE"]
+
+    Cmd --> Lookup
+    Lookup -->|"seqNum > lastSeqNum"| NewCmd
+    Lookup -->|"seqNum == lastSeqNum"| RetryCmd
+    Lookup -->|"seqNum < lastSeqNum"| StaleCmd
 ```
 
 Every client command carries a `(clientId, sequenceNumber)` pair. The state machine checks:
@@ -219,34 +230,53 @@ With `Long` sequence numbers (2^63), a client sending 1 million requests per sec
 
 ### Scenario 1: Client retries to same leader
 
-```
-t=0   Client sends (clientId=A, seq=42, transfer $100) → committed
-t=1   Response lost
-t=2   Client retries (clientId=A, seq=42, transfer $100)
-t=3   Session table: seq=42 already seen → return cached "OK:transferred $100"
+```mermaid
+sequenceDiagram
+    participant C as Client A
+    participant L as Leader (Session Table)
+
+    C->>L: t=0: (clientId=A, seq=42, transfer 100 USD)
+    Note over L: Committed -> session[A] = (42, "OK:transferred 100 USD")
+    L--xC: t=1: Response lost
+    C->>L: t=2: Retry (clientId=A, seq=42, transfer 100 USD)
+    Note over L: t=3: seq=42 == lastSeqNum -> cache hit
+    L-->>C: CACHED:OK:transferred 100 USD
 ```
 
 Result: Transfer happens exactly once.
 
 ### Scenario 2: Client retries to new leader
 
-```
-t=0   Client sends (clientId=A, seq=42, transfer $100) → committed on old leader
-t=1   Old leader crashes before sending response
-t=3   New leader elected — session table includes (A, seq=42, "OK:transferred")
-t=4   Client retries (clientId=A, seq=42) to new leader
-t=5   Session table hit → return cached result
+```mermaid
+sequenceDiagram
+    participant C as Client A
+    participant L1 as Old Leader
+    participant L2 as New Leader (Replicated Session Table)
+
+    C->>L1: t=0: (clientId=A, seq=42, transfer 100 USD)
+    L1->>L2: Replicate entry + session[A] = (42, "OK:transferred")
+    Note over L1: t=1: Old Leader crashes before replying!
+    Note over L2: t=3: Elected New Leader with replicated session table
+    C->>L2: t=4: Retry (clientId=A, seq=42, transfer 100 USD)
+    L2-->>C: t=5: CACHED:OK:transferred
 ```
 
 Result: Transfer happens exactly once, despite leader change.
 
 ### Scenario 3: Command was never committed
 
-```
-t=0   Client sends (clientId=A, seq=42, transfer $100)
-t=1   Leader crashes BEFORE committing
-t=3   New leader elected — session table does NOT have (A, seq=42)
-t=4   Client retries (clientId=A, seq=42) → new command, executes normally
+```mermaid
+sequenceDiagram
+    participant C as Client A
+    participant L1 as Old Leader
+    participant L2 as New Leader
+
+    C->>L1: t=0: (clientId=A, seq=42, transfer 100 USD)
+    Note over L1: t=1: Crashes BEFORE replicating to quorum!
+    Note over L2: t=3: Elected Leader (session table has NO seq=42)
+    C->>L2: t=4: Retry (clientId=A, seq=42, transfer 100 USD)
+    Note over L2: Treated as fresh command -> executes & commits
+    L2-->>C: OK:transferred 100 USD
 ```
 
 Result: Transfer happens exactly once. The first attempt was lost (never committed), and the retry is treated as a new command.

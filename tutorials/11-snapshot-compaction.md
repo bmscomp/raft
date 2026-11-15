@@ -16,14 +16,21 @@ The Raft log grows with every write. After a million operations, the log contain
 
 A snapshot captures the **current state machine state** at a specific log index, then discards all log entries up to that index:
 
-```
-Before snapshot (log has 1M entries):
-  Log: [entry_1, entry_2, ..., entry_1_000_000]
-  State: { "counter-A": 42, "counter-B": 17 }
+```mermaid
+flowchart TD
+    subgraph Before["Before Snapshot (1,000,000 Log Entries)"]
+        OldLog["WAL Log: [entry_1, entry_2, ..., entry_1_000_000]"]
+        OldSM["State Machine: { counter-A: 42, counter-B: 17 }"]
+        OldLog --> OldSM
+    end
 
-After snapshot at index 1_000_000:
-  Snapshot: { "counter-A": 42, "counter-B": 17, lastIndex: 1_000_000 }
-  Log: [entry_1_000_001, entry_1_000_002, ...]  (only new entries)
+    subgraph After["After Compaction at Index 1,000,000"]
+        Snap["Snapshot (lastIncludedIndex = 1,000,000): { counter-A: 42, counter-B: 17, ClusterConfig }"]
+        NewLog["Active WAL Suffix: [entry_1_000_001, entry_1_000_002, ...]"]
+        Snap --> NewLog
+    end
+
+    Before -->|"Save Snapshot & Truncate Prefix"| After
 ```
 
 ## When to Snapshot
@@ -186,6 +193,18 @@ The receiving node assembles chunks, then:
 2. Sets its last applied index to `lastIncludedIndex`
 3. Loads the cluster configuration from the snapshot metadata
 4. Begins accepting log entries from `lastIncludedIndex + 1`
+
+```mermaid
+sequenceDiagram
+    participant L as Leader (Compacted up to 1,000,000)
+    participant F as New / Lagging Follower (matchIndex = 0)
+
+    L->>F: InstallSnapshotChunk (chunk 0/N, done = false)
+    L->>F: InstallSnapshotChunk (chunk N-1/N, done = true)
+    Note over F: Restore StateMachine + ClusterConfig at 1,000,000
+    F-->>L: InstallSnapshotResponse (success, matchIndex = 1,000,000)
+    L->>F: AppendEntries from index 1,000,001
+```
 
 ## Compaction Safety Rules
 

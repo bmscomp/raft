@@ -24,28 +24,19 @@ This isn't theoretical. The Raft paper dedicates an entire section (§6) to this
 
 The library implements **joint consensus** (Raft §6), where membership changes go through a two-phase protocol that guarantees no two majorities can exist simultaneously:
 
-```
-Phase 1:  C_old → C_old,new  (joint config — both old AND new must agree)
-Phase 2:  C_old,new → C_new  (new config takes effect)
-```
+1. **Phase 1 (`C_old -> C_old,new`)**: Commit a joint configuration entry where **both** the old majority and the new majority must agree.
+2. **Phase 2 (`C_old,new -> C_new`)**: Once `C_old,new` commits, commit the final configuration entry where the new quorum takes effect.
 
 During the joint phase (`C_old,new`), every decision (election, commit) requires agreement from **both** a majority of the old config **and** a majority of the new config. This eliminates split-brain by construction.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  Joint Consensus Timeline                        │
-│                                                                 │
-│  C_old          C_old,new                    C_new              │
-│  [A,B,C]   →   [A,B,C] ∩ [A,B,C,D]    →   [A,B,C,D]          │
-│                                                                 │
-│  Quorum=2      Quorum = maj(old) AND        Quorum=3           │
-│                         maj(new)                                │
-│                = 2 of [A,B,C]                                   │
-│                  AND 3 of [A,B,C,D]                             │
-│                                                                 │
-│  Any leader must satisfy BOTH quorum requirements               │
-│  → no split brain possible                                      │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Cold["C_old: [A, B, C] (Quorum = 2 of 3)"]
+    Joint["C_old,new: Joint Consensus (2 of [A, B, C] AND 3 of [A, B, C, D])"]
+    Cnew["C_new: [A, B, C, D] (Quorum = 3 of 4)"]
+
+    Cold -->|"Phase 1: Propose Joint Entry"| Joint
+    Joint -->|"Phase 2: Auto-Propose Final Entry"| Cnew
 ```
 
 ## The ClusterConfig Type
@@ -111,9 +102,14 @@ def isLearnerCaughtUp(
 
 The leader tracks `matchIndex` for all followers, including learners. Wait until the gap is small enough that the transition will be fast:
 
-```
-Leader log: [1, 2, 3, ..., 1_000_000]
-Learner D:  [1, 2, 3, ...,   999_950]  ← gap = 50, ready to promote
+```mermaid
+flowchart LR
+    Leader["Leader Log: [1 .. 1,000,000]"]
+    Learner["Learner D: [1 .. 999,950] (Non-Voting)"]
+    Promote["Gap = 50 <= Threshold (100): Ready to Promote"]
+
+    Leader -->|"AppendEntries Catch-Up"| Learner
+    Learner --> Promote
 ```
 
 ### Step 3: Promote to voter via joint consensus
@@ -193,11 +189,14 @@ A 2-node cluster has **no fault tolerance** — losing either node loses quorum.
 
 The safest approach is **add-then-remove**:
 
-```
-Step 1: Add node D as learner        [A, B, C] + learner D
-Step 2: Wait for D to catch up       [A, B, C] + learner D (caught up)
-Step 3: Promote D, remove A in one   Joint: [B,C,D] ∩ [A,B,C] → Final: [B,C,D]
-Step 4: Shut down node A
+```mermaid
+flowchart LR
+    S1["1. Add Learner D: [A, B, C] + Learner D"]
+    S2["2. Catch Up: Learner D Reaches Leader Tip"]
+    S3["3. Joint Swap: [A, B, C] + [B, C, D] -> [B, C, D]"]
+    S4["4. Graceful Shutdown: Stop Node A"]
+
+    S1 --> S2 --> S3 --> S4
 ```
 
 This can be done as a single joint consensus transition:
@@ -218,15 +217,16 @@ The cluster never drops below 3 voters, and fault tolerance is maintained throug
 
 Upgrade every node in the cluster without downtime:
 
-```
-Initial: [A(v1), B(v1), C(v1)]
+```mermaid
+flowchart LR
+    Init["Initial: [A(v1), B(v1), C(v1)]"]
+    U1["Swap A -> D(v2): [B(v1), C(v1), D(v2)]"]
+    U2["Swap B -> E(v2): [C(v1), D(v2), E(v2)]"]
+    U3["Swap C -> F(v2): [D(v2), E(v2), F(v2)]"]
 
-Step 1: Add D(v2) as learner → wait for catch-up
-Step 2: Replace A with D: [B(v1), C(v1), D(v2)]
-Step 3: Add E(v2) as learner → wait for catch-up
-Step 4: Replace B with E: [C(v1), D(v2), E(v2)]
-Step 5: Add F(v2) as learner → wait for catch-up
-Step 6: Replace C with F: [D(v2), E(v2), F(v2)]
+    Init -->|"1. Learner D(v2) + Joint Swap"| U1
+    U1 -->|"2. Learner E(v2) + Joint Swap"| U2
+    U2 -->|"3. Learner F(v2) + Joint Swap"| U3
 ```
 
 At every step, the cluster has 3 voters and can tolerate 1 failure. The upgrade is fully reversible at any point by adding v1 nodes back.
@@ -283,21 +283,39 @@ def replaceNode(
 
 ### Scenario 1: Leader crash during joint consensus
 
-```
-t=0   Leader A proposes joint config [A,B,C] ∩ [A,B,C,D]
-t=1   Joint entry committed on A and B ── A crashes
-t=3   B or C elected (must satisfy both old AND new quorum)
-t=4   New leader completes the transition → final config [A,B,C,D]
+```mermaid
+sequenceDiagram
+    participant A as Leader A
+    participant B as Voter B
+    participant C as Voter C
+    participant D as Voter D
+
+    A->>B: AppendEntries C_old,new ([A,B,C] + [A,B,C,D])
+    A->>D: AppendEntries C_old,new ([A,B,C] + [A,B,C,D])
+    Note over A,D: t=1: C_old,new committed on dual quorum
+    Note over A: t=1: Leader A crashes!
+    B->>C: RequestVote (satisfies old AND new quorum)
+    B->>D: RequestVote (satisfies old AND new quorum)
+    Note over B: t=3: B elected Leader
+    B->>C: AppendEntries C_new ([A,B,C,D])
+    B->>D: AppendEntries C_new ([A,B,C,D])
+    Note over B,D: t=4: Transition finalized to [A,B,C,D]
 ```
 
 **What happens**: The joint consensus protocol survives leader failure. The committed joint entry is in B's log, so the new leader knows to complete the transition. If the joint entry hadn't been committed, the old config remains — the change is simply aborted.
 
 ### Scenario 2: New node fails during catch-up
 
-```
-t=0   D joins as learner, starts receiving entries
-t=5   D crashes at index 50,000 (leader is at 1,000,000)
-t=10  D restarts, resumes from index 50,000
+```mermaid
+sequenceDiagram
+    participant L as Leader (Index 1,000,000)
+    participant D as Learner D (Non-Voting)
+
+    L->>D: t=0: Replicate entries 1..50,000
+    Note over D: t=5: Learner D crashes at index 50,000
+    Note over L: Voters [A, B, C] continue committing unaffected
+    Note over D: t=10: Learner D restarts from WAL index 50,000
+    L->>D: Resume AppendEntries from index 50,001
 ```
 
 **What happens**: Learners are non-voting — D's failure doesn't affect the cluster. D can restart and catch up at its own pace. If D can't catch up (e.g., persistent hardware issue), simply remove the learner:
@@ -309,10 +327,13 @@ raftNode.proposeConfigChange(config)
 
 ### Scenario 3: Removing a node that's needed for quorum
 
-```
-Configuration: [A, B, C] (quorum = 2)
-Remove C: [A, B] (quorum = 2)
-B crashes: only A remains — NO QUORUM
+```mermaid
+flowchart LR
+    Start["[A, B, C] (Quorum = 2)"]
+    TwoNode["Remove C -> [A, B] (Quorum = 2, Zero Fault Tolerance)"]
+    Stuck["B Crashes -> [A] Only (NO QUORUM - Cluster Halted)"]
+
+    Start --> TwoNode --> Stuck
 ```
 
 **What happens**: The cluster is permanently stuck — writes are impossible, reads may be stale. This is why removing nodes is dangerous.
@@ -327,16 +348,14 @@ Never: Remove C → `[A, B]` (quorum = 2, can lose 0)
 
 Before any membership change:
 
-```
-□ All current voters are healthy and replicating
-□ Leader is stable (no recent elections in the last 60 seconds)
-□ The change won't reduce fault tolerance below acceptable levels
-□ A rollback plan exists (which node to add back if the change fails)
-□ Monitoring is in place for:
+- [ ] All current voters are healthy and replicating
+- [ ] Leader is stable (no recent elections in the last 60 seconds)
+- [ ] The change won't reduce fault tolerance below acceptable levels
+- [ ] A rollback plan exists (which node to add back if the change fails)
+- [ ] Monitoring is in place for:
   - Election frequency (spike = transition problem)
   - Commit latency (spike = quorum issues)
   - Log replication lag (growing = new node can't keep up)
-```
 
 ## Production Considerations
 
@@ -382,4 +401,4 @@ A node restoring from a snapshot must use this configuration, not whatever was i
 
 ---
 
-*This completes the tutorial series. For API reference, see [Appendix A](../docs/book/appendix-a-quick-reference.md). For the complete book, see the [Table of Contents](../docs/book/README.md).*
+*Next: [Tutorial 6 — Replicated Event Log & Event Sourcing](06-event-sourcing.md) — building an ordered, durable event stream with materialized views.*

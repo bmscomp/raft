@@ -19,74 +19,82 @@ Spreading Raft across datacenters provides **disaster recovery** but introduces 
 
 ### Topology 1: Three DCs, one voter each (simplest)
 
-```
-┌──DC-West────┐   ┌──DC-Central──┐   ┌──DC-East────┐
-│             │   │              │   │             │
-│  Node A     │◄─►│  Node B      │◄─►│  Node C     │
-│  (Voter)    │   │  (Voter)     │   │  (Voter)    │
-│             │   │              │   │             │
-└─────────────┘   └──────────────┘   └─────────────┘
+```mermaid
+flowchart LR
+    subgraph DCW["DC-West"]
+        A["Node A (Voter)"]
+    end
+    subgraph DCC["DC-Central"]
+        B["Node B (Voter)"]
+    end
+    subgraph DCE["DC-East"]
+        C["Node C (Voter)"]
+    end
 
-Quorum: 2 of 3 → survives loss of any 1 DC
-Write latency: max(RTT to DC-Central, RTT to DC-East) ≈ 50-150ms
+    A <-->|"WAN RTT"| B
+    B <-->|"WAN RTT"| C
+    A <-->|"WAN RTT"| C
 ```
+
+- **Quorum**: 2 of 3 → survives loss of any 1 DC
+- **Write latency**: `max(RTT to nearest peer)` ≈ 50–150 ms
 
 **Trade-off**: Simple, but every write pays cross-DC latency. Best for low-write workloads where disaster recovery is critical.
 
-### Topology 2: Primary DC with witnesses (recommended)
+### Topology 2: Primary DC with witnesses (recommended for low write latency)
 
+```mermaid
+flowchart TD
+    subgraph Primary["DC-Primary (us-east)"]
+        A["Node A (Voter / Leader)"]
+        B["Node B (Voter)"]
+        C["Node C (Voter)"]
+        A <--> B
+        A <--> C
+    end
+
+    subgraph Secondary["DC-Secondary (eu-west)"]
+        D["Node D (Witness)"]
+    end
+
+    subgraph Tertiary["DC-Tertiary (ap-south)"]
+        E["Node E (Witness)"]
+    end
+
+    Primary -->|"Metadata / Quorum Votes"| Secondary
+    Primary -->|"Metadata / Quorum Votes"| Tertiary
 ```
-┌──DC-Primary (us-east)──────────────────────┐
-│                                            │
-│  Node A (Voter/Leader)                     │
-│  Node B (Voter)                            │
-│  Node C (Voter)                            │
-│                                            │
-└────────────────────────────────────────────┘
-        │                   │
-        ▼                   ▼
-┌──DC-Secondary──┐   ┌──DC-Tertiary──┐
-│                │   │               │
-│  Node D        │   │  Node E       │
-│  (Witness)     │   │  (Witness)    │
-│                │   │               │
-└────────────────┘   └───────────────┘
 
-Quorum: 3 of 5 → survives loss of primary DC
-Write latency: intra-DC ≈ 1-5ms (witnesses don't slow commits)
+- **Quorum**: 3 of 5 → survives loss of any secondary DC with zero write-latency penalty
+- **Write latency**: intra-DC ≈ 1–5 ms (`Node A`, `Node B`, `Node C` form a local 3-of-5 quorum)
+
+**Witness nodes** vote in elections and participate in commit decisions (`votingMembers`) without storing full state-machine payloads.
+
+### Topology 3: Two DCs with cloud arbiter (common in practice)
+
+```mermaid
+flowchart TD
+    subgraph Primary["DC-Primary"]
+        A["Node A (Voter / Leader)"]
+        B["Node B (Voter)"]
+    end
+
+    subgraph Secondary["DC-Secondary"]
+        C["Node C (Voter)"]
+        D["Node D (Voter)"]
+    end
+
+    subgraph Arbiter["Cloud Arbiter Region"]
+        E["Node E (Witness Tiebreaker)"]
+    end
+
+    Primary <-->|"WAN Replication"| Secondary
+    Primary <-->|"Votes & Metadata"| Arbiter
+    Secondary <-->|"Votes & Metadata"| Arbiter
 ```
 
-**Witness nodes** vote in elections and participate in commit decisions but don't store the full log. They're lightweight quorum participants that enable cross-DC fault tolerance without cross-DC write latency.
-
-### Topology 3: Two DCs with arbiter (common in practice)
-
-```
-┌──DC-Primary──────────────┐
-│                          │
-│  Node A (Voter/Leader)   │
-│  Node B (Voter)          │
-│                          │
-└──────────────────────────┘
-        │
-        ▼
-┌──DC-Secondary────────────┐
-│                          │
-│  Node C (Voter)          │
-│  Node D (Voter)          │
-│                          │
-└──────────────────────────┘
-        │
-        ▼
-┌──Cloud Arbiter───────────┐
-│                          │
-│  Node E (Witness)        │
-│  (tiebreaker only)       │
-│                          │
-└──────────────────────────┘
-
-Quorum: 3 of 5 → survives loss of either DC
-Write latency: cross-DC RTT (must reach Node C or D + E for quorum)
-```
+- **Quorum**: 3 of 5 → survives complete loss of either `DC-Primary` or `DC-Secondary`
+- **Write latency**: cross-DC RTT (must reach at least one remote voter or the arbiter for 3-of-5 quorum)
 
 ## Configuration
 
@@ -184,20 +192,15 @@ class LatencyAwareClient(
 
 ### Scenario 1: Secondary DC goes down
 
-```
-Topology: Primary [A,B,C] + Witnesses [D(secondary), E(tertiary)]
-Failure: Secondary DC (witness D) is unreachable
-Quorum: A,B,C,E = 4 of 5 → still have majority → cluster continues
-Impact: None (witnesses are not needed for normal operation)
-```
+- **Topology**: Primary `[A, B, C]` + Witnesses `[D (secondary), E (tertiary)]`
+- **Failure**: Secondary DC (`D`) is unreachable
+- **Surviving Quorum**: `A, B, C, E` = 4 of 5 → majority intact, cluster continues with zero impact
 
 ### Scenario 2: Primary DC goes down
 
-```
-Topology: Primary [A,B,C] + Witnesses [D(secondary), E(tertiary)]
-Failure: Primary DC (voters A,B,C) is unreachable
-Quorum: D,E = 2 of 5 → NO majority → cluster stalls
-```
+- **Topology**: Primary `[A, B, C]` + Witnesses `[D (secondary), E (tertiary)]`
+- **Failure**: Primary DC (`A, B, C`) is unreachable
+- **Surviving Nodes**: `D, E` = 2 of 5 → **no majority**, cluster stalls safely
 
 With only witnesses surviving, the cluster cannot elect a leader because witnesses alone don't form a majority. This is by design — witnesses don't have the full log, so they can't become leader.
 
@@ -236,12 +239,19 @@ val trulyResilientConfig = ClusterConfig(
 
 ### Scenario 3: Network partition between DCs
 
-```
-t=0    Primary DC (leader) partitioned from secondary/tertiary
-t=5    Secondary + tertiary elect new leader (if they have quorum)
-t=5.1  Primary DC leader steps down (can't reach quorum)
-t=5.2  New leader serves traffic from secondary DC
-t=60   Partition heals — primary DC nodes rejoin as followers
+```mermaid
+sequenceDiagram
+    participant P as Primary DC (2 Voters, Old Leader)
+    participant S as Secondary DC (2 Voters)
+    participant T as Tertiary DC (1 Voter Tiebreaker)
+
+    Note over P,T: t=0: WAN partition isolates Primary DC from Secondary + Tertiary
+    S->>T: t=5.0s: PreVote + RequestVote (3 of 5 majority)
+    Note over S: Elected New Leader in Secondary DC
+    Note over P: t=5.1s: CheckQuorum fails -> Old Leader steps down
+    Note over S,T: t=5.2s: Secondary DC serves linearizable traffic
+    Note over P,T: t=60s: WAN partition heals
+    S->>P: AppendEntries (higher term) -> Primary nodes rejoin as Followers
 ```
 
 ## Network Partition Strategies
@@ -298,12 +308,10 @@ class MultiDcRouter(localDc: String, primaryDc: String):
 
 Cross-DC replication consumes WAN bandwidth. Budget for:
 
-```
-Bandwidth = write_rate × avg_entry_size × (num_cross_dc_replicas)
+$$\text{Bandwidth} = \text{write\_rate} \times \text{avg\_entry\_size} \times \text{num\_cross\_dc\_replicas}$$
 
-Example: 1000 writes/s × 1KB × 2 cross-DC replicas = 2 MB/s
-Monthly: 2 MB/s × 86400 × 30 = ~5 TB/month of cross-DC traffic
-```
+- **Sustained throughput**: `1,000 writes/s × 1 KB × 2 cross-DC replicas = 2 MB/s`
+- **Monthly egress**: `2 MB/s × 86,400 s/day × 30 days ≈ 5 TB/month` of cross-DC traffic
 
 ### Clock synchronization
 

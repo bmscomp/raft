@@ -15,17 +15,23 @@ Raft's baseline protocol makes conservative choices at every step:
 
 These choices guarantee safety but produce dismal throughput — often under 1,000 writes/second on modern hardware. Production systems like etcd, CockroachDB, and TiKV achieve 10,000–100,000+ writes/second by relaxing these constraints. The art is knowing *which* constraints can be relaxed without breaking Raft's safety properties.
 
-```
-Performance ←──────────────── Spectrum ──────────────────→ Safety
+```mermaid
+flowchart LR
+    subgraph Perf["High Throughput / Low Latency"]
+        P1["Lease Reads (Clock-Bounded)"]
+        P2["Pipelining (Inflight Window)"]
+        P3["Batching (Group Commit)"]
+        P4["Parallel Replication"]
+    end
 
-High throughput                                    Strict correctness
-Low latency                                        Crash recovery
-  ▲                                                      ▲
-  │                                                      │
-  Batching                                     Per-entry fsync
-  Pipelining                               Stop-and-wait replication
-  Lease reads                               ReadIndex with heartbeat
-  Parallel replication                       Sequential replication
+    subgraph Safe["Baseline Conservative Protocol"]
+        S1["Per-Entry fsync"]
+        S2["Stop-and-Wait Replication"]
+        S3["ReadIndex / Log Reads"]
+        S4["Sequential Replication"]
+    end
+
+    Perf <-->|"Engineering Tradeoff Spectrum"| Safe
 ```
 
 ---
@@ -244,13 +250,18 @@ The simplest way to guarantee linearizable reads is to run every read through th
 
 The ReadIndex protocol (Raft paper §8) allows linearizable reads without writing to the log:
 
-```
-1. Client sends read(key) to leader
-2. Leader records its current commitIndex as "readIndex"
-3. Leader sends heartbeats to confirm it's still the leader
-4. Majority of followers respond to heartbeats
-5. Leader waits until its state machine has applied entries through readIndex
-6. Leader serves the read from its local state machine
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F as Followers (Quorum)
+
+    C->>L: 1. read(key)
+    Note over L: 2. Record readIndex = commitIndex
+    L->>F: 3. Broadcast Heartbeat
+    F-->>L: 4. Majority Heartbeat ACKs
+    Note over L: 5. Wait until lastApplied >= readIndex
+    L-->>C: 6. Serve read from local StateMachine
 ```
 
 The library's effects for ReadIndex:
@@ -297,12 +308,11 @@ val config = RaftConfig(
 
 The protocol:
 
-```
-1. Leader sends heartbeats to followers
-2. At time T, a majority of followers respond
-3. Leader sets lease_expiry = T + leaderLeaseDuration - maxClockDrift
-4. While now() < lease_expiry: serve reads locally (zero RTT)
-5. When lease expires: fall back to ReadIndex
+```mermaid
+flowchart LR
+    HB["1-2. Majority Heartbeat ACKs at time T"] --> EXP["3. Set leaseExpiry = T + leaderLeaseDuration - maxClockDrift"]
+    EXP -->|"now() < leaseExpiry"| FAST["4. Serve Local Read Immediately (0 RTT)"]
+    EXP -->|"now() >= leaseExpiry"| FALL["5. Lease Expired -> Fall back to ReadIndex"]
 ```
 
 The library produces `ExtendLease` and `LeaseReadReady` effects:
@@ -446,20 +456,23 @@ val aggressive = RaftConfig(
 > The most dangerous column in this table is "Safety Impact." Only two optimizations introduce risk: **pipelining** (manageable with correct implementation) and **lease reads** (requires clock synchronization). Everything else is pure win. Start with batching and parallel replication — they're free safety-wise and deliver the biggest gains.
 
 ```mermaid
-quadrantChart
-    title Optimization Tradeoff Map
-    x-axis Low Risk --> High Risk
-    y-axis Low Gain --> High Gain
-    quadrant-1 "Sweet Spot"
-    quadrant-2 "Diminishing Returns"
-    quadrant-3 "Low Priority"
-    quadrant-4 "Use With Caution"
-    Batching: [0.1, 0.9]
-    Parallel Replication: [0.1, 0.5]
-    Pre-Vote: [0.15, 0.3]
-    ReadIndex: [0.2, 0.7]
-    Pipelining: [0.4, 0.85]
-    Lease Reads: [0.7, 0.8]
+flowchart TD
+    subgraph ZeroRisk["Zero Safety Risk (Enable First)"]
+        B["Batching (~100x write throughput)"]
+        PR["Parallel Replication (~2x quorum latency)"]
+        PV["Pre-Vote (Prevents term inflation)"]
+        RI["ReadIndex (~10x read throughput, 1 RTT)"]
+    end
+
+    subgraph RuntimeCare["Requires Careful Runtime Tracking"]
+        PL["Pipelining (~1000x WAN throughput, ordered sequenceNum)"]
+    end
+
+    subgraph ClockDep["Requires Bounded Physical Clock Drift"]
+        LR["Lease Reads (0-RTT local reads, maxClockDrift margin)"]
+    end
+
+    ZeroRisk --> RuntimeCare --> ClockDep
 ```
 
 ---

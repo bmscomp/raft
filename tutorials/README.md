@@ -10,6 +10,31 @@
 - Familiarity with the library's core API — read [Chapter 6: Core API](../docs/book/06-core-api.md) and [Chapter 7: The SPI Layer](../docs/book/07-spi-layer.md) first
 - Understanding of the pure state transition model — [Chapter 5: Design Philosophy](../docs/book/05-design-philosophy.md) explains the effects-as-data pattern
 
+```mermaid
+flowchart TD
+    subgraph P1["Part I: Building Distributed Services (Tutorials 01-05)"]
+        T1["01: Config Service (ReadIndex + Watch)"] --> T2["02: Microservice Leader Election (Fencing)"]
+        T2 --> T3["03: Replicated Task Queue (Claim/Ack)"]
+        T3 --> T4["04: Distributed Rate Limiter (Lease Reads)"]
+        T4 --> T5["05: Cluster Membership (Joint Consensus)"]
+    end
+
+    subgraph P2["Part II: Advanced Patterns (Tutorials 06-10)"]
+        T6["06: Event Sourcing & CQRS"] --> T7["07: Distributed Lease Service"]
+        T7 --> T8["08: Service Registry & Health"]
+        T8 --> T9["09: Sharded Multi-Raft Counter"]
+        T9 --> T10["10: Client Sessions (Exactly-Once)"]
+    end
+
+    subgraph P3["Part III: Operations & Production (Tutorials 11-14)"]
+        T11["11: Snapshot & Compaction"] --> T12["12: Chaos Testing"]
+        T12 --> T13["13: Observability & Metrics"]
+        T13 --> T14["14: Multi-Datacenter Topologies"]
+    end
+
+    P1 --> P2 --> P3
+```
+
 ## Part I — Building Distributed Services
 
 | # | Tutorial | Real-World Problem | Key Concepts |

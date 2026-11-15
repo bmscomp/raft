@@ -35,25 +35,18 @@ Raft's leader election isn't just a lock — it's a **continuously validated lea
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Raft Cluster (3 nodes)                     │
-│                                                             │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐              │
-│  │ Instance A│    │Instance B│    │Instance C│               │
-│  │  (Leader) │◄──►│(Follower)│◄──►│(Follower)│              │
-│  │           │    │          │    │          │               │
-│  │ ┌───────┐ │    │ ┌──────┐ │    │ ┌──────┐ │              │
-│  │ │ACTIVE │ │    │ │STANDBY│ │    │ │STANDBY│ │             │
-│  │ │service│ │    │ │service│ │    │ │service│ │             │
-│  │ └───────┘ │    │ └──────┘ │    │ └──────┘ │              │
-│  └──────────┘    └──────────┘    └──────────┘              │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-         │
-    ┌────┴────┐
-    │ Clients │   (Only talk to the ACTIVE instance)
-    └─────────┘
+```mermaid
+flowchart TD
+    C["Clients (Route to Active Leader)"] --> IA
+
+    subgraph Cluster["3-Node Microservice Raft Cluster"]
+        IA["Instance A: Raft Leader -> ACTIVE Service"]
+        IB["Instance B: Raft Follower -> STANDBY Service"]
+        IC["Instance C: Raft Follower -> STANDBY Service"]
+        IA <--> IB
+        IB <--> IC
+        IA <--> IC
+    end
 ```
 
 The key insight: **the application service is active only on the Raft leader node.** When leadership changes, the service activates on the new leader and deactivates on the old one.
@@ -252,39 +245,47 @@ The rule of thumb from the Raft paper: `electionTimeout >> heartbeatInterval × 
 
 ### Scenario 1: Leader process crash
 
-```
-t=0    Instance A is leader, actively processing jobs
-t=1    Instance A crashes (kill -9)
-t=3    Instances B and C notice missing heartbeats
-t=4    Instance B's election timeout fires — starts election
-t=4.1  Instance B wins election → BecomeLeader effect
-t=4.2  Instance B activates its job processor with new fencing token
+```mermaid
+sequenceDiagram
+    participant IA as Instance A (Leader)
+    participant IB as Instance B (Standby)
+    participant IC as Instance C (Standby)
+
+    Note over IA: t=0s: Actively processing jobs
+    Note over IA: t=1s: Process crash (SIGKILL)
+    Note over IB,IC: t=3s: Missing heartbeats detected
+    IB->>IC: t=4s: RequestVote
+    IC-->>IB: t=4.1s: VoteGranted -> BecomeLeader
+    Note over IB: t=4.2s: Activate job processor with higher FencingToken
 ```
 
 **Downtime**: ~3-4 seconds (configurable via election timeout). The fencing token ensures that any in-flight work from Instance A is safely rejected by external systems.
 
 ### Scenario 2: Network partition
 
-```
-t=0    Instance A (leader) is partitioned from B and C
-t=3    B and C elect Instance B as new leader
-t=3.1  Instance B activates its service (term 6)
-t=3.2  Instance A still thinks it's leader (term 5)
-t=4    Instance A's heartbeats fail — it steps down
-t=4.1  Instance A deactivates its service
+```mermaid
+sequenceDiagram
+    participant IA as Instance A (Old Leader, Term 5)
+    participant IB as Instance B (New Leader, Term 6)
+    participant DB as External Database (Fenced)
+
+    Note over IA,IB: t=0s: Network partition isolates Instance A from {B, C}
+    Note over IB: t=3.1s: Elected Leader in Term 6 -> Activates service
+    IB->>DB: Write with FencingToken(term=6) -> Accepted
+    IA->>DB: t=3.2s: Stale write with FencingToken(term=5) -> REJECTED!
+    Note over IA: t=4.1s: Quorum timeout -> Steps down & deactivates service
 ```
 
 **Brief overlap**: Between t=3.1 and t=4.1, both A and B think they're the leader. This is where fencing tokens are critical — Instance A's writes with term 5 are rejected by any system that has already seen term 6.
 
 ### Scenario 3: Rolling deployment
 
-```
-t=0    Three instances: A (leader), B, C — all on version 1.0
-t=1    Deploy version 1.1 to instance D (new node, joins as learner)
-t=2    Promote D to voter, transfer leadership: A → D
-t=3    D becomes leader (v1.1), activates service
-t=4    Remove A from cluster, drain B, deploy v1.1 to B
-t=5    Remove C from cluster, deploy v1.1 to C, re-add as voter
+```mermaid
+flowchart LR
+    S0["t=0: {A, B, C} on v1.0 (A leads)"] --> S1["t=1: Add D (v1.1) as Learner"]
+    S1 --> S2["t=2: Promote D & TransferLeadership(A -> D)"]
+    S2 --> S3["t=3: D (v1.1) Active Leader"]
+    S3 --> S4["t=4-5: Upgrade B & C to v1.1, Retire A"]
 ```
 
 **Result**: Zero-downtime deployment with controlled leadership transfer. At no point is the service interrupted.

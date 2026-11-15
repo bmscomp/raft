@@ -36,14 +36,15 @@ Because every node processes this log identically:
 
 ## Task Lifecycle
 
-```
-  ┌──────────┐    CLAIM     ┌──────────┐   COMPLETE   ┌──────────┐
-  │ PENDING  │─────────────►│ CLAIMED  │─────────────►│COMPLETED │
-  └──────────┘              └──────────┘              └──────────┘
-       ▲                         │
-       │         TTL expires     │
-       └─────────────────────────┘
-                (re-enqueue)
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Enqueue(taskId)
+    PENDING --> CLAIMED: Claim(workerId, ttl)
+    CLAIMED --> COMPLETED: Complete(workerId, result)
+    CLAIMED --> PENDING: ExpireClaims (TTL elapsed) or Fail (retries left)
+    CLAIMED --> FAILED: Fail or ExpireClaims (maxRetries exhausted)
+    COMPLETED --> [*]
+    FAILED --> [*]
 ```
 
 Each state transition is a Raft command. The TTL expiration is also a command — submitted by a leader-side sweeper process — ensuring it's deterministically ordered relative to other state changes.
@@ -335,13 +336,18 @@ If the worker crashes between steps 1 and 3, the claim's TTL expires and the tas
 
 ### Scenario 1: Worker crashes mid-task
 
-```
-t=0    Worker-A claims task-42 (committed at log index 10)
-t=1    Worker-A starts executing task-42
-t=5    Worker-A crashes
-t=35   ExpireClaims command committed — task-42 returns to Pending
-t=36   Worker-B claims task-42 (committed at log index 15)
-t=37   Worker-B executes and completes task-42
+```mermaid
+sequenceDiagram
+    participant WA as Worker-A
+    participant Q as Replicated Task Queue
+    participant WB as Worker-B
+
+    WA->>Q: t=0s: Claim(task-42, ttl=30s) -> Committed at idx 10
+    Note over WA: t=1s: Starts executing task-42
+    Note over WA: t=5s: Worker-A crashes!
+    Note over Q: t=35s: ExpireClaims committed -> task-42 returns to PENDING
+    WB->>Q: t=36s: Claim(task-42) -> Committed at idx 15
+    WB->>Q: t=37s: Complete(task-42) -> COMPLETED
 ```
 
 The task executes twice (partially on Worker-A, fully on Worker-B), but only Worker-B's completion is committed. The application must handle partial execution on Worker-A:
@@ -350,23 +356,33 @@ The task executes twice (partially on Worker-A, fully on Worker-B), but only Wor
 
 ### Scenario 2: Leader crashes with pending ENQUEUEs
 
-```
-t=0    Client submits ENQUEUE task-99 to Leader
-t=1    Leader appends to its log — crashes before replication
-t=2    New leader elected — task-99 is NOT in the log
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L1 as Old Leader
+    participant L2 as New Leader
+
+    C->>L1: t=0: Enqueue(task-99)
+    Note over L1: t=1: Appends locally, crashes before replication!
+    Note over L2: t=2: Elected Leader (task-99 absent)
+    C->>L2: Retry Enqueue(task-99) -> Committed
 ```
 
-**Result**: Task-99 is lost. The client's `propose` call times out, and the client must re-submit. This is identical to any write-ahead system — uncommitted writes are lost on crash.
+**Result**: Task-99 is lost on the first attempt because it was uncommitted. The client's `propose` call times out, and the client must re-submit. This is identical to any write-ahead system — uncommitted writes are lost on crash.
 
 **Mitigation**: The client should retry with the same `TaskId`. The state machine's `if state.tasks.contains(taskId)` check prevents duplicate tasks from being created if the original ENQUEUE actually was committed before the crash.
 
 ### Scenario 3: Duplicate ENQUEUE after retry
 
-```
-t=0    Client submits ENQUEUE task-99 (attempt 1)
-t=1    Committed, but client's connection drops before receiving ACK
-t=2    Client retries: ENQUEUE task-99 (attempt 2)
-t=3    State machine: tasks.contains(task-99) → true → "DUPLICATE"
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Q as TaskQueueStateMachine
+
+    C->>Q: t=0: Enqueue(task-99) [Attempt 1]
+    Q--xC: t=1: Committed, but ACK lost on network!
+    C->>Q: t=2: Enqueue(task-99) [Attempt 2]
+    Q-->>C: t=3: "DUPLICATE:task-99" (tasks.contains == true)
 ```
 
 **Result**: Exactly one task-99 exists in the queue. The idempotency key (`TaskId`) prevents duplicates even with client retries.

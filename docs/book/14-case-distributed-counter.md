@@ -20,20 +20,18 @@ Only consensus-backed replication guarantees that every `Increment` operation is
 
 Unlike the previous case studies where we manually constructed log entries and passed them to a state machine, this example simulates the **full lifecycle** — election, log replication, commit, and state machine application — across three nodes communicating via simulated network queues:
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                      Test Harness                          │
-│                                                            │
-│  ┌──────────┐     ┌──────────┐     ┌──────────┐           │
-│  │  Node-1  │◄───►│  Node-2  │◄───►│  Node-3  │           │
-│  │          │     │          │     │          │           │
-│  │ RaftLogic│     │ RaftLogic│     │ RaftLogic│           │
-│  │ Counter  │     │ Counter  │     │ Counter  │           │
-│  └──────────┘     └──────────┘     └──────────┘           │
-│       ▲                ▲                ▲                  │
-│       └────────────────┴────────────────┘                  │
-│            SimulatedNetwork (bounded queues)               │
-└────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Harness["Deterministic In-Memory Cluster Harness"]
+        N1["Node-1 (RaftLogic + CounterStateMachine)"]
+        N2["Node-2 (RaftLogic + CounterStateMachine)"]
+        N3["Node-3 (RaftLogic + CounterStateMachine)"]
+        NET["SimulatedNetwork (Bounded Point-to-Point Queues)"]
+
+        N1 <--> NET
+        N2 <--> NET
+        N3 <--> NET
+    end
 ```
 
 Each node has its own instance of `RaftLogic`, its own log, its own state, and its own counter state machine. The simulated network delivers messages between nodes via in-memory queues. There are no real sockets, no real timers — the entire cluster runs deterministically in a single test.

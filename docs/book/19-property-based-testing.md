@@ -17,6 +17,15 @@ The library's pure functional design makes property-based testing unusually prac
 
 No mocks, no timeouts, no network simulators. Just functions and data.
 
+```mermaid
+flowchart LR
+    GEN["RaftEventGen (Arbitrary Events)"] --> SEQ["100-200 Random Event Schedule"]
+    SEQ --> SIM["SimulatedCluster + Pure RaftLogic"]
+    SIM --> INV{"Check 5 Safety Invariants"}
+    INV -->|"All Hold"| PASS["Property Passed (Next Schedule)"]
+    INV -->|"Violation"| SHR["ScalaCheck Shrinker -> Minimal 3-5 Step Seeded Repro"]
+```
+
 ## The Five Safety Properties
 
 The Raft paper (§5.2) defines five properties that a correct implementation must satisfy. These are our test targets:

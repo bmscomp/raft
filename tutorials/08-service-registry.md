@@ -16,25 +16,29 @@ Static configuration files fail because addresses change with deployments, scali
 
 ## Architecture
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                  Service Registry (Raft)                      │
-│                                                               │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐                    │
-│  │ Node 1  │◄──►│ Node 2  │◄──►│ Node 3  │                    │
-│  └─────────┘    └─────────┘    └─────────┘                    │
-│                                                               │
-│  State Machine:                                               │
-│  ┌─────────────────────────────────────────────────────┐      │
-│  │ "payment-api"                                       │      │
-│  │   ├─ instance-1  10.0.1.5:8080  ● healthy (3s ago)  │      │
-│  │   ├─ instance-2  10.0.1.6:8080  ● healthy (1s ago)  │      │
-│  │   └─ instance-3  10.0.1.7:8080  ○ failing (45s ago) │      │
-│  │ "user-service"                                      │      │
-│  │   ├─ instance-1  10.0.2.3:9090  ● healthy (2s ago)  │      │
-│  │   └─ instance-2  10.0.2.4:9090  ● healthy (1s ago)  │      │
-│  └─────────────────────────────────────────────────────┘      │
-└───────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Svc["Backend Services (Register / Heartbeat / Deregister)"]
+
+    subgraph Cluster["Service Registry Cluster (Raft)"]
+        N1["Node 1 (Leader)"]
+        N2["Node 2 (Follower)"]
+        N3["Node 3 (Follower)"]
+        N1 <--> N2
+        N1 <--> N3
+
+        subgraph SM["Replicated RegistryStateMachine"]
+            Pay["payment-api: inst-1 Healthy (3s), inst-2 Healthy (1s), inst-3 Unhealthy (45s)"]
+            Usr["user-service: inst-1 Healthy (2s), inst-2 Healthy (1s)"]
+        end
+
+        N1 --> SM
+    end
+
+    Client["ServiceDiscoveryClient (ReadIndex / Local Cache -> Healthy Only)"]
+
+    Svc -->|"Propose Heartbeat"| N1
+    SM -->|"Healthy Endpoints"| Client
 ```
 
 ## Command Design

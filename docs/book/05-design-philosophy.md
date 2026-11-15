@@ -42,30 +42,26 @@ The function receives the current node state and an incoming event (an RPC from 
 
 The runtime — which is a separate piece of code that **you** control — is responsible for actually executing those effects (sending messages, writing to disk, etc.).
 
-```
-┌──────────────────────────────────────┐
-│           Your Runtime               │
-│                                      │
-│   ┌──────────────────────────────┐   │
-│   │     Pure Logic (RaftLogic)   │   │
-│   │                              │   │
-│   │   (state, msg)               │   │
-│   │       → (newState, effects)  │   │
-│   │                              │   │
-│   │   No I/O. No sockets.        │   │
-│   │   No threads. No disk.       │   │
-│   └──────────────┬───────────────┘   │
-│                  │                   │
-│                  ▼                   │
-│   ┌──────────────────────────────┐   │
-│   │     Effect Interpreter       │   │
-│   │                              │   │
-│   │   Broadcast(msg) → gRPC      │   │
-│   │   Persist(term)  → RocksDB   │   │
-│   │   Commit(idx)    → apply FSM │   │
-│   │   ResetTimer     → scheduler │   │
-│   └──────────────────────────────┘   │
-└──────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph HostRuntime["Your Host Runtime"]
+        IN["Incoming Event (RPC, Timer, Proposal)"]
+        subgraph PureCore["Pure Logic: RaftLogic (No I/O, No Sockets, No Threads)"]
+            STEP["(state, msg) -> Transition(newState, effects)"]
+        end
+        subgraph Interpreter["Effect Interpreter"]
+            B["Broadcast / SendMessage -> gRPC / Netty"]
+            P["PersistHardState / AppendLogs -> RocksDB / mmap WAL"]
+            C["CommitEntries -> StateMachine.apply"]
+            T["ResetTimers -> Scheduler"]
+        end
+
+        IN --> STEP
+        STEP --> B
+        STEP --> P
+        STEP --> C
+        STEP --> T
+    end
 ```
 
 > **Note — This pattern has deep roots.** The idea of separating pure computation from side-effect execution is central to functional programming. Haskell uses monads for this; Elm uses the "Elm Architecture" (Model-View-Update); Redux in JavaScript uses reducers and middleware. In the distributed systems world, the idea of modeling a protocol as a state machine fed by inputs was formalized by Fred Schneider (1990) and is the basis of TLA+ specifications. What's unusual here is applying it to an *implementation*, not just a spec.

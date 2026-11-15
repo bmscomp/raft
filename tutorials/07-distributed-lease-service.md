@@ -24,6 +24,18 @@ Unlike a permanent lock, a **lease** has a built-in expiration. If the holder cr
 | Renewal | N/A | Holder can extend before expiration |
 | Fencing | Must implement separately | Built into the lease version/epoch |
 
+### Lease Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Free
+    Free --> Held: Acquire (globalEpoch + 1)
+    Held --> Held: Renew (extend expiresAt)
+    Held --> Free: Release (holder matches)
+    Held --> Free: ExpireLeases (currentTimeMs >= expiresAt)
+    Held --> Free: ForceRevoke (operator override)
+```
+
 ## Command Design
 
 ```scala
@@ -242,6 +254,26 @@ def leaseRenewalLoop(
 ```
 
 ## Failure Scenarios
+
+```mermaid
+sequenceDiagram
+    participant W1 as Holder 1
+    participant LS as Lease Service (Raft)
+    participant W2 as Holder 2
+    participant Res as Shared Resource (Fenced)
+
+    W1->>LS: Acquire("db-migrate", ttl=30s)
+    LS-->>W1: ACQUIRED (epoch = 1)
+    Note over W1,LS: Network partition isolates Holder 1
+    W1--xLS: Renew("db-migrate") blocked
+    Note over LS: ExpireLeases -> "db-migrate" expires
+    W2->>LS: Acquire("db-migrate", ttl=30s)
+    LS-->>W2: ACQUIRED (epoch = 2)
+    W2->>Res: Execute migration (epoch = 2) -> Accepted
+    Note over W1,Res: Partition heals; Holder 1 sends delayed write
+    W1->>Res: Execute migration (epoch = 1)
+    Res-->>W1: Rejected (Stale epoch: held = 2, yours = 1)
+```
 
 ### Scenario 1: Lease holder crashes
 

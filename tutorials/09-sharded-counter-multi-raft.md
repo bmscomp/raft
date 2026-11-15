@@ -12,23 +12,27 @@ The solution: **sharding**. Partition the counter space across multiple independ
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                  Physical Node (runs MultiRaftNode)                  │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │ Group shard-0 │  │ Group shard-1 │  │ Group shard-2 │             │
-│  │  keys: a-h    │  │  keys: i-p    │  │  keys: q-z    │            │
-│  │  Leader here  │  │  Follower    │  │  Leader here  │             │
-│  └──────────────┘  └──────────────┘  └──────────────┘              │
-│                                                                     │
-│  Shared transport layer (MultiGroupTransport)                       │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │ GroupEnvelope(shard-0, msg) → Node2                          │   │
-│  │ GroupEnvelope(shard-1, msg) → Node1                          │   │
-│  │ GroupEnvelope(shard-2, msg) → Node3                          │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Router["Client Router (shardForKey)"]
+
+    subgraph Node1["Physical Node 1 (MultiRaftNode)"]
+        G0["Group shard-0 (keys a-h, Leader)"]
+        G1["Group shard-1 (keys i-p, Follower)"]
+        G2["Group shard-2 (keys q-z, Leader)"]
+        Trans["Shared MultiGroupTransport (GroupEnvelope Multiplexing)"]
+
+        G0 --> Trans
+        G1 --> Trans
+        G2 --> Trans
+    end
+
+    Peer2["Physical Node 2 (MultiRaftNode)"]
+    Peer3["Physical Node 3 (MultiRaftNode)"]
+
+    Router -->|"hash(key) % N"| Node1
+    Trans <-->|"Single Multiplexed Connection"| Peer2
+    Trans <-->|"Single Multiplexed Connection"| Peer3
 ```
 
 Three physical nodes, each running a `MultiRaftNode` that hosts all shard groups. Each group has its own leader — leadership is distributed across nodes for balanced load.

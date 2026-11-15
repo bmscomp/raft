@@ -225,20 +225,18 @@ The follower rejects the RPC, and the leader decrements `nextIndex` and retries 
 
 ### Visualizing the Induction
 
-```
-Leader log:     [1:T1] [2:T1] [3:T2] [4:T3] [5:T3]
-                                              ↑ sending entries from here
+```mermaid
+flowchart LR
+    subgraph LeaderLog["Leader Log"]
+        L1["1:T1"] --> L2["2:T1"] --> L3["3:T2"] --> L4["4:T3 (prevLog)"] --> L5["5:T3 (new entry)"]
+    end
 
-AppendEntriesRequest:
-  prevLogIndex = 4
-  prevLogTerm  = T3    ← "do you have entry (4, T3)?"
-  entries      = [5:T3]
+    subgraph FollowerLog["Follower Log"]
+        F1["1:T1"] --> F2["2:T1"] --> F3["3:T2"] --> F4["4:T3 (getTermAt(4) == T3)"] --> F5["5:T3 (appended -> prefix 1..5 identical)"]
+    end
 
-Follower log:   [1:T1] [2:T1] [3:T2] [4:T3]
-                                      ↑ getTermAt(4) == Some(T3) ✓
-
-The check passes. By induction on previous AppendEntries rounds,
-entries 1–4 are identical. Now entry 5 is appended → logs match through index 5.
+    L4 -. "prevLogIndex=4, prevLogTerm=T3" .-> F4
+    L5 -. "entries=[5:T3]" .-> F5
 ```
 
 ### How to Test It
@@ -315,15 +313,21 @@ val logOk = isLogUpToDate(
 
 A committed entry has been replicated to a majority. Any future leader must collect votes from a majority. These two majorities overlap. The overlapping node has the committed entry, and it will only vote for a candidate whose log is at least as up-to-date — which means the candidate must also have the committed entry (or something newer).
 
-```
-Committed entry at (index=5, term=3):
-  Replicated to: {A, B, C}      ← majority of {A, B, C, D, E}
+```mermaid
+flowchart LR
+    subgraph CommitQuorum["Term 3 Commit Quorum: {A, B, C}"]
+        NA["Node A (has 5:T3)"]
+        NB["Node B (has 5:T3)"]
+        NC["Node C (has 5:T3 - Overlapping Voter)"]
+    end
 
-Future election in term 4:
-  Candidate D needs votes from: 3 of {A, B, C, D, E}
-  At least one voter ∈ {A, B, C} ∩ {voters for D}
-  That voter has entry (5, T3) and won't vote for D unless D's log ≥ (5, T3)
-  ∴ If D wins, D has entry (5, T3)   □
+    subgraph ElectionQuorum["Term 4 Election Quorum: {C, D, E}"]
+        NC
+        ND["Candidate D (must have log >= 5:T3)"]
+        NE["Node E"]
+    end
+
+    NC -->|"Grants vote iff D.log >= (5:T3)"| ND
 ```
 
 ### How to Test It
@@ -432,23 +436,27 @@ The table below maps each safety property to its enforcement mechanism in the li
 
 What makes this library unique is that all five properties are enforced in a single, pure Scala object — `RaftLogic` — with no hidden state, no callbacks, and no I/O. Every safety invariant is directly testable by calling a function and asserting on the result.
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   RaftLogic                         │
-│                                                     │
-│  ┌───────────────┐  ┌────────────────────────────┐  │
-│  │ onRequestVote │  │ onAppendEntries            │  │
-│  │               │  │                            │  │
-│  │ • Election    │  │ • Log Matching (P3)        │  │
-│  │   Safety (P1) │  │ • Leader Append-Only (P2)  │  │
-│  │ • Leader      │  │ • State Machine            │  │
-│  │   Complete-   │  │   Safety (P5)              │  │
-│  │   ness (P4)   │  │                            │  │
-│  └───────────────┘  └────────────────────────────┘  │
-│                                                     │
-│         All properties ↔ pure functions              │
-│         All tests ↔ assert on Transition             │
-└─────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph RL["RaftLogic (Pure Consensus Core)"]
+        RV["onRequestVote"]
+        AE["onAppendEntries & onAppendEntriesResponse"]
+    end
+
+    P1["P1: Election Safety (votedFor + hasMajority)"]
+    P2["P2: Leader Append-Only (Leader rejects same-term AppendEntries)"]
+    P3["P3: Log Matching (prevLogIndex / prevLogTerm induction)"]
+    P4["P4: Leader Completeness (isLogUpToDate restriction)"]
+    P5["P5: State Machine Safety (Majority commit + monotonic apply)"]
+
+    RV --> P1
+    RV --> P4
+    AE --> P2
+    AE --> P3
+    P1 --> P3
+    P2 --> P3
+    P3 --> P4
+    P4 --> P5
 ```
 
 > [!IMPORTANT]

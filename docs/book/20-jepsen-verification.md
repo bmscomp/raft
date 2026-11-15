@@ -12,18 +12,18 @@ The methodology is deceptively simple:
 
 ```mermaid
 flowchart LR
-    subgraph Setup
-        C["Deploy real cluster\n(5 nodes, separate VMs)"]
+    subgraph Setup["1. Setup"]
+        C["Deploy 5-Node Cluster"]
     end
 
-    subgraph Test
-        W["Generate concurrent\nclient workload"]
-        F["Inject faults\n(partitions, kills, clock skew)"]
+    subgraph Test["2. Concurrent Execution"]
+        W["Client Workload (Read / Write / CAS)"]
+        F["Nemesis Faults (Partitions, Kills, Clock Skew)"]
     end
 
-    subgraph Verify
-        H["Record operation\nhistory"]
-        L["Check linearizability\n(Knossos / Elle)"]
+    subgraph Verify["3. Verification"]
+        H["Record Timestamped History"]
+        L["Check Linearizability (WGL / Knossos / Elle)"]
     end
 
     C --> W
@@ -32,8 +32,8 @@ flowchart LR
     F --> H
     H --> L
 
-    L -->|Pass| OK["✓ No violations found"]
-    L -->|Fail| BUG["✗ Consistency violation\n+ minimal reproduction"]
+    L -->|"Pass"| OK["Linearizable History Confirmed"]
+    L -->|"Fail"| BUG["Violation + Minimal Counterexample"]
 ```
 
 The key insight: **you don't test specific failure scenarios**. Instead, you run a workload while randomly injecting faults, record every operation, and then mathematically verify that the recorded history is consistent with the claimed consistency model (usually linearizability).
@@ -111,15 +111,15 @@ The most important component. The nemesis injects faults into the running cluste
 
 A typical nemesis schedule:
 
-```
-t=0s    Start workload (5 clients, 100 ops/sec)
-t=5s    Partition: {n1, n2} | {n3, n4, n5}
-t=15s   Heal partition
-t=20s   Kill n3 (SIGKILL)
-t=25s   Restart n3
-t=30s   Clock skew: n1 +200ms, n4 -200ms
-t=40s   Partition: {n1} | {n2, n3} | {n4, n5}
-t=50s   Heal all, stop workload
+```mermaid
+flowchart LR
+    T0["t=0s: Start Workload (5 clients)"] --> T5["t=5s: Partition {n1,n2} | {n3,n4,n5}"]
+    T5 --> T15["t=15s: Heal Partition"]
+    T15 --> T20["t=20s: SIGKILL n3"]
+    T20 --> T25["t=25s: Restart n3"]
+    T25 --> T30["t=30s: Clock Skew (n1 +200ms, n4 -200ms)"]
+    T30 --> T40["t=40s: 3-Way Partition"]
+    T40 --> T50["t=50s: Heal All & Verify History"]
 ```
 
 ### 4. The History
@@ -426,20 +426,14 @@ def recover: IO[RaftNode[IO, MyCommand]] =
 Jepsen sits at one end of a verification spectrum. Use multiple approaches for maximum confidence:
 
 ```mermaid
-flowchart TB
-    subgraph Confidence["Increasing Confidence →"]
+flowchart LR
+    subgraph Confidence["Increasing Verification Rigor"]
         direction LR
-        UT["Unit Tests\n(fast, specific)"] --> PT["Property Tests\n(random inputs)"]
-        PT --> IT["Integration Tests\n(multi-node, in-memory)"]
-        IT --> JS["Jepsen-Style\n(real faults, real VMs)"]
-        JS --> FM["Formal Methods\n(TLA+, mathematical proof)"]
+        UT["Unit Tests (Fast, Specific)"] --> PT["Property Tests (Random Schedules)"]
+        PT --> DST["Deterministic Simulation (Seeded Cluster)"]
+        DST --> JS["Jepsen Suite (Concurrent Faults & WGL)"]
+        JS --> FM["Formal Methods (TLA+ Proofs)"]
     end
-
-    style UT fill:#e8f5e9
-    style PT fill:#c8e6c9
-    style IT fill:#a5d6a7
-    style JS fill:#81c784
-    style FM fill:#66bb6a
 ```
 
 | Approach | Time to Run | Bugs Found | Coverage |

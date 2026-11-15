@@ -10,21 +10,18 @@
 
 The basic Raft protocol has a subtle operational issue that becomes a real problem in production environments. Consider what happens when a single follower gets cut off from the rest of the cluster by a network partition:
 
-```
-┌─────────────┐      ╳ Partition ╳       ┌─────────────┐
-│   Node A    │                          │   Node C    │
-│ (Follower)  │◄─────────────────────────│  (Leader)   │
-│   term = 5  │       Network OK         │   term = 5  │
-└─────────────┘                          └─────────────┘
-                                         ┌─────────────┐
-                                         │   Node B    │
-         ╳ Partition ╳                   │ (Follower)  │
-                                         │   term = 5  │
-┌─────────────┐                          └─────────────┘
-│   Node D    │   ← Isolated! Cannot reach any peer
-│ (Follower)  │
-│   term = 5  │
-└─────────────┘
+```mermaid
+flowchart LR
+    subgraph Healthy["Healthy Quorum (term = 5)"]
+        NC["Node C (Leader, term=5)"] -->|"Heartbeats OK"| NA["Node A (Follower, term=5)"]
+        NC -->|"Heartbeats OK"| NB["Node B (Follower, term=5)"]
+    end
+
+    subgraph Isolated["Network Partition"]
+        ND["Node D (Isolated Follower -> term 6, 7, ... 47)"]
+    end
+
+    NC -. "X Partition X" .- ND
 ```
 
 Node D can't reach anyone. Its election timer fires. It starts an election, incrementing its term to 6. Nobody responds (because they can't reach Node D), so the election times out. Node D's timer fires again — term 7. Still no response. Term 8, 9, 10, ... By the time the partition heals, Node D is at term 47, but it has no log entries that the rest of the cluster doesn't already have.
@@ -41,13 +38,17 @@ This phenomenon is called **term inflation**, and it's a serious operational pro
 
 The pre-vote protocol was proposed by Diego Ongaro in §9.6 of his doctoral thesis (*"Consensus: Bridging Theory and Practice"*, Stanford University, 2014) as a direct fix for term inflation. The idea is elegant: before starting a real election that increments the term, a node first runs a **preliminary check** ("pre-vote") to see if it would even have a chance of winning.
 
-```
-Standard Raft:    Follower → Candidate(term+1) → may disrupt cluster
+```mermaid
+flowchart LR
+    subgraph Standard["Standard Raft"]
+        SF["Follower (term T)"] --> SC["Candidate (term T+1)"] --> SD["May disrupt healthy leader"]
+    end
 
-With Pre-Vote:    Follower → PreCandidate(same term) → got majority?
-                                                            │
-                                                     Yes ───┼──→ Candidate(term+1)
-                                                     No  ───┼──→ stays Follower
+    subgraph PreVote["With Pre-Vote"]
+        PF["Follower (term T)"] --> PPC["PreCandidate (term T, probe T+1)"]
+        PPC -->|"Majority granted"| PC["Candidate (term T+1)"]
+        PPC -->|"Rejected / Partitioned"| PSTAY["Stays Follower (term T unchanged)"]
+    end
 ```
 
 In the pre-vote phase:
@@ -97,14 +98,17 @@ In any long-running system, the cluster membership will change: you add nodes fo
 
 Here's the specific danger:
 
-```
-Old config: {A, B, C}          → majority = 2 nodes
-New config: {A, B, C, D, E}    → majority = 3 nodes
+```mermaid
+flowchart TD
+    T["Naive Config Switch: {A, B, C} -> {A, B, C, D, E}"]
+    Q1["Nodes {A, B} use Old Config (2/3 majority)"]
+    Q2["Nodes {C, D, E} use New Config (3/5 majority)"]
+    L1["Leader 1 elected by {A, B}"]
+    L2["Leader 2 elected by {C, D, E}"]
+    SB["Split-Brain: Two concurrent leaders in same term!"]
 
-During transition, if:
-  - {A, B} think old config is active (majority = 2/3 ✓) and elect a leader
-  - {C, D, E} think new config is active (majority = 3/5 ✓) and elect a leader
-→ TWO LEADERS! Split-brain!
+    T --> Q1 --> L1 --> SB
+    T --> Q2 --> L2 --> SB
 ```
 
 The problem is that there's no single instant at which the entire cluster atomically switches from the old configuration to the new one. Different nodes learn about the configuration change at different times, and during this window, two independent majorities can form.
@@ -165,12 +169,17 @@ What if the membership change goes wrong? Maybe the new nodes are unreachable, o
 
 In Chapter 2, we established that client writes go through the leader and are committed once replicated to a majority. But what about reads? A naive implementation might serve reads directly from the leader's state machine without going through the log. This is fast but **unsafe**:
 
-```
-Time 0: Leader A (term 5) serves read(x) → "5"        ← correct
-Time 1: Network partition isolates Leader A
-Time 2: Nodes B, C, D elect Leader B (term 6)
-Time 3: Leader B commits write(x = "7")
-Time 4: Client reads from Leader A → still returns "5" ← STALE!
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant LA as Leader A (Term 5)
+    participant LB as Quorum {B, C, D} (Term 6)
+
+    C->>LA: Time 0: read(x) -> "5" (valid)
+    Note over LA,LB: Time 1: Network partition isolates Node A
+    Note over LB: Time 2: {B, C, D} elect Leader B in Term 6
+    C->>LB: Time 3: write(x = "7") committed
+    C->>LA: Time 4: read(x) -> "5" (STALE READ!)
 ```
 
 Leader A doesn't know it's been deposed — it hasn't received any messages from the new leader, so its term is still 5 and it still thinks it's the leader. This violates **linearizability**, the gold standard for consistency: a read that happens after a write (in real time) should always reflect that write.
@@ -187,14 +196,12 @@ Treat every read as a write: append a "read command" to the log, replicate it to
 
 The ReadIndex protocol avoids putting reads into the log while still guaranteeing linearizability. The steps are:
 
-```
-1. Client sends read(x) to the leader
-2. Leader records its current commitIndex as the "readIndex"
-3. Leader sends heartbeats to all followers (a lightweight round-trip)
-4. If a majority responds → the leader is confirmed to still be the leader
-5. Leader waits until its state machine has applied entries through readIndex
-6. Leader reads from its state machine and returns the result
-```
+1. Client sends `read(x)` to the leader.
+2. Leader records its current `commitIndex` as the `readIndex`.
+3. Leader sends heartbeats to all followers (a lightweight round-trip).
+4. If a majority responds, the leader is confirmed to still hold authority.
+5. Leader waits until its state machine has applied entries through `readIndex`.
+6. Leader reads from its local state machine and returns the result.
 
 **Why this works**: Step 4 confirms that no new leader has been elected (because the responding majority would have rejected the heartbeat if they'd already voted for a different leader in a higher term). Step 5 ensures the read reflects all committed writes up to the point the read was initiated.
 
@@ -232,16 +239,12 @@ sequenceDiagram
 
 If you're willing to assume that clocks on different nodes are **approximately synchronized** (bounded clock skew), you can eliminate the heartbeat round-trip entirely.
 
-The idea: when the leader receives heartbeat acknowledgments from a majority, it knows that **no election can succeed for at least one election timeout period** (because the followers that acknowledged the heartbeat have reset their election timers). The leader can therefore claim a "leadership lease" and serve reads without further confirmation during the lease period.
+The idea: when the leader receives heartbeat acknowledgments from a majority, it knows that **no election can succeed for at least one election timeout period** (because the followers that acknowledged the heartbeat have reset their election timers). The leader can therefore claim a "leadership lease" and serve reads without further confirmation during the lease period:
 
-```
-1. Leader receives heartbeat ACKs from a majority at local time T
-2. Leader calculates lease expiry = T + electionTimeout - maxClockSkew
-3. During the lease period (now < lease expiry):
-      → serve reads immediately from local state machine (zero RTT!)
-4. After lease expires:
-      → fall back to ReadIndex
-```
+1. Leader receives heartbeat ACKs from a majority at local time `T`.
+2. Leader calculates `leaseExpiry = T + electionTimeoutMin - maxClockSkew`.
+3. While `now < leaseExpiry`, the leader serves reads immediately from its local state machine (zero RTT).
+4. Once `now >= leaseExpiry`, the leader falls back to `ReadIndex` until the next heartbeat quorum renews the lease.
 
 **The catch**: this only works if the clock skew between nodes is bounded by `maxClockSkew`. If a follower's clock runs too fast and it starts an election before the leader's lease expires, a new leader could be elected while the old leader still thinks its lease is valid, leading to stale reads.
 
@@ -251,22 +254,14 @@ The idea: when the leader receives heartbeat acknowledgments from a majority, it
 | **ReadIndex** | One heartbeat RTT | None | etcd, most Raft implementations |
 | **Lease-based** | Zero extra RTT | Bounded clock skew | CockroachDB, TiKV |
 
-The lease timeline:
+The lease decision and clock-budget timeline:
 
 ```mermaid
-gantt
-    title Leader Lease Timeline
-    dateFormat X
-    axisFormat %s
-
-    section Leader
-    heartbeat ACKs received     :milestone, 0, 0
-    Lease valid (serve reads)   :active, 0, 8
-    Lease expired (use ReadIndex) :crit, 8, 10
-
-    section Clock Budget
-    electionTimeout             :0, 10
-    maxClockSkew margin         :8, 10
+flowchart LR
+    ACK["Time T: Majority Heartbeat ACKs"] --> VALID["Lease Valid Window (T .. T + electionTimeout - maxClockSkew)"]
+    VALID -->|"Zero-RTT read"| LOCAL["Serve directly from local StateMachine"]
+    VALID --> GUARD["Clock Skew Guard Margin (maxClockSkew)"]
+    GUARD --> EXPIRED["Lease Expired -> Fall back to ReadIndex"]
 ```
 
 > **Note — Clock Skew in Practice:** In a well-configured data center with NTP, clock skew is typically under 10ms. With PTP (Precision Time Protocol) or dedicated time hardware (like Google's TrueTime), it can be under 1ms. For most deployments, lease-based reads with a conservative maxClockSkew setting are safe and provide a significant latency improvement for read-heavy workloads. However, if you're running on unreliable infrastructure (multi-cloud, edge computing), prefer ReadIndex.
@@ -288,15 +283,24 @@ Without a transfer protocol, the operator's only option is to kill the leader pr
 
 The leadership transfer protocol provides a **zero-downtime** handoff:
 
-```
-1. Admin requests: "transfer leadership to Node B"
-2. Leader (Node A) stops accepting new client requests
-3. Leader sends any remaining log entries to Node B
-4. Leader waits until Node B's log is fully caught up (matchIndex == leader's log length)
-5. Leader sends TimeoutNow to Node B
-6. Node B immediately starts an election (skipping the randomized timeout AND pre-vote)
-7. Node B wins (it has the most up-to-date log, and the old leader votes for it)
-8. Node B becomes the new leader and starts accepting requests
+```mermaid
+sequenceDiagram
+    participant Admin as Operator
+    participant LA as Old Leader (Node A)
+    participant NB as Target (Node B)
+    participant F as Other Voters
+
+    Admin->>LA: 1. TransferLeadership(target = Node B)
+    Note over LA: 2. Pause new client proposals
+    LA->>NB: 3. AppendEntries (replicate remaining tail)
+    NB-->>LA: 4. AppendEntriesResponse (matchIndex caught up)
+    LA->>NB: 5. TimeoutNow
+    Note over NB: 6. Immediately start election (skip timer & Pre-Vote)
+    NB->>LA: RequestVote(term = T+1)
+    NB->>F: RequestVote(term = T+1)
+    LA-->>NB: 7. VoteGranted
+    F-->>NB: VoteGranted
+    Note over NB: 8. Node B becomes Leader & resumes traffic
 ```
 
 The `TimeoutNow` message is a special directive that tells the target node: "start an election right now, don't wait for your election timer." This bypasses both the randomized timeout and the pre-vote check (since the transfer was initiated by the current leader, there's no need to check if an election would succeed — the leader has already ensured the target's log is caught up).
@@ -318,14 +322,15 @@ Under normal Raft operation, the log grows monotonically — entries are appende
 
 The solution is **log compaction via snapshots** (§7 of the Raft paper). Each node periodically takes a snapshot of its state machine at a particular log index, capturing the cumulative effect of all log entries up to that index. Once the snapshot is saved, the log entries through that index can be discarded.
 
-```
-Before compaction:
-  [entry 1] [entry 2] [entry 3] [entry 4] [entry 5] [entry 6]
-                                                       ↑ last applied
+```mermaid
+flowchart TD
+    subgraph Before["Before Compaction"]
+        B1["Entry 1"] --> B2["Entry 2"] --> B3["Entry 3"] --> B4["Entry 4"] --> B5["Entry 5"] --> B6["Entry 6 (lastApplied)"]
+    end
 
-After snapshot at index 4:
-  [SNAPSHOT: state machine state at index 4] [entry 5] [entry 6]
-  Contains: lastIncludedIndex=4, lastIncludedTerm=1, state machine data
+    subgraph After["After Snapshot at Index 4"]
+        SNAP["Snapshot (lastIncludedIndex=4, lastIncludedTerm=1, FSM bytes)"] --> A5["Entry 5"] --> A6["Entry 6"]
+    end
 ```
 
 A snapshot must include:
@@ -337,12 +342,17 @@ A snapshot must include:
 
 When a follower falls so far behind that the leader has already discarded the entries it needs (because they've been compacted into a snapshot), the leader uses `InstallSnapshot` instead of `AppendEntries`:
 
-```
-Leader: "I need to send you entries starting from index 3..."
-Leader: "Wait, I've already compacted entries 1-1000 into a snapshot."
-Leader: → sends InstallSnapshot(lastIncludedIndex=1000, ..., data=<snapshot bytes>)
-Follower: installs snapshot, replaces its state machine state
-Leader: → resumes normal AppendEntries from index 1001
+```mermaid
+sequenceDiagram
+    participant L as Leader (compacted 1..1000)
+    participant F as Lagging Follower (at index 2)
+
+    Note over L: Needs index 3, but entries 1..1000 are compacted
+    L->>F: InstallSnapshot(lastIncludedIndex=1000, lastIncludedTerm=4, data)
+    F->>F: Replace StateMachine state & discard stale log <= 1000
+    F-->>L: InstallSnapshotResponse(success=true)
+    L->>F: AppendEntries(prevLogIndex=1000, entries=[1001..])
+    F-->>L: AppendEntriesResponse(success=true, matchIndex=1001)
 ```
 
 For large state machines, the snapshot data may be too large to fit in a single RPC. In such cases, the leader can send the snapshot in **chunks** (offset-based transfer), with the follower reassembling the chunks and applying the complete snapshot once all chunks arrive. The library supports this via the `PendingSnapshot` data structure (see Chapter 6).

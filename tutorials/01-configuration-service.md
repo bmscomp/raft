@@ -27,24 +27,22 @@ Raft provides exactly the guarantees a configuration service needs:
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                  Configuration Service                    │
-│                                                          │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐              │
-│  │ Node 1  │◄──►│ Node 2  │◄──►│ Node 3  │  (Raft)     │
-│  │(Leader) │    │(Follower)│    │(Follower)│              │
-│  └────▲────┘    └─────────┘    └─────────┘              │
-│       │                                                  │
-└───────┼──────────────────────────────────────────────────┘
-        │
-   ┌────┴─────────────────────┐
-   │    Client Applications    │
-   │                           │
-   │  PUT /config/db.host      │
-   │  GET /config/db.host      │
-   │  WATCH /config/db.*       │
-   └───────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Clients["Client Applications"]
+        OP["PUT /config/db.host | GET /config/db.host | WATCH /config/db.*"]
+    end
+
+    subgraph Cluster["Configuration Service (3-Node Raft Cluster)"]
+        N1["Node 1 (Leader)"]
+        N2["Node 2 (Follower)"]
+        N3["Node 3 (Follower)"]
+        N1 <--> N2
+        N1 <--> N3
+        N2 <--> N3
+    end
+
+    OP --> N1
 ```
 
 ## Command Design
@@ -293,11 +291,18 @@ The pure functional core makes this clean — watch evaluation is just another f
 
 ### Scenario 1: Leader crashes mid-write
 
-```
-t=0   Client sends PUT db.host=new-host to Leader (Node 1)
-t=1   Leader appends to its log and sends AppendEntries to Nodes 2, 3
-t=2   Node 2 acknowledges ── Leader CRASHES before committing
-t=3   Node 3 didn't receive the AppendEntries
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N1 as Node 1 (Leader)
+    participant N2 as Node 2 (Follower)
+    participant N3 as Node 3 (Follower)
+
+    C->>N1: t=0: PUT db.host=new-host
+    N1->>N2: t=1: AppendEntries(PUT db.host)
+    N1--xN3: t=1: AppendEntries lost
+    N2-->>N1: t=2: AppendEntriesResponse(success)
+    Note over N1: t=2: Leader CRASHES before committing!
 ```
 
 **What happens**: Node 2 or Node 3 is elected. If Node 2 wins (it has the entry), the write is committed when Node 2 appends its own no-op entry. If Node 3 wins (log is more up-to-date or equal), Node 3's log doesn't have the entry. The write is lost — but the client never received an acknowledgment, so from the client's perspective, the write failed.
@@ -306,10 +311,16 @@ t=3   Node 3 didn't receive the AppendEntries
 
 ### Scenario 2: Network partition during read
 
-```
-t=0   Client reads db.host via ReadIndex on Leader (partition starts)
-t=5   Leader sends heartbeat to confirm leadership — no responses
-t=10  ReadIndex times out → ReadIndexRejected effect
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N1 as Partitioned Leader
+    participant Q as Followers {N2, N3}
+
+    C->>N1: t=0: GET db.host (ReadIndex)
+    N1--xQ: t=5: Heartbeat confirmation blocked by partition
+    Note over N1: t=10: Quorum confirmation timeout
+    N1-->>C: ReadIndexRejected
 ```
 
 **What happens**: With ReadIndex, the leader must confirm it's still the leader before serving a read. If it can't reach a quorum, the read is rejected. The client retries and discovers the new leader.
@@ -318,11 +329,15 @@ t=10  ReadIndex times out → ReadIndexRejected effect
 
 ### Scenario 3: Watch misses an update
 
-```
-t=0   Client watching prefix "db." with lastSeenVersion=5
-t=1   PUT db.host=new-host (version 6) committed
-t=2   PUT db.port=5433 (version 7) committed
-t=3   Client polls — sees both changes (versions 6 and 7)
+```mermaid
+sequenceDiagram
+    participant C as Client (lastSeenVersion = 5)
+    participant L as Config Service Leader
+
+    Note over L: t=1: PUT db.host=new-host committed (version = 6)
+    Note over L: t=2: PUT db.port=5433 committed (version = 7)
+    C->>L: t=3: WATCH(prefix="db.", sinceVersion=5)
+    L-->>C: [db.host=new-host@6, db.port=5433@7]
 ```
 
 **What happens**: Because watches are version-based, the client never misses an update — it asks for "everything after version 5" and gets all changes. Even if the client was offline for hours, reconnecting and providing the last seen version retrieves all missed changes.

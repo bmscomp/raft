@@ -8,16 +8,16 @@
 
 In Chapter 1, we saw that consensus is hard. Raft makes it tractable by **decomposition** — breaking a monolithic problem into three smaller, more manageable sub-problems:
 
-```
-┌───────────────────────────────────────────────────┐
-│                  RAFT PROTOCOL                    │
-├─────────────────┬────────────────┬────────────────┤
-│ Leader Election │ Log Replication│    Safety      │
-│                 │                │                │
-│ Who leads?      │ How data flows │ Why it's       │
-│ When to change? │ from leader    │ always correct │
-│                 │ to followers   │                │
-└─────────────────┴────────────────┴────────────────┘
+```mermaid
+flowchart TD
+    R["Raft Consensus Protocol"]
+    E["Leader Election: Who leads & when to change"]
+    L["Log Replication: How commands flow from leader to followers"]
+    S["Safety Invariants: Why committed state never diverges"]
+
+    R --> E
+    R --> L
+    R --> S
 ```
 
 This isn't just an organizational trick for the paper. It's a genuine architectural principle that makes Raft implementations cleaner: you can implement and test election logic independently of replication logic, and both independently of safety proofs. The code in this library reflects this separation directly.
@@ -42,13 +42,11 @@ Since there's no global physical clock (as we discussed in Chapter 1), Raft need
 
 A term is a monotonically increasing integer that acts as a **logical clock** for the cluster. Think of terms as "reign numbers" or "epochs" — each term represents a period of time during which one leader (at most) holds authority.
 
-```
-    Term 1          Term 2      Term 3      Term 4
-┌──────────────┐┌──────────┐┌──────────┐┌──────────────┐
-│  Election →  ││ Election ││ Election ││  Election →  │
-│  Leader A    ││ (no win) ││ Leader B ││  Leader C    │
-│  Normal ops  ││          ││ Normal   ││  Normal ops  │
-└──────────────┘└──────────┘└──────────┘└──────────────┘
+```mermaid
+flowchart LR
+    T1["Term 1: Election -> Leader A (Normal ops)"] --> T2["Term 2: Split Vote (No winner)"]
+    T2 --> T3["Term 3: Election -> Leader B (Normal ops)"]
+    T3 --> T4["Term 4: Election -> Leader C (Normal ops)"]
 ```
 
 Each term begins with an election. If a candidate wins, it serves as leader for the rest of the term. If no candidate wins (a "split vote" — more on this shortly), the term ends with no leader and a new term begins immediately.
@@ -211,13 +209,18 @@ Once a leader has been elected, it needs to do something useful: accept client c
 
 Raft's core data structure is the **replicated log** — an ordered sequence of entries that every node applies to its state machine in the same order:
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Index:   1       2       3       4       5         │
-│  Term:    1       1       1       2       2         │
-│  Data:    SET x=1 SET y=2 DEL z   SET x=3 NO-OP    │
-│  Status:  applied applied applied committed pending │
-└─────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Applied["Applied to State Machine"]
+        E1["Idx 1 | T1 | SET x=1"] --> E2["Idx 2 | T1 | SET y=2"] --> E3["Idx 3 | T1 | DEL z"]
+    end
+    subgraph Committed["Committed (Safe)"]
+        E4["Idx 4 | T2 | SET x=3"]
+    end
+    subgraph Pending["Pending Quorum"]
+        E5["Idx 5 | T2 | NO-OP"]
+    end
+    E3 --> E4 --> E5
 ```
 
 Each entry contains three pieces of information:
@@ -246,19 +249,16 @@ The leader replicates entries to followers using `AppendEntries` RPCs. This is t
 
 The RPC contains everything the follower needs to verify consistency and append new entries:
 
-```
-Leader sends to Follower:
-  ┌──────────────────────────────────────────────────┐
-  │  AppendEntriesRequest                            │
-  │    term           = 2   (leader's current term)  │
-  │    leaderId       = "node-1"                     │
-  │    prevLogIndex   = 3   (index just before the   │
-  │                          new entries)             │
-  │    prevLogTerm    = 1   (term of entry at         │
-  │                          prevLogIndex)            │
-  │    entries        = [{idx=4, term=2, "SET x=3"}] │
-  │    leaderCommit   = 3   (leader's commit index)  │
-  └──────────────────────────────────────────────────┘
+```mermaid
+classDiagram
+    class AppendEntriesRequest {
+        +Long term = 2
+        +NodeId leaderId = "node-1"
+        +Long prevLogIndex = 3
+        +Long prevLogTerm = 1
+        +Seq~Log~ entries = "[idx=4, term=2, SET x=3]"
+        +Long leaderCommit = 3
+    }
 ```
 
 The full replication cycle looks like this:
@@ -351,13 +351,11 @@ The **Leader Completeness** property is the most subtle and the most important. 
 
 The state machine is the **application-specific logic** that consumes committed log entries. It's the whole reason the consensus algorithm exists — the replicated log is just a vehicle for ensuring that every node applies the same commands in the same order.
 
-```
-                                     ┌──────────────┐
-  Client Command ──→ Leader Log ──→ │ State Machine │──→ Application State
-                                     │              │
-                                     │ apply(entry) │    "x" → "1"
-                                     │              │    "y" → "2"
-                                     └──────────────┘
+```mermaid
+flowchart LR
+    C["Client Command"] --> L["Leader Replicated Log"]
+    L --> SM["StateMachine.apply(entry)"]
+    SM --> AS["Deterministic Application State (x=1, y=2)"]
 ```
 
 The contract is simple: the state machine is a **deterministic function** of the log. Given the same sequence of entries, every state machine on every node will produce the same output state. This is the fundamental guarantee of the replicated state machine approach (Schneider, 1990 — referenced in Chapter 1).
@@ -409,17 +407,23 @@ val config = RaftConfig(
 
 Let's trace a single client write through the entire Raft protocol to see how all the pieces fit together:
 
-```
-1. Client sends "SET x = 42" to the leader (or a follower redirects to the leader)
-2. Leader creates a Log entry: Log(index=8, term=3, data="SET x=42")
-3. Leader appends the entry to its own log
-4. Leader sends AppendEntries(prevLogIndex=7, entries=[entry]) to all followers
-5. Each follower verifies prevLogIndex/prevLogTerm, appends the entry, responds success
-6. Leader receives successful responses from a majority (including itself)
-7. Leader advances commitIndex to 8
-8. Leader applies entry 8 to its state machine, returns result to client
-9. Next heartbeat carries leaderCommit=8 to followers
-10. Followers apply entry 8 to their state machines
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F as Followers (Quorum)
+    participant SM as State Machines
+
+    C->>L: 1. Propose "SET x = 42"
+    L->>L: 2-3. Append Log(index=8, term=3, "SET x=42")
+    L->>F: 4. AppendEntries(prevLogIndex=7, entries=[8])
+    F->>F: 5. Verify prevLogIndex/prevLogTerm & append
+    F-->>L: 6. AppendEntriesResponse(success=true, matchIndex=8)
+    L->>L: 7. Quorum reached -> advance commitIndex = 8
+    L->>SM: 8. Apply entry 8 on Leader
+    L-->>C: Return write result
+    L->>F: 9. Next Heartbeat(leaderCommit=8)
+    F->>SM: 10. Apply entry 8 on Followers
 ```
 
 If a follower is slow or its response is lost, the leader retries the `AppendEntries` in the next heartbeat cycle. If the leader crashes after step 6, the entry is safe on a majority of nodes, and the next leader will re-replicate it and complete the commit.

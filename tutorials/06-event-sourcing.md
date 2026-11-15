@@ -32,25 +32,24 @@ The state machine becomes the **event processor** — it receives committed even
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Event Log Cluster (Raft)                     │
-│                                                                 │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  Node 1  │◄──►│  Node 2  │◄──►│  Node 3  │                   │
-│  │ (Leader) │    │(Follower)│    │(Follower)│                   │
-│  │          │    │          │    │          │                   │
-│  │ Log:     │    │ Log:     │    │ Log:     │                   │
-│  │ [E1,E2,  │    │ [E1,E2,  │    │ [E1,E2,  │                   │
-│  │  E3,E4]  │    │  E3,E4]  │    │  E3,E4]  │                   │
-│  └──────────┘    └──────────┘    └──────────┘                   │
-│       │                │                │                       │
-└───────┼────────────────┼────────────────┼───────────────────────┘
-        │                │                │
-   ┌────┴────┐    ┌──────┴──────┐   ┌─────┴─────┐
-   │Producer │    │ Consumer A  │   │Consumer B  │
-   │(writes) │    │(offset: 3)  │   │(offset: 1) │
-   └─────────┘    └─────────────┘   └────────────┘
+```mermaid
+flowchart TD
+    P["Producer (Proposes Events)"]
+
+    subgraph Cluster["Event Log Cluster (Raft)"]
+        N1["Node 1 (Leader) - Log: [E1, E2, E3, E4]"]
+        N2["Node 2 (Follower) - Log: [E1, E2, E3, E4]"]
+        N3["Node 3 (Follower) - Log: [E1, E2, E3, E4]"]
+        N1 <-->|"AppendEntries"| N2
+        N1 <-->|"AppendEntries"| N3
+    end
+
+    CA["Consumer A (Offset = 3)"]
+    CB["Consumer B (Offset = 1)"]
+
+    P -->|"Publish Event"| N1
+    N2 -->|"Poll from Offset 3"| CA
+    N3 -->|"Poll from Offset 1"| CB
 ```
 
 ## Event Encoding
@@ -245,22 +244,34 @@ A powerful property of event sourcing: any consumer can replay the entire histor
 
 ### Scenario 1: Producer retry creates duplicate event
 
-```
-t=0   Producer publishes OrderPlaced (idempotency key: "order-42-v1")
-t=1   Event committed, but producer's connection drops before ACK
-t=2   Producer retries with same idempotency key: "order-42-v1"
-t=3   State machine: processedKeys contains "order-42-v1" → DUPLICATE
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant SM as Leader & EventSourcedStateMachine
+
+    P->>SM: t=0: Publish OrderPlaced (idempotencyKey = "order-42-v1")
+    Note over SM: t=1: Committed & applied (processedKeys += "order-42-v1")
+    SM--xP: ACK dropped by network
+    P->>SM: t=2: Retry OrderPlaced (idempotencyKey = "order-42-v1")
+    Note over SM: t=3: processedKeys contains "order-42-v1" -> skip side effect
+    SM-->>P: DUPLICATE:order-42-v1
 ```
 
 The idempotency key ensures exactly-once semantics from the producer's perspective.
 
 ### Scenario 2: Consumer crashes mid-batch
 
-```
-t=0   Consumer at offset 100, reads events 101-200
-t=5   Consumer processes events 101-150, then crashes
-t=10  Consumer restarts, resumes from offset 100 (last acknowledged)
-t=11  Consumer re-processes events 101-150 (must be idempotent)
+```mermaid
+sequenceDiagram
+    participant C as EventConsumer
+    participant Log as Committed Event Log
+
+    C->>Log: t=0: Poll from offset 100 -> receives events 101..200
+    Note over C: t=5: Processes events 101..150, then crashes before ack!
+    Note over C: t=10: Consumer restarts at last acked offset (100)
+    C->>Log: Poll from offset 100 -> receives events 101..200
+    Note over C: t=11: Re-processes 101..150 idempotently, completes 151..200
+    C->>C: acknowledge(200)
 ```
 
 Consumer-side processing must be idempotent or use the transactional outbox pattern (process + acknowledge atomically).

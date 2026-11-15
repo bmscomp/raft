@@ -256,14 +256,26 @@ A lightweight, modular Java Raft library emphasizing minimalism and clean abstra
 
 Libraries fall on a spectrum from **minimal core** (you build everything) to **complete framework** (it handles everything):
 
-```
-Minimal Core                                              Complete Framework
-     ◄──────────────────────────────────────────────────────────►
-     │                           │                              │
- etcd/raft                   OpenRaft                      SOFAJRaft
- tikv/raft-rs                                             HashiCorp Raft
- MicroRaft
- This Library
+```mermaid
+flowchart LR
+    subgraph Minimal["Minimal Sans-I/O Core (Host Owns Runtime & Storage)"]
+        M1["etcd/raft (Go)"]
+        M2["tikv/raft-rs (Rust)"]
+        M3["MicroRaft (Java)"]
+        M4["raft-core (Scala 3)"]
+    end
+
+    subgraph Mid["Async Runtime + Pluggable Traits"]
+        MD1["OpenRaft (Rust)"]
+        MD2["raft-runtime (Scala 3 + Cats Effect)"]
+    end
+
+    subgraph Full["Complete Integrated Framework"]
+        F1["SOFAJRaft (Java)"]
+        F2["HashiCorp Raft (Go)"]
+    end
+
+    Minimal <--> Mid <--> Full
 ```
 
 **Minimal core** libraries (etcd/raft, tikv/raft-rs, MicroRaft, this library) give you the consensus algorithm as a pure function or state machine. You build the networking, storage, and timers. This maximizes flexibility — you can use any network stack, any storage engine, any timer implementation — but increases integration effort. It also makes the library **testable in isolation**, which is why this end of the spectrum tends to produce more thoroughly tested consensus logic.

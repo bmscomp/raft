@@ -8,31 +8,29 @@
 
 The term "Service Provider Interface" comes from the Java ecosystem (dating to the JDK 1.3 era), but the concept is universal: instead of the library depending on specific implementations (e.g., gRPC, RocksDB), it depends on **abstract interfaces** that you implement to match your infrastructure. This inverts the traditional dependency direction:
 
-```
-Traditional:   Library ──depends on──→ gRPC, RocksDB, etc.
-SPI approach:  Library ──depends on──→ abstract traits ←──implemented by── You
+```mermaid
+flowchart LR
+    subgraph Traditional["Traditional Coupling"]
+        TL["Raft Library"] -->|"depends directly on"| TI["gRPC, RocksDB, Threads"]
+    end
+
+    subgraph SPI["Dependency Inversion (SPI)"]
+        SL["raft-runtime"] -->|"depends on"| ST["Abstract SPI Traits"]
+        USER["Your Infrastructure"] -->|"implements"| ST
+    end
 ```
 
 There are five SPIs in this library:
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                     RaftNode[F]                          │
-│                                                          │
-│    RaftLogic (Pure) ────→ Effects ────→ SPI Calls        │
-│                                                          │
-├───────────────┬──────────────┬────────────┬──────────────┤
-│  Transport    │   LogStore   │StableStore │ StateMachine │
-│               │              │            │              │
-│  send()       │  append()    │ setTerm()  │ apply()      │
-│  broadcast()  │  get()       │ setVote()  │ snapshot()   │
-│  sendBatch()  │  truncate()  │ getTerm()  │ restore()    │
-│  receive      │  getRange()  │ getVote()  │              │
-├───────────────┴──────────────┴────────────┴──────────────┤
-│                     TimerService                         │
-│  resetElectionTimer  · resetHeartbeatTimer  · cancelAll  │
-│  electionTimeouts (stream)  · heartbeatTicks (stream)    │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    RN["RaftNode[F] Runtime"] --> RL["RaftLogic (Pure State Machine)"]
+    RL --> EF["Effect Stream"]
+    EF --> TR["Transport[F, Wire] (send, broadcast, receive)"]
+    EF --> LS["LogStore[F] (append, get, getRange, truncateFrom)"]
+    EF --> SS["StableStore[F] (currentTerm, votedFor)"]
+    EF --> SM["StateMachine[F, R] (apply, snapshot, restore)"]
+    EF --> TS["TimerService[F] (electionTimeouts, heartbeatTicks)"]
 ```
 
 Each SPI is parameterized by `F[_]`, the effect type from Cats Effect (typically `IO`). This means SPI implementations can express asynchronous, concurrent, and potentially failing operations in a type-safe way.

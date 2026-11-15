@@ -33,30 +33,12 @@ case class Transition(state: NodeState, effects: List[Effect])
 
 That's it. The entire Raft protocol is driven by calling this function in a loop. Your runtime looks like:
 
-```
-             ┌──────────┐
-             │  Event   │  (message from peer, timer, client request)
-             └────┬─────┘
-                  │
-                  ▼
-    ┌───────────────────────────┐
-    │  RaftLogic.onMessage(     │
-    │    currentState,          │
-    │    event,                 │
-    │    config,                │
-    │    lastLogIndex,          │
-    │    lastLogTerm,           │
-    │    clusterSize            │
-    │  )                        │
-    └────────────┬──────────────┘
-                 │
-                 ▼
-         ┌──────────────┐
-         │  Transition  │
-         │              │
-         │  .state  ─────────→  update currentState
-         │  .effects ────────→  execute each effect
-         └──────────────┘
+```mermaid
+flowchart TD
+    EV["Event (Peer RPC, Timer Timeout, Client Proposal)"] --> ON["RaftLogic.onMessage(currentState, event, config, lastLogIndex, lastLogTerm, clusterSize)"]
+    ON --> TR["Transition"]
+    TR -->|".state"| ST["Update currentState"]
+    TR -->|".effects"| EF["Execute each Effect in order"]
 ```
 
 There's something worth noting about the `getTermAt` parameter: it's a function, not a value. The protocol logic sometimes needs to look up the term of a specific log entry (for example, to fill in the `prevLogTerm` field of an `AppendEntries` request). Rather than passing the entire log, we pass a lookup function. This keeps the interface minimal — the protocol logic only queries the log when it needs to, and only for the specific information it requires.
@@ -67,23 +49,17 @@ There's something worth noting about the `getTermAt` parameter: it's a function,
 
 Every node in a Raft cluster is in exactly one of four states. These are modeled as a sealed trait hierarchy:
 
-```
-                     ElectionTimeout
-         ┌──────────────────────────────┐
-         │                              ▼
-    ┌──────────┐  preVote        ┌──────────────┐
-    │ Follower │────────────────→│ PreCandidate │
-    └──────────┘                 └──────────────┘
-         ▲                              │ majority pre-votes
-         │ higher term                  ▼
-         │                      ┌──────────────┐
-         │                      │  Candidate   │
-         │                      └──────────────┘
-         │ steps down                   │ majority votes
-         │                              ▼
-         │                      ┌──────────────┐
-         └──────────────────────│    Leader    │
-                                └──────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Follower
+    Follower --> PreCandidate: ElectionTimeout (preVoteEnabled = true)
+    Follower --> Candidate: ElectionTimeout (preVoteEnabled = false)
+    PreCandidate --> Candidate: Majority pre-votes granted
+    PreCandidate --> Follower: Higher term or valid Leader heartbeat
+    Candidate --> Leader: Majority votes granted
+    Candidate --> Candidate: ElectionTimeout (split vote -> term + 1)
+    Candidate --> Follower: Higher term or AppendEntries from Leader
+    Leader --> Follower: Higher term discovered
 ```
 
 Let's look at each state in detail.
@@ -378,24 +354,31 @@ This function is separate from `onMessage` because vote responses require the vo
 
 Here's the complete API surface at a glance:
 
-```
-                    ┌──────────────────────────┐
-                    │       RaftLogic          │
-                    │                          │
-  RaftMessage ─────→│  onMessage(state, msg)   │─────→ Transition
-  Timer events      │  onVoteResponse(...)     │       ├── NodeState
-                    │  handleReadIndex(...)    │       └── List[Effect]
-                    │  handleLeaseRead(...)    │
-                    │  handleTransferLeader..  │
-                    └──────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Inputs["Inputs & Configuration"]
+        MSG["RaftMessage & Timer Events"]
+        CFG["RaftConfig & ClusterConfig"]
+        LOG["Log Metadata (lastIndex, lastTerm, getTermAt)"]
+    end
 
-  NodeState: Follower | PreCandidate | Candidate | Leader
-  Effect:    SendMessage | Broadcast | PersistHardState | AppendLogs
-             TruncateLog | CommitEntries | BecomeLeader | ResetElectionTimer
-             ResetHeartbeatTimer | ConfirmLeadership | ReadIndexReady
-             LeaseReadReady | ExtendLease | TimeoutNow | ...
-  Config:    RaftConfig (tuning), ClusterConfig (membership)
-  Data:      Log (entries), Transition (state + effects)
+    subgraph Core["RaftLogic (Pure Core)"]
+        OM["onMessage(state, msg, ...)"]
+        VR["onVoteResponse(...)"]
+        RD["handleReadIndex / handleLeaseRead"]
+        TL["handleTransferLeadership"]
+    end
+
+    subgraph Outputs["Transition Result"]
+        NS["NodeState (Follower | PreCandidate | Candidate | Leader)"]
+        EF["List[Effect] (Persist, Append, Send, Broadcast, Commit, ...)"]
+    end
+
+    MSG --> Core
+    CFG --> Core
+    LOG --> Core
+    Core --> NS
+    Core --> EF
 ```
 
 ---

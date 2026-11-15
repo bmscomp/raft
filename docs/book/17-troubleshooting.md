@@ -204,6 +204,17 @@ See [Chapter 3](03-raft-advanced-theory.md) for learner semantics and [Chapter 9
 
 ## Diagnostic Checklist
 
+```mermaid
+flowchart TD
+    START["Production Incident Observed"] --> Q1{"Frequent Leader Elections?"}
+    Q1 -->|"Yes"| A1["Check electionTimeout >= 10x heartbeatInterval, JVM GC pauses, and preVoteEnabled = true"]
+    Q1 -->|"No"| Q2{"Client Writes Stalling?"}
+    Q2 -->|"Yes"| A2["Verify BecomeLeader No-Op, Follower fsync latency, and Quorum reachability"]
+    Q2 -->|"No"| Q3{"Suspected Stale Read / Split-Brain?"}
+    Q3 -->|"Yes"| A3["Audit StableStore fsync durability, Persist-before-Send order, and ReadIndex vs Lease skew"]
+    Q3 -->|"No"| A4["Monitor Log Compaction (Snapshots) & Demote Chronic Slow Followers to Learner"]
+```
+
 When debugging a Raft cluster, check these in order:
 
 | Check | How | What It Tells You |

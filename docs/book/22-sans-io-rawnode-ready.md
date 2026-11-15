@@ -22,27 +22,24 @@ In this library, `raft-core` has **zero third-party dependencies** (`libraryDepe
 
 ## Architectural Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         HOST SYSTEM (Your Code)                         │
-│   Timers / Event Loop  ·  WAL / RocksDB / Mmap  ·  TCP / gRPC / Actors  │
-└──────────┬─────────────────────────▲────────────────────────┬───────────┘
-           │ 1. tick()               │ 3. ready()             │ 4. advance(rd)
-           │    step(from, msg)      │    Ready {             │    -> LightReady
-           │    propose(bytes)       │      messages,         │
-           │    readIndex(ctx)       │      entries,          │
-           ▼                         │      hardState,        ▼
-┌────────────────────────────────────┴────────────────────────────────────┐
-│                    raft-core: RawNode (Zero I/O)                        │
-│                                                                         │
-│  ┌──────────────────┐  ┌─────────────────────────┐  ┌────────────────┐  │
-│  │  Role & Clocks   │  │    ProgressTracker      │  │ Unstable Log   │  │
-│  │  Follower /      │  │  Probe / Replicate /    │  │ Overlay +      │  │
-│  │  PreCandidate /  │  │  Snapshot + Inflights   │  │ Read-Only      │  │
-│  │  Candidate /     │  │  Dual Joint Quorum      │  │ RaftStorage    │  │
-│  │  Leader          │  └─────────────────────────┘  └────────────────┘  │
-│  └──────────────────┘                                                   │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Host["Host System (Your Event Loop, WAL / RocksDB, TCP / gRPC / Actors)"]
+        DRV["1. Drive Inputs: tick() · step(from, msg) · propose(bytes) · readIndex(ctx)"]
+        RDY["2. Poll Batch: ready() -> Ready (entries, hardState, messages, persistedMessages, committedEntries)"]
+        ADV["3. Persist & Acknowledge: advance(rd) -> LightReady"]
+    end
+
+    subgraph Core["raft-core: RawNode (Zero External Dependencies, Zero I/O)"]
+        ROLE["Role & Logical Clocks (Follower · PreCandidate · Candidate · Leader)"]
+        PROG["ProgressTracker (Probe · Replicate · Snapshot + Inflights + Joint Quorum)"]
+        UNST["Unstable Log Overlay + Read-Only RaftStorage"]
+    end
+
+    DRV --> Core
+    Core --> RDY
+    RDY --> ADV
+    ADV --> Core
 ```
 
  Notice a critical directional rule borrowed from `tikv/raft-rs`:
@@ -79,19 +76,14 @@ Why synchronous? Because consensus state machines need fast `term(prevLogIndex)`
 
 A naive Raft leader blasts `AppendEntries` to every peer on every write regardless of whether that peer is online, lagging by 500,000 entries, or recovering from a partition. `RawNode` instead tracks each voter, learner, and witness through a 3-state machine modeled on `tikv/raft-rs`:
 
-```
-                  matched & moved
-     ┌─────────┐ ───────────────► ┌─────────────┐
-     │  Probe  │                  │  Replicate  │
-     │ (max 1) │ ◄─────────────── │ (pipelined) │
-     └────┬────┘  reject / stall  └──────┬──────┘
-          │                              │
-          │ log compacted                │ log compacted
-          ▼                              ▼
-     ┌──────────────────────────────────────────┐
-     │                 Snapshot                 │
-     │   (paused until snapshotIndex matched)   │
-     └──────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Probe
+    Probe --> Replicate: Follower ACK advances matchIndex
+    Replicate --> Probe: Reject (conflict hint) or stalled heartbeat
+    Probe --> Snapshot: Needed entry < storage.firstIndex (compacted)
+    Replicate --> Snapshot: Needed entry < storage.firstIndex (compacted)
+    Snapshot --> Probe: Snapshot installed (matchIndex >= pendingSnapshot)
 ```
 
 1. **`Probe`**: Used right after an election or after a rejection/packet drop. At most **one** probe RPC is in flight (`paused = true` until ACK/NACK). Rejections carry `(conflictTerm, conflictIndex)` hints so the leader jumps backward over entire conflicting terms in a single RTT instead of decrementing `nextIndex` one entry at a time.

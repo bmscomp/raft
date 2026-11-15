@@ -25,6 +25,18 @@ Whether you're learning about distributed consensus for the first time or design
 
 > **Who is this for?** Software engineers who want to understand distributed consensus beyond the abstract. You should be comfortable reading Scala (or any typed functional language), but deep Scala expertise isn't required — the code is deliberately straightforward.
 
+```mermaid
+flowchart LR
+    P1["Part I: Foundations (Ch 1-4)"] --> P2["Part II: Library Architecture (Ch 5-7)"]
+    P2 --> P3["Part III: Building Clusters (Ch 8-11)"]
+    P2 --> P8["Part VIII: Sans-I/O & DST (Ch 22-24)"]
+    P3 --> P4["Part IV: Case Studies (Ch 12-15)"]
+    P4 --> P5["Part V: Ecosystem (Ch 16)"]
+    P4 --> P6["Part VI: Operations & Testing (Ch 17-20)"]
+    P6 --> P7["Part VII: Multi-Raft Scaling (Ch 21)"]
+    P8 --> P6
+```
+
 ---
 
 ## Table of Contents

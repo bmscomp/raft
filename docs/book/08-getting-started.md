@@ -123,17 +123,17 @@ The step-by-step walkthrough above manually fed events and collected effects. A 
 ```mermaid
 flowchart LR
     subgraph Sources["Event Sources"]
-        N[Network Messages]
-        ET[Election Timer]
-        HT[Heartbeat Timer]
+        N["Network Messages"]
+        ET["Election Timer"]
+        HT["Heartbeat Timer"]
     end
 
-    M["FS2 merge\n(concurrent)"] --> P["RaftLogic.onMessage\n(sequential)"]
+    M["FS2 merge (concurrent)"] --> P["RaftLogic.onMessage (sequential)"]
     N --> M
     ET --> M
     HT --> M
 
-    P --> E["Effect Interpreter\n(pattern match)"]
+    P --> E["Effect Interpreter (pattern match)"]
     E --> Send["SendMessage"]
     E --> Persist["PersistHardState"]
     E --> Append["AppendLogs"]

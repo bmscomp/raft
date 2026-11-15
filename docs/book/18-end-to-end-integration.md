@@ -18,11 +18,11 @@ The `RaftNode` class handles all of these concerns:
 
 ```mermaid
 flowchart TB
-    subgraph RaftNode["RaftNode[IO, MyCommand]"]
+    subgraph RaftNode["RaftNode[IO]"]
         direction TB
-        ML["Message Loop\n(FS2 Stream)"]
-        EI["Effect Interpreter\n(pattern match)"]
-        SR["State Ref\n(cats.effect.Ref)"]
+        ML["Message Loop (FS2 Stream)"]
+        EI["Effect Interpreter (pattern match)"]
+        SR["State Ref (cats.effect.Ref)"]
     end
 
     subgraph SPIs["SPI Implementations"]
@@ -197,15 +197,15 @@ class IntegrationSpec extends AnyFlatSpec:
 ```mermaid
 flowchart TB
     subgraph DC1["Data Center 1"]
-        N1["RaftNode-1\n(Leader)"]
+        N1["RaftNode-1 (Leader)"]
     end
 
     subgraph DC2["Data Center 2"]
-        N2["RaftNode-2\n(Follower)"]
+        N2["RaftNode-2 (Follower)"]
     end
 
     subgraph DC3["Data Center 3"]
-        N3["RaftNode-3\n(Follower)"]
+        N3["RaftNode-3 (Follower)"]
     end
 
     N1 <-->|"gRPC / TCP"| N2

@@ -26,6 +26,34 @@ The Raft library guarantees correctness of the **consensus protocol**. But your 
 
 ## Building a Chaos Test Framework
 
+```mermaid
+flowchart TD
+    Seed["Seeded Random Generator (seed = 42)"]
+    Workload["Client Workload (Concurrent Proposals & Reads)"]
+    Nemesis["ChaosAgent (KillLeader / PartitionLeader / RestartNode / HealAll)"]
+
+    subgraph Cluster["SimulatedCluster (In-Memory)"]
+        Net["SimulatedNetwork (Partition Matrix & Delays)"]
+        Nodes["Raft Nodes (Node 1, Node 2, Node 3)"]
+        SMs["Application StateMachines"]
+        Net <--> Nodes --> SMs
+    end
+
+    History["Recorded Operation History"]
+    Inv1["Invariant 1: State Machine Replica Convergence"]
+    Inv2["Invariant 2: WGL Linearizability Check"]
+    Inv3["Invariant 3: Acknowledged Write Durability"]
+
+    Seed --> Workload
+    Seed --> Nemesis
+    Workload --> Cluster
+    Nemesis --> Cluster
+    Workload --> History
+    SMs --> Inv1
+    History --> Inv2
+    History --> Inv3
+```
+
 ### The simulated cluster
 
 Use the library's in-memory infrastructure to build a fully controlled cluster:

@@ -8,31 +8,16 @@
 
 Before diving into code, let's trace the complete lifecycle of a client write through the cluster. Understanding this flow is essential for designing applications on top of Raft.
 
-```
-  Client ──("SET x=1")──→ Leader (Node-1)
-                              │
-                         1. Encode command as Log entry
-                         2. Append to local log
-                         3. Send AppendEntries to all followers
-                              │
-                    ┌─────────┼─────────┐
-                    ▼                   ▼
-               Node-2               Node-3
-           (accepts entry)      (accepts entry)
-                    │                   │
-                    └────────┬──────────┘
-                             │
-                    Majority (3/3) replicated
-                             │
-                    ┌────────▼────────┐
-                    │   COMMITTED     │
-                    │  commitIndex↑   │
-                    └────────┬────────┘
-                             │
-                    ┌────────┼────────┐
-                    ▼        ▼        ▼
-                  FSM-1    FSM-2    FSM-3
-            (apply "SET x=1" → state machine updates)
+```mermaid
+flowchart TD
+    C["Client: SET x=1"] --> L["Leader (Node-1): Encode Log & Append Locally"]
+    L -->|"AppendEntries"| N2["Node-2 (Accepts Entry)"]
+    L -->|"AppendEntries"| N3["Node-3 (Accepts Entry)"]
+    N2 --> Q["Majority Replicated (3/3) -> Advance commitIndex"]
+    N3 --> Q
+    Q --> F1["FSM-1: apply(SET x=1)"]
+    Q --> F2["FSM-2: apply(SET x=1)"]
+    Q --> F3["FSM-3: apply(SET x=1)"]
 ```
 
 The key insight: **replication and commitment are not the same thing.** An entry is replicated when it exists in a follower's log. An entry is committed when a majority of nodes have replicated it. Only committed entries are applied to the state machine and reported to clients. This distinction is what makes Raft safe — even if some followers are slow, the client only sees a success after the data is durable on a majority.
@@ -120,23 +105,21 @@ sequenceDiagram
 
 Here's a concrete scenario:
 
-```
-Leader's log:    [idx:1 t:1] [idx:2 t:1] [idx:3 t:2] [idx:4 t:2]
-Follower's log:  [idx:1 t:1] [idx:2 t:1] [idx:3 t:1] [idx:4 t:1]
-                                           ↑           ↑
-                                    Different terms! Entries 3,4 conflict.
+```mermaid
+flowchart LR
+    subgraph LeaderLog["Leader Log (Term 2)"]
+        L1["idx:1 t:1"] --> L2["idx:2 t:1"] --> L3["idx:3 t:2"] --> L4["idx:4 t:2"]
+    end
+
+    subgraph FollowerLog["Follower Log (Stale Entries 3-4)"]
+        F1["idx:1 t:1"] --> F2["idx:2 t:1 (Match Point)"] --> F3["idx:3 t:1 (Conflict)"] --> F4["idx:4 t:1 (Conflict)"]
+    end
 ```
 
-The follower accepted entries 3 and 4 from a previous leader in term 1. The current leader (in term 2) has different entries at those indices. The consistency check catches this:
+The follower accepted entries 3 and 4 from a previous leader in term 1. The current leader (in term 2) has different entries at those indices. The consistency check catches this in two steps:
 
-```
-Step 1: Leader sends AppendEntriesRequest(prevLogIndex=4, prevLogTerm=2)
-        Follower checks: "Do I have term 2 at index 4?" → No, I have term 1 → REJECT
-
-Step 2: Leader decrements: AppendEntriesRequest(prevLogIndex=2, prevLogTerm=1)
-        Follower checks: "Do I have term 1 at index 2?" → Yes! → ACCEPT
-        Follower truncates entries 3+ and appends the leader's entries
-```
+1. **Step 1**: Leader sends `AppendEntriesRequest(prevLogIndex=4, prevLogTerm=2)`. Follower checks index 4, finds term `1 != 2`, and rejects.
+2. **Step 2**: Leader backs up to `AppendEntriesRequest(prevLogIndex=2, prevLogTerm=1)`. Follower confirms term `1` at index 2, truncates conflicting entries `3..4`, and appends the leader's entries.
 
 In code:
 

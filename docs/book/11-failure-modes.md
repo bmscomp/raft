@@ -28,18 +28,21 @@ Raft resolves this tension through **terms** — monotonically increasing epoch 
 
 This is the canonical Raft failure mode, the one you'll find in every distributed systems textbook. A three-node cluster is humming along. The leader (Node A) receives a client write, appends entry E₃ at index 3, and begins replicating it:
 
-```
-Time      Node A (Leader)     Node B (Follower)    Node C (Follower)
-────      ─────────────────   ──────────────────   ──────────────────
-t₁        append E₃ locally
-t₂        send AE to B ──→   receive E₃ ✓
-t₃        send AE to C ──→
-t₄        ╳ CRASH             
-t₅                            (waiting...)          (AE never arrives)
-t₆                            election timeout
-t₇                            ──→ RequestVote ──→
-t₈                                                  grants vote
-t₉                            becomes Leader (term+1)
+```mermaid
+sequenceDiagram
+    participant NA as Node A (Leader)
+    participant NB as Node B (Follower)
+    participant NC as Node C (Follower)
+
+    Note over NA: t1: append E3 locally
+    NA->>NB: t2: AppendEntries(E3)
+    Note over NB: Receive E3
+    NA--xNC: t3: AppendEntries(E3) lost
+    Note over NA: t4: CRASH!
+    Note over NB,NC: t5-t6: Election timeout fires on Node B
+    NB->>NC: t7: RequestVote(term + 1)
+    NC-->>NB: t8: VoteGranted
+    Note over NB: t9: Becomes Leader (term + 1)
 ```
 
 Node A crashed after replicating E₃ to B but before replicating it to C. Node B has E₃. Node C does not. Node B wins the election.
@@ -78,30 +81,24 @@ This function is the reason committed entries can never be lost. If E₃ is comm
 
 The logic is deceptively simple — four lines of code. But those four lines are the load-bearing wall of the entire Raft safety proof.
 
-### Timeline Diagram
+### Post-Crash Log State
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Leader Crash Mid-Replication                     │
-│                                                                     │
-│  Node A (Leader, term=5)                                            │
-│  ┌────────┐  ┌────────┐  ┌────────┐                                 │
-│  │ E₁ t=5 │  │ E₂ t=5 │  │ E₃ t=5 │  ← appended, not yet committed. │
-│  └────────┘  └────────┘  └────────┘                                 │
-│       │           │           │                                     │
-│       │           │     replication                                 │
-│       ▼           ▼       ┌───┴───┐                                 │
-│                           │  ╳    │  ← crash before C receives E₃   │
-│                           └───────┘                                 │
-│                                                                     │
-│  Node B (has E₃)                 Node C (missing E₃)                │
-│  ┌────────┐  ┌────────┐  ┌────────┐     ┌────────┐  ┌────────┐      │
-│  │ E₁ t=5 │  │ E₂ t=5 │  │ E₃ t=5 │     │ E₁ t=5 │  │ E₂ t=5 │      │
-│  └────────┘  └────────┘  └────────┘     └────────┘  └────────┘      │
-│                                                                     │
-│  If B wins election → E₃ preserved (will be committed with new term)│
-│  If C wins election → E₃ lost (acceptable: was never committed)     │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Crash["Node A (Crashed Leader, term=5)"]
+        A1["E1 t=5"] --> A2["E2 t=5"] --> A3["E3 t=5 (uncommitted)"]
+    end
+
+    subgraph NodeB["Node B (Received E3)"]
+        B1["E1 t=5"] --> B2["E2 t=5"] --> B3["E3 t=5"]
+    end
+
+    subgraph NodeC["Node C (Missing E3)"]
+        C1["E1 t=5"] --> C2["E2 t=5"]
+    end
+
+    NodeB -->|"If B wins election"| OUT1["E3 preserved & committed once B commits a new-term entry"]
+    NodeC -->|"If C wins election"| OUT2["E3 discarded (safe: E3 was never committed)"]
 ```
 
 ### What Can Go Wrong in Your Runtime
@@ -120,16 +117,18 @@ The library's pure logic handles this correctly. But your runtime can still brea
 
 A five-node cluster splits into two partitions: {A, B} and {C, D, E}. Node A is the current leader.
 
-```
-  Partition 1 (minority)          Partition 2 (majority)
-  ┌──────────────────┐          ┌──────────────────────────┐
-  │                  │          │                          │
-  │   A (Leader)     │  ╳ ╳ ╳   │   C (Follower)           │
-  │   B (Follower)   │  ╳ ╳ ╳   │   D (Follower)           │
-  │                  │          │   E (Follower)           │
-  └──────────────────┘          └──────────────────────────┘
-         ↑                                  ↑
-    stale leader                    will elect new leader
+```mermaid
+flowchart LR
+    subgraph P1["Partition 1: Minority (Stale Leader, Cannot Commit)"]
+        NA["Node A (Old Leader)"] <--> NB["Node B (Follower)"]
+    end
+
+    subgraph P2["Partition 2: Majority (3/5 Quorum, Elects New Leader)"]
+        NC["Node C (New Leader)"] <--> ND["Node D (Follower)"]
+        NC <--> NE["Node E (Follower)"]
+    end
+
+    P1 -. "X Network Partition X" .- P2
 ```
 
 ### Why This Is Subtle
@@ -217,20 +216,18 @@ Suppose S1 commits the entry and then crashes. S5 wakes up with its entry at (in
 
 A committed entry was just overwritten. The State Machine Safety property is violated. Any client that was told "your write at index 2 is durable" was lied to.
 
-```
-The Figure 8 Failure:
+```mermaid
+flowchart TD
+    subgraph Logs["Cluster Logs at Step 3 (S1 is Leader in Term 4)"]
+        S1["S1 (Leader T4): [1:t=1] -> [2:t=2]"]
+        S2["S2 (Follower):  [1:t=1] -> [2:t=2]"]
+        S3["S3 (Follower):  [1:t=1] -> [2:t=2]"]
+        S4["S4 (Follower):  [1:t=1]"]
+        S5["S5 (Offline):   [1:t=1] -> [2:t=3] (Higher Term!)"]
+    end
 
-        Index:     1      2
-        ──────────────────────
-S1  →   │ t=1  │  t=2  │     ← leader term 4, replicated to majority
-S2      │ t=1  │  t=2  │     ← has entry
-S3      │ t=1  │  t=2  │     ← just received entry
-S4      │ t=1  │       │
-S5      │ t=1  │  t=3  │     ← different entry, higher term!
-        ──────────────────────
-
-If S1 commits (index=2, term=2) and crashes,
-S5 can win election (its term 3 > term 2) and overwrite "committed" data.
+    Logs --> BAD["Naive Commit of (2, t=2): S1 crashes -> S5 wins T5 (t=3 > t=2) & overwrites index 2!"]
+    Logs --> GOOD["Raft Rule: S1 appends & commits (3, t=4) first -> S5 can no longer win election"]
 ```
 
 ### Raft's Fix: The Current-Term Commitment Rule
@@ -274,12 +271,11 @@ case BecomeLeader => // runtime appends no-op entry with leader's term
 
 Three nodes, no current leader. All three election timers fire at roughly the same moment. Each node votes for itself and broadcasts `RequestVote` to the others. Node A votes for itself and receives Node B's vote request — but A already voted for itself, so it rejects. Node B votes for itself and rejects A's request. Node C does the same. Nobody gets a majority.
 
-```
-Node A: votes for A → rejects B → rejects C → 1 vote (needs 2)
-Node B: votes for B → rejects A → rejects C → 1 vote (needs 2)
-Node C: votes for C → rejects A → rejects B → 1 vote (needs 2)
-
-Result: no leader elected. Entire round wasted.
+```mermaid
+flowchart LR
+    NA["Node A (Voted: A -> 1/3)"] -->|"Rejects"| NB["Node B (Voted: B -> 1/3)"]
+    NB -->|"Rejects"| NC["Node C (Voted: C -> 1/3)"]
+    NC -->|"Rejects"| NA
 ```
 
 ### Why It Matters
@@ -326,11 +322,16 @@ Node D is partitioned from the rest of the cluster. It doesn't know the leader i
 
 When the partition heals, Node D's term is enormous — say, term 47 — while the rest of the cluster is at term 5. Node D sends a message with term 47. Every node that receives it immediately steps down to follower in term 47 (the term rule). The current leader is deposed. A new election begins, unnecessarily.
 
-```
-Before partition heals:          After partition heals:
-  Cluster: term 5 (stable)        Node D sends msg with term 47
-  Node D: term 47 (inflated)      All nodes step down → term 47
-                                   Needless election disruption
+```mermaid
+sequenceDiagram
+    participant C as Healthy Cluster (Leader in Term 5)
+    participant D as Partitioned Node D (Inflated Term 47)
+
+    Note over C,D: Before heal: Cluster stable at Term 5, Node D isolated at Term 47
+    Note over C,D: Network partition heals
+    D->>C: RequestVote(term = 47)
+    Note over C: Term 47 > Term 5 -> Leader immediately steps down!
+    Note over C: Needless cluster-wide election disruption
 ```
 
 ### The Theory: Why Terms Are Dangerous
@@ -381,13 +382,13 @@ This is carefully designed: pre-votes don't consume the real vote, so a pre-vote
 
 In a five-node cluster, one follower (Node E) has a degraded disk. It takes 50ms to fsync each `AppendLogs` effect instead of the usual 2ms. Without parallel replication, the leader sends entries sequentially:
 
-```
-Leader → Node B: 2ms → ack
-Leader → Node C: 2ms → ack
-Leader → Node D: 2ms → ack
-Leader → Node E: 50ms → ack
-                  ─────
-                  Total: 56ms per round
+```mermaid
+flowchart LR
+    L["Leader"] -->|"2ms"| NB["Node B"]
+    NB -->|"2ms"| NC["Node C"]
+    NC -->|"2ms"| ND["Node D"]
+    ND -->|"50ms (Slow Disk)"| NE["Node E"]
+    NE --> TOT["Total Sequential Round: 56ms (vs 2ms Parallel Quorum)"]
 ```
 
 But the commit only requires a majority (3 of 5). With sequential replication, the commit latency is dominated by the third-fastest node (Node D, 6ms cumulative), but the leader doesn't send the next batch until Node E responds (56ms total). The slow follower is holding the entire cluster hostage.
@@ -427,11 +428,15 @@ With parallel replication enabled, commit latency becomes `max(third-fastest)` r
 
 A follower has been offline for a long time. The leader's log has been compacted — entries before index 10,000 have been replaced by a snapshot. The follower comes back online with only entries up to index 500. The leader cannot send entries 501–10,000 because they no longer exist in the log. The leader must send a snapshot instead.
 
-```
-Leader's log:  [snapshot @ 10000] [10001] [10002] [10003] ...
-Follower's log: [1] [2] [3] ... [500]
+```mermaid
+flowchart LR
+    subgraph Leader["Leader Log (Compacted)"]
+        SNAP["Snapshot @ 10,000"] --> L1["10,001"] --> L2["10,002"] --> L3["10,003"]
+    end
 
-Gap: entries 501-10000 are gone. Only the snapshot covers them.
+    subgraph Follower["Lagging Follower Log"]
+        F1["1 .. 500"] -. "Gap: 501..10,000 discarded" .-> SNAP
+    end
 ```
 
 ### What Goes Wrong
@@ -482,21 +487,15 @@ That's the *safe* direction — the leader's clock is fast, so it stops serving 
 
 **The leader's clock runs 20ms slow.** The followers' clocks reach T=200 while the leader's clock reads T=180. From the leader's perspective, its lease is still valid (20ms remaining). But the followers may have already started an election, and a new leader may exist. The old leader is serving reads from a state machine that might already be stale compared to the new leader's.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│              Clock Skew and Lease Reads                       │
-│                                                             │
-│  Leader's clock:     ...178  179  180  181  182  183...     │
-│  Follower's clock:   ...198  199  200  201  202  203...     │
-│   (20ms ahead)                    ↑                         │
-│                                   │                         │
-│                           Followers may                     │
-│                            elect new leader                 │
-│                                                             │
-│  Leader thinks:  "lease valid until my T=200"               │
-│  Reality:        followers already in new term               │
-│  Risk:           stale reads for 20ms                        │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant L as Old Leader (Clock 20ms Slow)
+    participant F as Followers (True Time)
+
+    Note over L,F: Heartbeat quorum granted lease until T = 200
+    Note over F: Follower clock = 200 -> Lease expired, elect New Leader!
+    Note over L: Leader clock = 180 -> Believes lease still valid for 20ms!
+    Note over L: Hazard Window (20ms): Old Leader may serve stale local reads
 ```
 
 ### The Theory: Why Clocks Are Fundamentally Unreliable
@@ -540,10 +539,10 @@ The Raft paper (§6) originally proposed single-step membership changes — dire
 
 Joint consensus (from the Raft dissertation) eliminates this window by requiring both configurations to agree during the transition. The cost is complexity:
 
-```
-Normal operation:        Majority of {A, B, C} = 2
-Joint consensus:         Majority of {A, B, C} = 2 AND majority of {A, B, C, D} = 3
-After transition:        Majority of {A, B, C, D} = 3
+```mermaid
+flowchart LR
+    OLD["C_old: Majority of {A, B, C} = 2"] --> JOINT["C_old,new: 2 of {A, B, C} AND 3 of {A, B, C, D}"]
+    JOINT --> NEW["C_new: Majority of {A, B, C, D} = 3"]
 ```
 
 ### Practical Advice
@@ -575,35 +574,25 @@ To wrap up, here is a systematic classification of the failure modes we've cover
 | Membership change instability | Protocol | Election Safety | Joint consensus, staged changes |
 
 ```mermaid
-mindmap
-  root((Raft Failures))
-    Node Failures
-      Leader crash
-        Uncommitted: lost ✓
-        Committed: preserved ✓
-      Follower crash
-        Log catch-up
-        Snapshot transfer
-    Network Failures
-      Partition
-        Stale reads
-        Term inflation
-      Asymmetric partition
-        One-way heartbeat failure
-    Protocol Edge Cases
-      Figure 8
-        Current-term commit rule
-      Split vote
-        Randomized timeouts
-      Membership change
-        Joint consensus
-    Infrastructure
-      Clock skew
-        Lease read violations
-      Disk failure
-        Lost persistence
-      Correlated failures
-        Thundering herd
+flowchart TD
+    ROOT["Raft Failure Modes"]
+
+    ROOT --> NF["Node Failures"]
+    NF --> NF1["Leader Crash (isLogUpToDate preserves committed entries)"]
+    NF --> NF2["Follower Crash (AppendEntries / InstallSnapshot catch-up)"]
+
+    ROOT --> NET["Network Failures"]
+    NET --> NET1["Partition (ReadIndex prevents stale reads)"]
+    NET --> NET2["Term Inflation (Pre-Vote prevents disruption)"]
+
+    ROOT --> PROTO["Protocol Edge Cases"]
+    PROTO --> PR1["Figure 8 (Current-term commit rule)"]
+    PROTO --> PR2["Split Vote (Randomized election timeouts)"]
+    PROTO --> PR3["Membership Change (Joint consensus dual quorum)"]
+
+    ROOT --> INFRA["Infrastructure Hazards"]
+    INFRA --> IN1["Clock Skew (maxClockSkew guard or ReadIndex)"]
+    INFRA --> IN2["Slow Disk / Correlated Load (Parallel replication & Learners)"]
 ```
 
 ---

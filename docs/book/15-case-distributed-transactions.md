@@ -15,25 +15,22 @@ A key-value store (Chapter 10) lets you read and write individual keys atomicall
 
 Without transactions, concurrent operations on multiple keys can leave the system in an **inconsistent state**. Here's the classic example:
 
-```
-Time  Client-1                         Client-2
-─────────────────────────────────────────────────────
-  1   Read balance(A) = 500
-  2                                    Read balance(A) = 500
-  3                                    Read balance(B) = 300
-  4   Read balance(B) = 300
-  5   Write balance(A) = 400 }         
-  6   Write balance(B) = 400 } transfer $100
-  7                                    Write balance(A) = 400 }
-  8                                    Write balance(B) = 400 } transfer $100
+```mermaid
+sequenceDiagram
+    participant C1 as Client-1 (Transfer $100)
+    participant DB as Untransactional KV Store (A=500, B=300)
+    participant C2 as Client-2 (Transfer $100)
 
-Result: A=400, B=400 (total $800 instead of $800)
-Wait — the total is still $800? Let's check: before, A=500+B=300=$800.
-After, A=400+B=400=$800. Seems fine?
-
-No. Two transfers of $100 happened, but A only decreased by $100. One transfer was lost.
-The correct result should be A=300, B=500 (two transfers: 500→400→300, 300→400→500).
+    C1->>DB: 1. Read balance(A) -> 500
+    C2->>DB: 2. Read balance(A) -> 500
+    C2->>DB: 3. Read balance(B) -> 300
+    C1->>DB: 4. Read balance(B) -> 300
+    C1->>DB: 5-6. Write A = 400, B = 400
+    C2->>DB: 7-8. Write A = 400, B = 400 (Overwrites C1!)
+    Note over DB: Final: A=400, B=400 (Expected A=300, B=500 -> One transfer lost!)
 ```
+
+Two transfers of \$100 happened, yet `A` only decreased by \$100 (`A=400, B=400` instead of `A=300, B=500`). One transfer was silently lost.
 
 The root cause is a **write-write conflict** — both clients read the same initial value and then overwrote each other's changes. This is the classic "lost update" anomaly.
 
@@ -41,27 +38,14 @@ The root cause is a **write-write conflict** — both clients read the same init
 
 The key insight: Raft's log already provides **total ordering**. Every log entry has a unique index, and entries are applied in index order on every node. If we encode each transaction as a **single log entry**, the state machine applies transactions one at a time, sequentially. This gives us **serializable isolation** — the gold standard of transaction isolation levels — essentially for free.
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    Transaction Flow                           │
-│                                                               │
-│  Client                                                       │
-│    │ submit(Transaction)                                      │
-│    ▼                                                          │
-│  Leader                                                       │
-│    │ encode → single Log entry                                │
-│    │ replicate via Raft (same as any other write)             │
-│    ▼                                                          │
-│  Committed (replicated to majority)                           │
-│    │                                                          │
-│    ▼                                                          │
-│  StateMachine.apply(log)                                      │
-│    │ decode transaction                                       │
-│    │ validate preconditions (CAS checks against live state).  │
-│    │ if all checks pass → apply all operations → Committed    │
-│    │ if any check fails → reject entire txn → ConflictDetected│
-│    │ if decode error → Aborted                                │ 
-└───────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    C["Client: submit(Transaction)"] --> L["Leader: Encode as Single Log Entry & Replicate"]
+    L --> Q["Committed (Majority Replicated)"]
+    Q --> SM["StateMachine.apply(log): Decode & Validate CAS Preconditions"]
+    SM -->|"All preconditions match"| OK["Apply All Operations Atomically -> Committed"]
+    SM -->|"Any CAS check mismatches"| CF["Reject Entire Transaction -> ConflictDetected"]
+    SM -->|"Malformed payload"| AB["Reject -> Aborted"]
 ```
 
 This design is often called **OCC** (Optimistic Concurrency Control). The "optimistic" part means: the client prepares the transaction based on its view of the state, submits it, and hopes no conflicting transaction committed in the meantime. If a conflict is detected at apply time, the transaction is rejected and the client retries. This is in contrast to **pessimistic** concurrency control (locking), which prevents conflicts by blocking concurrent access.

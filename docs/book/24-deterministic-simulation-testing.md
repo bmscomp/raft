@@ -30,37 +30,14 @@ If Seed `2` fails at Step `127` in CI, re-running Seed `2` on your laptop six mo
 
 Because `RawNode` accepts an `initialSeed: Long` for its internal election-timeout jitter PRNG and performs zero I/O, the entire simulator is ~200 lines of pure Scala (`DeterministicSimulationSpec`):
 
-```
-                      64-bit Master Seed
-                              │
-                              ▼
-               ┌──────────────────────────────┐
-               │   Deterministic PRNG         │
-               │   (Ticks · Faults · Delays)  │
-               └──────┬───────────────┬───────┘
-                      │               │
-       ┌──────────────▼──┐         ┌──▼─────────────────────┐
-       │ Fault Scheduler │         │ Priority Queue Network │
-       │ • Partition     │         │ • Packet drop (12%)    │
-       │ • Asymmetric    │         │ • Duplicate (6%)       │
-       │ • Heal          │         │ • Reorder (1..5 steps) │
-       │ • Crash/Restart │         └──────────┬─────────────┘
-       └──────┬──────────┘                    │
-              │                               ▼
-        ┌─────▼───────────────────────────────────────┐
-        │   Nodes n1 .. n5: (RawNode, MemStorage)     │
-        │   Ready -> persistReady -> advance -> Light │
-        └─────────────────────┬───────────────────────┘
-                              │ Every step!
-                              ▼
-        ┌─────────────────────────────────────────────┐
-        │   Global 5-Invariant Safety Oracle          │
-        │   1. Election Safety                        │
-        │   2. Leader Append-Only                     │
-        │   3. Log Matching                           │
-        │   4. Leader Completeness                    │
-        │   5. State Machine Safety                   │
-        └─────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    SEED["64-Bit Master Seed"] --> PRNG["Deterministic PRNG (xorshift64)"]
+    PRNG --> FAULT["Fault Scheduler (Partitions, Asymmetric Links, Heals, Crash/Restart)"]
+    PRNG --> NET["Priority Queue Network (12% Drop, 6% Duplicate, 1-5 Step Reorder)"]
+    FAULT --> NODES["Cluster Nodes n1..n5: (RawNode, MemStorage) -> Ready -> persist -> advance -> LightReady"]
+    NET --> NODES
+    NODES -->|"Checked after every single step"| ORACLE["Global 5-Invariant Safety Oracle (Election, Append-Only, Log Matching, Completeness, FSM)"]
 ```
 
 ---
