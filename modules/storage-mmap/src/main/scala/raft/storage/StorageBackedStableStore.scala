@@ -25,7 +25,7 @@ class StorageBackedStableStore[F[_]: Monad](engine: StorageEngine[F])
 
   def setCurrentTerm(term: Term): F[Unit] =
     engine.readHardState.flatMap(s =>
-      engine.writeHardState(s.copy(currentTerm = term))
+      engine.writeHardState(s.copy(term = term.value))
     )
 
   def votedFor: F[Option[NodeId]] =

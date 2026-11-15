@@ -7,13 +7,22 @@ final case class BatchConfig(
     enabled: Boolean = false,
     maxSize: Int = 100,
     maxWait: FiniteDuration = 10.millis
-)
+):
+  require(maxSize > 0, s"BatchConfig.maxSize must be > 0, got $maxSize")
+  require(
+    maxWait >= Duration.Zero,
+    s"BatchConfig.maxWait must be >= 0, got $maxWait"
+  )
 
 /** Configuration for pipelining `AppendEntries` RPCs (`Inflights` window). */
 final case class PipelineConfig(
     enabled: Boolean = false,
     maxInflight: Int = 10
-)
+):
+  require(
+    maxInflight > 0,
+    s"PipelineConfig.maxInflight must be > 0, got $maxInflight"
+  )
 
 /** Configuration for a RAFT node.
   *
@@ -40,6 +49,26 @@ final case class RaftConfig(
     electionTimeoutTicks: Int = 10,
     heartbeatIntervalTicks: Int = 1
 ):
+  require(
+    electionTimeoutMin > Duration.Zero,
+    s"electionTimeoutMin must be > 0, got $electionTimeoutMin"
+  )
+  require(
+    electionTimeoutMax >= electionTimeoutMin,
+    s"electionTimeoutMax ($electionTimeoutMax) must be >= electionTimeoutMin ($electionTimeoutMin)"
+  )
+  require(
+    heartbeatInterval > Duration.Zero && heartbeatInterval < electionTimeoutMin,
+    s"heartbeatInterval ($heartbeatInterval) must be > 0 and < electionTimeoutMin ($electionTimeoutMin)"
+  )
+  require(
+    maxEntriesPerRequest > 0,
+    s"maxEntriesPerRequest must be > 0, got $maxEntriesPerRequest"
+  )
+  require(
+    heartbeatIntervalTicks > 0,
+    s"heartbeatIntervalTicks must be > 0, got $heartbeatIntervalTicks"
+  )
   require(
     electionTimeoutTicks > heartbeatIntervalTicks,
     "electionTimeoutTicks must exceed heartbeatIntervalTicks"

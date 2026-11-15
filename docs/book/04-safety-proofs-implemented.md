@@ -456,6 +456,28 @@ What makes this library unique is that all five properties are enforced in a sin
 
 ---
 
+## Extension Guards: Current-Term Commit Gate (§5.4.2, §6, §6.4)
+
+Two advanced protocol operations — **`ReadIndex` linearizable reads** and **dynamic membership changes (`proposeConfChange`)** — depend on an additional safety gate derived from Figure 8 (§5.4.2):
+
+> **A freshly elected leader in term `T` does not know the true cluster `commitIndex` (nor whether an uncommitted configuration from `< T` was partially replicated) until at least one entry from term `T` is committed.**
+
+```mermaid
+flowchart LR
+    E["Leader Elected in Term T"] --> N["Appends Mandatory NoOp (term = T)"]
+    N --> G{"term(commitIndex) == T?"}
+    G -->|"No (commitIndex == 0 or < T)"| R1["Reject ReadIndex (ReadIndexRejected)"]
+    G -->|"No (commitIndex == 0 or < T)"| R2["Reject ConfChange (LeaderNotReadyInTerm)"]
+    G -->|"Yes (NoOp committed)"| A["Safe to Serve ReadIndex & Propose Joint C_old,new"]
+```
+
+In code:
+
+- **`RaftLogic.onReadIndex`**: Checks `currentTermCommitted` — requiring `getTermAt(l.commitIndex).contains(l.term)` (and rejecting `commitIndex == 0` whenever `lastLogIndex > 0`, i.e., while the leader's initial `NoOp` is still in flight).
+- **`RawNode.proposeConfChange`**: Checks `hasCommittedInCurrentTerm(l.term)` before appending `LogType.Configuration`, returning `Left(RaftError.LeaderNotReadyInTerm(l.term))` if the leader's `NoOp` has not yet committed.
+
+---
+
 ## TLA+ Cross-Reference
 
 For readers interested in formal verification, the properties in this chapter correspond directly to the Raft TLA+ specification:

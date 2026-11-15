@@ -7,7 +7,6 @@ import scala.concurrent.duration.*
 import raft.state.*
 import raft.state.NodeState.*
 import raft.message.RaftMessage.*
-import raft.effect.Effect
 import raft.effect.Effect.*
 import raft.raw.{MemStorage, RawNode}
 
@@ -32,14 +31,6 @@ class LeaseReadSpec extends AnyFlatSpec with Matchers:
     config.leaderLeaseDuration shouldBe 100.millis
     config.leaseReadEnabled shouldBe true
     config.checkQuorumEnabled shouldBe true
-  }
-
-  "ExtendLease and LeaseReadReady effects" should "preserve values cleanly" in {
-    val extend: Effect = ExtendLease(untilTick = 1000L)
-    extend shouldBe ExtendLease(1000L)
-
-    val ready: Effect = LeaseReadReady("lease-read-123")
-    ready shouldBe LeaseReadReady("lease-read-123")
   }
 
   "CheckQuorumTimeout on partitioned Leader" should "force step-down to Follower and reject pending reads" in {

@@ -156,3 +156,24 @@ class RaftConfigSpec extends AnyFlatSpec with Matchers:
     val config = RaftConfig.default(node1)
     config.heartbeatInterval should be < config.electionTimeoutMin
   }
+
+  it should "reject invalid timeout ordering and non-positive batch sizes" in {
+    an[IllegalArgumentException] should be thrownBy RaftConfig(
+      localId = node1,
+      electionTimeoutMin = 300.millis,
+      electionTimeoutMax = 150.millis
+    )
+    an[IllegalArgumentException] should be thrownBy RaftConfig(
+      localId = node1,
+      electionTimeoutMin = 100.millis,
+      heartbeatInterval = 100.millis
+    )
+    an[IllegalArgumentException] should be thrownBy RaftConfig(
+      localId = node1,
+      maxEntriesPerRequest = 0
+    )
+    an[IllegalArgumentException] should be thrownBy RaftConfig(
+      localId = node1,
+      heartbeatIntervalTicks = 0
+    )
+  }

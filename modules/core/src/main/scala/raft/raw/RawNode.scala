@@ -190,6 +190,8 @@ final class RawNode(
       case l: Leader =>
         if l.transferTarget.isDefined then
           Left(RaftError.LeadershipTransferInProgress(l.transferTarget.get))
+        else if !hasCommittedInCurrentTerm(l.term) then
+          Left(RaftError.LeaderNotReadyInTerm(l.term))
         else if tracker.config.isInJointConsensus || hasUncommittedConfigEntry
         then Left(RaftError.ConfigurationChangeInProgress(tracker.config))
         else if !newMembers.values.exists(r =>
@@ -222,7 +224,7 @@ final class RawNode(
   def readIndex(requestCtx: String): Either[RaftError, Unit] =
     roleState match
       case l: Leader =>
-        if isSingleVoterQuorum && termAt(commitIdx).forall(_ == l.term) then
+        if isSingleVoterQuorum && hasCommittedInCurrentTerm(l.term) then
           readyReadStates = readyReadStates :+ ReadState(commitIdx, requestCtx)
           Right(())
         else if config.leaseReadEnabled && config.checkQuorumEnabled &&
@@ -707,9 +709,7 @@ final class RawNode(
                 lastIncludedIndex = snap.lastIncludedIndex,
                 lastIncludedTerm = snap.lastIncludedTerm,
                 offset = 0L,
-                data = snap.config
-                  .map(ClusterConfig.encode)
-                  .getOrElse(Array.emptyByteArray),
+                data = SnapshotMetadata.encodePayload(snap.config, snap.data),
                 done = true
               ),
               prePersist = true
@@ -1169,13 +1169,12 @@ final class RawNode(
           prePersist = true
         )
       else
-        val decodedCfg =
-          if req.data.nonEmpty then ClusterConfig.decode(req.data).toOption
-          else None
+        val (decodedCfg, stateBytes) = SnapshotMetadata.decodePayload(req.data)
         val meta = SnapshotMetadata(
           req.lastIncludedIndex,
           req.lastIncludedTerm,
-          decodedCfg
+          decodedCfg,
+          stateBytes
         )
         pendingSnapshotMeta = Some(meta)
         decodedCfg.foreach(applyClusterConfig)

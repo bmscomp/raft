@@ -1,25 +1,13 @@
 package raft.storage
 
 import cats.effect.Resource
-import raft.state.{Log, LogIndex, NodeId, Snapshot, Term}
+import raft.state.{Log, LogIndex, Snapshot, Term}
 
-/** Persistent hard state that must be fsync'd before responding to any RPC.
-  *
-  * The Raft paper (§5.2, Figure 2) requires these two values to survive
-  * crashes:
-  *   - '''currentTerm''' — prevents term regression and double voting
-  *   - '''votedFor''' — prevents granting a second vote in the same term
-  *
-  * @param currentTerm
-  *   the latest term this node has seen
-  * @param votedFor
-  *   the candidate this node voted for in the current term, if any
+/** Re-export canonical [[raft.state.HardState]] so all modules share a single
+  * runtime `HardState` type (`term` / `currentTerm`, `votedFor`,
+  * `commitIndex`).
   */
-case class HardState(currentTerm: Term, votedFor: Option[NodeId])
-
-object HardState:
-  /** Initial hard state before any election. */
-  val empty: HardState = HardState(Term.Zero, None)
+export raft.state.HardState
 
 /** Pluggable storage engine for all durable Raft state.
   *

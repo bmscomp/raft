@@ -138,10 +138,18 @@ final class MemStorage private (
     meta.config.foreach(cfg => clusterConfigVar = cfg)
     logsVar = logsVar.dropWhile(_.index <= meta.lastIncludedIndex)
 
-  def compactTo(compactIndex: Long): Unit =
+  def compactTo(
+      compactIndex: Long,
+      snapshotData: Array[Byte] = Array.emptyByteArray
+  ): Unit =
     term(compactIndex).foreach { compactTerm =>
       snapshotVar = Some(
-        SnapshotMetadata(compactIndex, compactTerm, Some(clusterConfigVar))
+        SnapshotMetadata(
+          compactIndex,
+          compactTerm,
+          Some(clusterConfigVar),
+          snapshotData
+        )
       )
       logsVar = logsVar.dropWhile(_.index <= compactIndex)
     }

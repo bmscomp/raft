@@ -168,6 +168,24 @@ When a leader persists its own `Ready.entries` and calls `rawNode.advance(rd)`, 
 
 ---
 
+## Self-Describing Snapshot Envelopes (`RSNP`) in `RawNode`
+
+When a follower lags behind `storage.firstIndex`, a Sans-I/O leader must transmit **both** the compacted `ClusterConfig` (voters, learners, witnesses) **and** the serialized state-machine snapshot bytes inside `InstallSnapshotRequest.data`.
+
+`SnapshotMetadata` provides a zero-dependency binary envelope (`magic = "RSNP"`, version `1`) with structural byte-array equality:
+
+```mermaid
+flowchart LR
+    SM["Leader SnapshotMetadata (config + data)"] --> ENC["SnapshotMetadata.encodePayload"]
+    ENC --> WIRE["InstallSnapshotRequest (RSNP Header + Config + State Bytes)"]
+    WIRE --> DEC["SnapshotMetadata.decodePayload"]
+    DEC --> RD["Follower Ready.snapshot (ClusterConfig + State Bytes)"]
+```
+
+On receipt, `RawNode` decodes the envelope, updates its `ProgressTracker` membership immediately if `config` is present, and surfaces the complete `SnapshotMetadata(lastIncludedIndex, lastIncludedTerm, config, data)` in `Ready.snapshot` so the host loop can atomically restore its state machine and truncate obsolete WAL entries.
+
+---
+
 ## Summary
 
 | Component | Role | Inspiration |

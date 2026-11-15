@@ -365,8 +365,8 @@ class RawNodeSpec extends AnyFlatSpec with Matchers:
       val _ = leaderRaw.propose(s"entry-$i".getBytes)
     val _ = pumpCluster(active)
 
-    // Compact leader's storage up to index 5 so follower n3 (at 0) needs Snapshot
-    leaderStore.compactTo(5L)
+    // Compact leader's storage up to index 5 with serialized state-machine snapshot bytes
+    leaderStore.compactTo(5L, "kv-state-at-5".getBytes)
     leaderStore.firstIndex shouldBe 6L
 
     // Reconnect n3 and trigger heartbeat/append
@@ -377,10 +377,58 @@ class RawNodeSpec extends AnyFlatSpec with Matchers:
 
     r3.commitIndex should be >= 5L
     s3.snapshotMetadata.map(_.lastIncludedIndex) shouldBe Some(5L)
+    s3.snapshotMetadata.map(m => new String(m.data)) shouldBe Some(
+      "kv-state-at-5"
+    )
 
     // Propose one more entry and confirm n3 now receives normal log entries!
     val _ = leaderRaw.propose("after-snap".getBytes)
     val _ = pumpCluster(all)
     r3.commitIndex shouldBe 7L
     leaderId should not be n3
+  }
+
+  it should "reject proposeConfChange before the leader commits an entry in its current term (§4.1)" in {
+    val cluster = ClusterConfig(Set(n1, n2, n3))
+    val (r1, s1) = mkNode(n1, cluster, seed = 1L, preVote = false)
+    val (r2, s2) = mkNode(n2, cluster, seed = 99L, preVote = false)
+
+    // Trigger election on r1 only and grant vote from r2, WITHOUT pumping NoOp replication yet
+    while !r1.state.isInstanceOf[Candidate] do r1.tick()
+    val rd1 = r1.ready()
+    s1.persistReady(rd1)
+    val _ = r1.advance(rd1)
+
+    r2.step(
+      n1,
+      raft.message.RaftMessage.RequestVoteRequest(
+        term = r1.currentTerm,
+        candidateId = n1,
+        lastLogIndex = 0L,
+        lastLogTerm = 0L
+      )
+    )
+    val rd2 = r2.ready()
+    s2.persistReady(rd2)
+    val voteResp = rd2.persistedMessages.head
+    val _ = r2.advance(rd2)
+
+    r1.step(n2, voteResp.message)
+    r1.state shouldBe a[Leader]
+    r1.commitIndex shouldBe 0L // Mandatory NoOp not yet replicated/committed!
+
+    val targetMembers = Map(
+      n1 -> NodeRole.Voter,
+      n2 -> NodeRole.Voter,
+      n3 -> NodeRole.Voter,
+      n4 -> NodeRole.Voter
+    )
+    r1.proposeConfChange(targetMembers) shouldBe Left(
+      RaftError.LeaderNotReadyInTerm(r1.currentTerm)
+    )
+
+    // Once NoOp commits across {n1, n2}, proposeConfChange succeeds!
+    val _ = pumpCluster(Map(n1 -> (r1, s1), n2 -> (r2, s2)))
+    r1.commitIndex shouldBe 1L
+    r1.proposeConfChange(targetMembers).isRight shouldBe true
   }

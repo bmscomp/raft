@@ -91,8 +91,20 @@ val newNodeId = NodeId("D")
 // On the leader: add D as a learner first so it catches up without affecting quorum
 val learnerConfig = currentConfig.addMember(newNodeId, NodeRole.Learner)
 // Via Sans-I/O RawNode:
-rawNode.proposeConfChange(learnerConfig)
+rawNode.proposeConfChange(learnerConfig.members)
 ```
+
+> **Handling `LeaderNotReadyInTerm` right after failover:** Under Ongaro §4.1, a freshly elected leader rejects `proposeConfChange` with `Left(RaftError.LeaderNotReadyInTerm(term))` until its mandatory initial `NoOp` entry commits in the new term. Control-plane operators should retry briefly with backoff when `LeaderNotReadyInTerm` is returned:
+>
+> ```scala
+> rawNode.proposeConfChange(learnerConfig.members) match
+>   case Right(logIdx) =>
+>     println(s"Appended C_old,new at index $logIdx")
+>   case Left(RaftError.LeaderNotReadyInTerm(term)) =>
+>     // Leader just won election in `term`; retry once its NoOp commits (~1 RTT)
+>   case Left(err) =>
+>     println(s"Rejected membership change: ${err.detail}")
+> ```
 
 **Why learner first?** If you add D directly as a voter, it starts with an empty log while A, B, C have millions of entries. Until D catches up, you effectively have a 4-node cluster where only 3 nodes can participate in quorum — one slow node can stall commits.
 
