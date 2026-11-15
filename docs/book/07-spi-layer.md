@@ -266,11 +266,11 @@ The state machine is where Raft meets your domain. Everything up to this point �
 ```scala
 trait StateMachine[F[_], R]:
   def apply(log: Log): F[R]
-  def snapshot: F[Array[Byte]]
-  def restore(data: Array[Byte]): F[Unit]
+  def snapshot: F[Stream[F, Byte]]
+  def restore(data: Stream[F, Byte]): F[Unit]
 ```
 
-The type parameter `R` is the **result type** — what the client sees after their command is applied. For a key-value store, `R` might be `Option[String]` (the value for GET operations, None for SET). For a counter, it might be `Long` (the new count).
+The type parameter `R` is the **result type** — what the client sees after their command is applied. Notice that `snapshot` and `restore` stream `fs2.Stream[F, Byte]` chunks rather than materializing a monolithic `Array[Byte]` in heap memory, allowing multi-gigabyte snapshots to stream directly between disk and network with constant memory overhead.
 
 ### The Determinism Contract
 
@@ -311,11 +311,11 @@ class KvStoreFSM[F[_]: Sync](
       case Delete(key) =>
         ref.update(_ - key).as(None)
 
-  def snapshot: F[Array[Byte]] =
-    ref.get.map(state => serialize(state))
+  def snapshot: F[Stream[F, Byte]] =
+    ref.get.map(state => Stream.emits(serialize(state)).covary[F])
 
-  def restore(data: Array[Byte]): F[Unit] =
-    ref.set(deserialize(data))
+  def restore(data: Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap(bytes => ref.set(deserialize(bytes)))
 ```
 
 ### Example: A Counter FSM
@@ -326,11 +326,11 @@ class CounterFSM[F[_]: Sync](ref: Ref[F, Long]) extends StateMachine[F, Long]:
     val delta = new String(log.data).toLong
     ref.updateAndGet(_ + delta)
 
-  def snapshot: F[Array[Byte]] =
-    ref.get.map(v => v.toString.getBytes)
+  def snapshot: F[Stream[F, Byte]] =
+    ref.get.map(v => Stream.emits(v.toString.getBytes).covary[F])
 
-  def restore(data: Array[Byte]): F[Unit] =
-    ref.set(new String(data).toLong)
+  def restore(data: Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap(bytes => ref.set(new String(bytes).toLong))
 ```
 
 ## TimerService: Election and Heartbeat Scheduling

@@ -1,0 +1,34 @@
+name: Jepsen & DST Nightly Stress
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stress:
+    name: Deterministic Simulation & 7-Node Jepsen Stress (JDK 25)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+          cache: 'sbt'
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Run Deterministic Simulation & Jepsen Stress Suites
+        run: sbt -batch "core/testOnly raft.dst.DeterministicSimulationSpec" jepsenStress

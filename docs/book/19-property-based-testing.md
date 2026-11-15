@@ -224,7 +224,7 @@ property("...").check(Test.Parameters.default.withInitialSeed(1234567890))
 
 Because the logic is pure, this reproduces deterministically. No flaky tests, no timing dependencies, no "it works on my machine."
 
-> **Note — Coverage.** Property-based tests complement but don't replace scenario tests. They excel at finding unexpected edge cases but can miss scenarios that require specific multi-step setups (e.g., "leader commits entry, then partition, then new leader, then partition heals"). Use both approaches: property tests for invariants, scenario tests for specific operational sequences.
+> **Note — From Property Tests to Full Deterministic Simulation.** Property-based tests complement scenario tests and lead naturally to full **Deterministic Simulation Testing (DST)** — where an entire multi-node `RawNode` cluster, lossy/reordering network, partition nemesis, and crash-recovery storage loop execute deterministically from a single 64-bit seed. See [Chapter 24 — Deterministic Simulation Testing](24-deterministic-simulation-testing.md) and `DeterministicSimulationSpec` for the complete architecture.
 
 ---
 

@@ -1,103 +1,74 @@
 # Functional RAFT Library for Scala 3
 
-A **purely functional** implementation of the [Raft consensus algorithm](https://raft.github.io/) in Scala 3. The core protocol logic has zero side effects — every state transition is a pure function that returns the new state and a list of effect descriptors. Your runtime interprets the effects, giving you complete control over networking, storage, and timers.
+A **Sans-I/O, deterministic** implementation of the [Raft consensus algorithm](https://raft.github.io/) in Scala 3. Storage, networking, and execution threads belong to the host system embedding the library: **`raft-core` has zero external dependencies** and isolates pure consensus safety, membership transitions, linearizable reads, and replication progress tracking behind deterministic state machines.
 
-**Inspired by:** [etcd/raft](https://github.com/etcd-io/raft) · [MicroRaft](https://microraft.io/) · [tikv/raft-rs](https://github.com/tikv/raft-rs) · [OpenRaft](https://github.com/datafuselabs/openraft) · [SOFAJRaft](https://github.com/sofastack/sofa-jraft)
-
----
-
-## Why This Library?
-
-Most Raft libraries are **frameworks** — they own the event loop, manage threads, and call your code through callbacks. This library is different. It's a **state machine** that you drive:
-
-```scala
-// The entire Raft protocol is behind this single pure function call
-val transition = RaftLogic.onMessage(state, message, config, lastLogIndex, lastLogTerm, clusterSize)
-
-transition.state   // → the new node state (Follower, Candidate, or Leader)
-transition.effects // → List[Effect] — what your runtime should do next
-```
-
-No threads are spawned. No network connections are opened. No disk writes happen. The function takes state in, and returns state and effects out. **Effects are data** — plain Scala objects you pattern match on and execute however you want. This means:
-
-- **Testability**: test any Raft scenario with pure function calls — no mocks, no waits, no flakiness
-- **Portability**: runs on JVM, Scala.js, GraalVM native — anywhere Scala runs
-- **Composability**: embed the protocol in any architecture — Cats Effect, ZIO, Akka, or plain Scala
-- **Determinism**: same input always produces the same output, making debugging and formal verification straightforward
+**Inspired by:** [tikv/raft-rs](https://github.com/tikv/raft-rs) · [OpenRaft](https://github.com/datafuselabs/openraft) · [etcd/raft](https://github.com/etcd-io/raft) · [TigerBeetle DST](https://tigerbeetle.com/) · [MicroRaft](https://microraft.io/)
 
 ---
 
-## Architecture
+## Why Sans-I/O Raft?
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                  RaftNode[F[_], M]                       │
-│          Event-driven runtime (Cats Effect + FS2)        │
-├──────────────────────────────────────────────────────────┤
-│          Pure Logic — RaftLogic.onMessage()              │
-│   No I/O, no side effects, fully deterministic           │
-│                                                          │
-│   Pre-Vote · Leader Stickiness · Joint Consensus         │
-│   ReadIndex · Lease Reads · Leadership Transfer          │
-│   Batching · Pipelining · Parallel Replication           │
-│   Multi-Raft Groups · Transport Multiplexing             │
-├──────────────────────────────────────────────────────────┤
-│          Effect ADT — what should happen next            │
-│   SendMessage · Broadcast · PersistHardState             │
-│   AppendLogs · CommitEntries · ResetElectionTimer · ...  │
-├──────────────────────────────────────────────────────────┤
-│          SPI — pluggable infrastructure                  │
-│   Transport[F] · LogStore[F] · StableStore[F]            │
-│   StateMachine[F,R] · TimerService[F]                    │
-└──────────────────────────────────────────────────────────┘
-```
+Traditional JVM Raft frameworks hijack your threads, force an opinionated RPC stack, and couple consensus correctness to background I/O callbacks. Following the Rust ecosystem (`tikv/raft-rs` and `openraft`), this library puts **consensus logic first** and leaves runtime & storage ownership to your system:
 
-The SPI (Service Provider Interface) layer defines abstract traits for all infrastructure concerns. The library ships with in-memory implementations for testing; you provide production implementations for your deployment environment.
+1. **Stateful Sans-I/O Driver (`RawNode` + `Ready` / `LightReady`)** — modeled directly on `tikv/raft-rs`:
+   ```scala
+   val store = MemStorage.create(ConfState(voters = Set(NodeId("n1"), NodeId("n2"), NodeId("n3"))))
+   val raw   = RawNode(RaftConfig.default(NodeId("n1")), store)
+
+   raw.tick()                        // logical tick — zero OS timers!
+   raw.step(from, incomingMessage)   // step any RaftMessage deterministically
+   if raw.hasReady then
+     val rd = raw.ready()            // batch of messages, HardState, entries, snapshots, ReadStates
+     store.persistReady(rd)          // host persists state & entries before persistedMessages
+     val light = raw.advance(rd)     // commit advancement & follow-up messages
+     raw.advanceApply()
+   ```
+2. **Pure Transition Function (`RaftLogic.onMessage`)** — stateless functional transitions `(NodeState, RaftMessage) => Transition(NodeState, List[Effect])` where every side effect is an immutable value.
+3. **Optional Turnkey Modules** — if your host system uses Cats Effect + FS2, `raft-runtime`, `raft-storage-mmap` (JDK 22+ FFM off-heap segmented WAL), and `raft-transport-grpc` (ScalaPB + Netty HTTP/2) plug straight in without polluting `raft-core`.
 
 ---
 
-## Features
+## 6-Module Architecture
 
-### Core Protocol
+```mermaid
+flowchart TD
+    core["raft-core (Zero External Dependencies · JDK 21+ bytecode)"]
+    runtime["raft-runtime (Cats Effect 3.7 + FS2 3.14 + log4cats-core)"]
+    mmap["raft-storage-mmap (JDK 22+ FFM Segmented WAL)"]
+    grpc["raft-transport-grpc (ScalaPB + gRPC Netty)"]
+    jepsen["raft-jepsen (WGL Linearizability & Nemesis Suite)"]
+    examples["raft-examples (17 Runnable Examples · publish/skip)"]
 
-| Feature | Description |
-|---------|-------------|
-| **Leader Election** | Randomized timeouts, majority voting, automatic step-down on higher terms |
-| **Log Replication** | AppendEntries with consistency check, conflict detection, and automatic repair |
-| **Commit Tracking** | Median-based commit index advancement with current-term safety check |
-| **Log Matching** | Ensures log consistency across all nodes (the Log Matching Property from §5.3 of the Raft paper) |
+    core --> runtime
+    runtime --> mmap
+    runtime --> grpc
+    runtime --> jepsen
+    mmap --> examples
+    grpc --> examples
+```
 
-### Advanced Protocol Extensions
+| Module | Artifact | External Dependencies (`Compile`) | Purpose |
+|--------|----------|-----------------------------------|---------|
+| `modules/core` | `raft-core` | **Zero** (Scala 3 stdlib only) | `RaftLogic`, `RawNode`, `Ready`/`LightReady`, `ProgressTracker` (`Probe`/`Replicate`/`Snapshot` + `Inflights`), `RaftStorage`/`MemStorage`, `LogId`, `JsonCodec` |
+| `modules/runtime` | `raft-runtime` | `cats-effect`, `fs2-core`, `log4cats-core` | `RaftNode`, `MultiRaftNode`, `CompactionManager`, streaming `Snapshot[F]`, `LogStore`/`StableStore`/`SnapshotStore`/`Transport` SPIs |
+| `modules/storage-mmap` | `raft-storage-mmap` | `raft-runtime` (JDK `java.lang.foreign`) | Off-heap memory-mapped segmented WAL (`Arena`/`MemorySegment`), CRC32 validation, segment rotation & compaction |
+| `modules/transport-grpc` | `raft-transport-grpc` | `scalapb-runtime-grpc`, `grpc-netty-shaded` | Protobuf wire protocol + live Netty HTTP/2 client/server `GrpcTransport` with cached channel pooling |
+| `modules/jepsen` | *(unpublished)* | `raft-runtime` | Wing & Gong (WGL) linearizability checker, partition/crash/split-brain `NemesisScheduler`, chaos & stress harnesses |
+| `modules/examples` | *(unpublished)* | `raft-storage-mmap`, `raft-transport-grpc`, `logback` | 17 runnable end-to-end protocol, Virtual Thread Sans-I/O, DST, KV, Lock, Transaction, and Multi-Raft examples |
 
-| Feature | Description |
-|---------|-------------|
-| **Pre-Vote** | Two-phase election that prevents partitioned nodes from disrupting the cluster with unnecessary term inflation |
-| **Leader Stickiness** | Followers reject votes while they have a healthy leader, reducing unnecessary elections |
-| **Joint Consensus** | Safe membership changes via dual-quorum transitions — never lose availability during reconfiguration |
-| **Linearizable Reads (ReadIndex)** | Strong consistency reads by confirming leadership via heartbeat quorum |
-| **Lease-Based Reads** | Zero-network-round-trip reads when bounded clock skew is acceptable |
-| **Leadership Transfer** | Graceful leader handoff to a target node — useful for rolling upgrades and load balancing |
-| **Learner Nodes** | Non-voting members that receive log replication but don't participate in elections or quorum |
-| **Witness Nodes** | Lightweight voting members for tie-breaking without full log storage |
-| **Log Compaction** | `InstallSnapshot` request/response for snapshotting and log truncation |
+---
 
-### Performance Optimizations
+## Protocol & Correctness Capabilities
 
-| Feature | Description |
-|---------|-------------|
-| **Batching** | Combine multiple commands into a single AppendEntries RPC — dramatically reduces per-entry overhead |
-| **Pipelining** | Send new AppendEntries requests without waiting for acknowledgments — critical for WAN deployments |
-| **Parallel Replication** | Replicate to all followers concurrently — a slow follower doesn't delay communication with others |
-
-### Multi-Raft Group Support
-
-| Feature | Description |
-|---------|-------------|
-| **MultiRaftNode** | Coordinator managing multiple independent consensus groups on one node — dynamic create/remove lifecycle |
-| **GroupId** | Type-safe opaque group identifiers (zero runtime cost) |
-| **Transport Multiplexing** | FS2 Topic-based multiplexing/demultiplexing — all groups share one connection per node pair |
-| **GroupEnvelope** | Wire-level message wrapper tagging each RPC with its target group for routing |
-| **Per-Group Isolation** | Each group has independent log, stable store, state machine, and timers |
+| Category | Capabilities |
+|----------|--------------|
+| **Core Safety (§5)** | Randomized election ticks, §5.4.1 `LogId(term, index)` up-to-date restriction, §5.3 fast conflict backtracking (`conflictTerm` / `conflictIndex`), §5.4.2 current-term `NoOp` commit rule, strict §5.3 Rule 5 follower commit clamping |
+| **Disruption Prevention** | **Pre-Vote (§9.6)** two-phase elections (zero term inflation while partitioned), **Leader Stickiness (§6)**, **CheckQuorum (§6.2)** automatic minority leader step-down |
+| **Linearizable Reads (§6.4)** | Quorum-confirmed **`ReadIndex`** (`ReadState` without log writes) and clock-bounded zero-RTT **`LeaseRead`** |
+| **Membership & Admin** | **Joint Consensus (§6)** dual-quorum transitions (`C_old` → `C_old,new` → `C_new`), `Voter` / `Learner` / `Witness` roles, **Leadership Transfer (§3.10)** via catch-up + `TimeoutNow` |
+| **Replication Engine** | Per-follower `ProgressTracker` (`Probe` → `Replicate` → `Snapshot`) with bounded `Inflights` sliding window, command batching, parallel replication, chunked streaming `InstallSnapshot` |
+| **Multi-Raft Scaling** | `MultiRaftNode` group lifecycle coordinator, `GroupEnvelope` routing, FS2 `Topic`-multiplexed `MultiGroupTransport` |
+| **Verification** | Seeded single-threaded **Deterministic Simulation Testing (`DeterministicSimulationSpec`)**, ScalaCheck safety property suites, and **Jepsen WGL linearizability** under partitions, crashes, and CAS contention |
 
 ---
 
@@ -105,200 +76,108 @@ The SPI (Service Provider Interface) layer defines abstract traits for all infra
 
 ### Prerequisites
 
-- Scala 3.3.7+
-- sbt 1.x
+- **JDK 21+** for `raft-core` and `raft-runtime` (**JDK 25** recommended for building all modules including `raft-storage-mmap`)
+- **sbt 1.12+** (Scala `3.3.9` LTS)
 
-### Add to Your Project
+### Coordinates (`build.sbt`)
 
 ```scala
-// build.sbt
+// Pure Sans-I/O consensus engine (zero transitive third-party dependencies!)
+libraryDependencies += "com.github.bmscomp" %% "raft-core" % "<version>"
+
+// Optional Cats Effect + FS2 runtime, FFM WAL, and gRPC Netty transport
 libraryDependencies ++= Seq(
-  "org.typelevel" %% "cats-effect" % "3.6.3",
-  "co.fs2"        %% "fs2-core"    % "3.12.2"
+  "com.github.bmscomp" %% "raft-runtime"        % "<version>",
+  "com.github.bmscomp" %% "raft-storage-mmap"   % "<version>",
+  "com.github.bmscomp" %% "raft-transport-grpc" % "<version>"
 )
 ```
 
-The core protocol logic (`RaftLogic`, `NodeState`, `RaftMessage`, `Effect`) has **zero dependencies**. Cats Effect and FS2 are only needed for the SPI implementations and `RaftNode` runtime.
-
-### Your First Election (15 Lines)
+### Pure Election in 12 Lines (`raft-core`)
 
 ```scala
-import raft.state.*, raft.state.NodeState.*, raft.message.RaftMessage.*, raft.logic.RaftLogic
+import raft.state.*, raft.state.NodeState.*, raft.message.RaftMessage.*, raft.effect.Effect.*, raft.logic.RaftLogic
 
-val config = RaftConfig(localId = NodeId("node-1"), preVoteEnabled = false)
-var state  = Follower(term = 0, votedFor = None, leaderId = None): NodeState
+val cfg = RaftConfig(localId = NodeId("n1"), preVoteEnabled = false)
+val s0  = Follower(term = 0, votedFor = None, leaderId = None)
 
-// 1. Election timeout fires → become Candidate
-val election = RaftLogic.onMessage(state, ElectionTimeout, config, 0, 0, 3)
-state = election.state  // Candidate(term=1, votesReceived={node-1})
-
-// 2. Receive a vote from node-2 → become Leader (majority: 2/3)
-val voteReq = election.effects.collectFirst { case Broadcast(r: RequestVoteRequest) => r }.get
-// ... feed voteReq to node-2, get a RequestVoteResponse back ...
-
-val afterVote = RaftLogic.onVoteResponse(state.asInstanceOf[Candidate], NodeId("node-2"), voteResponse, config, 3)
-state = afterVote.state  // Leader(term=1)
-```
-
-No network. No threads. No mocks. Pure functions, deterministic results.
-
----
-
-## The Effect System
-
-Every state transition produces a list of effects — data objects describing what side effects the runtime should perform. Your effect interpreter pattern-matches on these and executes them:
-
-```scala
-transition.effects.traverse_ {
-  case SendMessage(to, msg)      => transport.send(to, msg)
-  case Broadcast(msg)            => transport.broadcast(msg)
-  case PersistHardState(term, v) => stableStore.setCurrentTerm(term) *> stableStore.setVotedFor(v)
-  case AppendLogs(entries)       => logStore.append(entries)
-  case TruncateLog(fromIdx)      => logStore.truncateFrom(fromIdx)
-  case CommitEntries(upTo)       => applyToStateMachine(upTo)
-  case ResetElectionTimer        => timerService.resetElectionTimer
-  case ResetHeartbeatTimer       => timerService.resetHeartbeatTimer
-  case BecomeLeader              => initializeLeaderState()
-  case ConfirmLeadership(ci)     => handleReadIndexConfirmation(ci)
-  case LeaseReadReady(ci)        => serveLeaseRead(ci)
-  case TransferLeadership(t, n)  => initiateTransfer(t, n)
-  case ParallelReplicate(p, m)   => peers.parTraverse_(p => transport.send(p, m))
-  case _                         => IO.unit
-}
+val t1      = RaftLogic.onMessage(s0, ElectionTimeout, cfg, lastLogIndex = 0, lastLogTerm = 0, clusterSize = 3)
+val voteReq = t1.effects.collectFirst { case Broadcast(r: RequestVoteRequest) => r }.get
+val grant   = RequestVoteResponse(term = voteReq.term, voteGranted = true, isPreVote = false)
+val t2      = RaftLogic.onVoteResponse(t1.state.asInstanceOf[Candidate], NodeId("n2"), grant, cfg, clusterSize = 3)
+// t2.state == Leader(term = 1, ...)
 ```
 
 ---
 
-## Examples
-
-The library ships with 12 runnable examples covering protocol fundamentals, cluster simulation, and complete applications:
+## Runnable Examples (17 Included)
 
 ```bash
-# Protocol mechanics
-sbt "runMain examples.protocol.PreVoteExample"
-sbt "runMain examples.protocol.LogMatchingExample"
-sbt "runMain examples.protocol.CommitTrackingExample"
-sbt "runMain examples.protocol.TimerServiceExample"
+# Sans-I/O RawNode on JDK Virtual Threads & Seeded Deterministic Simulation
+sbt "examples/runMain examples.rawnode.RawNodeHostLoopExample"
+sbt "examples/runMain examples.simulation.DeterministicSimulationExample"
 
-# Full cluster simulation
-sbt "runMain examples.cluster.ThreeNodeClusterExample"
+# Protocol mechanics & cluster membership
+sbt "examples/runMain examples.protocol.PreVoteExample"
+sbt "examples/runMain examples.protocol.LogMatchingExample"
+sbt "examples/runMain examples.protocol.CommitTrackingExample"
+sbt "examples/runMain examples.protocol.TimerServiceExample"
+sbt "examples/runMain examples.protocol.ReadIndexAndLeaseExample"
+sbt "examples/runMain examples.protocol.LeadershipTransferExample"
+sbt "examples/runMain examples.cluster.ThreeNodeClusterExample"
+sbt "examples/runMain examples.cluster.JointConsensusExample"
 
-# Application case studies
-sbt "runMain examples.kvstore.KVStoreExample"
-sbt "runMain examples.lock.DistributedLockExample"
-sbt "runMain examples.counter.CounterWithCodecExample"
-sbt "runMain examples.distributed.DistributedCounterExample"
-sbt "runMain examples.distributed.RaftTransactionExample"
-sbt "runMain examples.distributed.DistributedTransactionExample"
-
-# Multi-Raft groups
-sbt "runMain examples.distributed.MultiGroupExample"
+# Distributed applications & Multi-Raft
+sbt "examples/runMain examples.kvstore.KVStoreExample"
+sbt "examples/runMain examples.lock.DistributedLockExample"
+sbt "examples/runMain examples.counter.CounterWithCodecExample"
+sbt "examples/runMain examples.distributed.DistributedCounterExample"
+sbt "examples/runMain examples.distributed.RaftTransactionExample"
+sbt "examples/runMain examples.distributed.DistributedTransactionExample"
+sbt "examples/runMain examples.distributed.MultiGroupExample"
 ```
 
 ---
 
-## Project Structure
-
-```
-src/main/scala/raft/
-├── logic/
-│   └── RaftLogic.scala          # Pure state machine — the heart of the library
-├── state/
-│   ├── NodeState.scala          # Follower | PreCandidate | Candidate | Leader
-│   ├── Log.scala                # Log entries (Command, NoOp, Configuration)
-│   ├── RaftConfig.scala         # Configuration (timeouts, batching, pipelining)
-│   └── ClusterConfig.scala      # Membership (voters, learners, witnesses, joint consensus)
-├── message/
-│   ├── RaftMessage.scala        # All Raft RPCs and internal events
-│   └── MessageCodec.scala       # Wire format SPI
-├── effect/
-│   ├── Effect.scala             # Side-effect descriptors (the Effect ADT)
-│   └── Transition.scala         # State + Effects bundle
-├── spi/
-│   ├── Transport.scala          # Network abstraction
-│   ├── LogStore.scala           # Persistent log storage
-│   ├── StableStore.scala        # Term + votedFor persistence
-│   ├── StateMachine.scala       # Application state machine (your code)
-│   └── TimerService.scala       # Election + heartbeat timers
-├── impl/
-│   ├── InMemLogStore.scala      # In-memory log (for testing)
-│   ├── InMemStableStore.scala   # In-memory stable store (for testing)
-│   ├── InMemTransport.scala     # In-memory network (for testing)
-│   └── DefaultTimerService.scala # FS2-based timer implementation
-├── codec/
-│   └── JsonCodec.scala          # JSON message encoding
-├── metrics/
-│   └── RaftMetrics.scala        # Observable metrics
-├── multigroup/
-│   ├── GroupEnvelope.scala      # Wire-level group routing wrapper
-│   ├── GroupConfig.scala        # Per-group dependency bundle
-│   ├── MultiRaftNode.scala      # Multi-group coordinator
-│   ├── MultiGroupTransport.scala # FS2 Topic-based multiplexing
-│   └── GroupAwareCodec.scala    # Envelope-aware serialization
-├── storage/
-│   └── mmap/                    # Memory-mapped WAL engine (segments, index, hard state)
-├── compaction/
-│   └── SnapshotTransfer.scala   # Pipelined, ack-based snapshot streaming
-└── RaftNode.scala               # Cats Effect runtime combining logic + SPIs
-```
-
-```
-src/test/scala/raft/              # 527 tests across 50+ suites
-├── logic/                        # Unit tests for every protocol path
-├── state/                        # State type tests (ClusterConfig, etc.)
-├── integration/                  # Multi-node integration tests
-├── chaos/                        # Adversarial network/timing scenarios
-├── property/                     # Property-based safety invariants
-├── benchmark/                    # Election, recovery, and multi-raft benchmarks
-├── storage/                      # WAL engine and storage adapter tests
-└── multigroup/                   # Multi-raft group tests
-```
-
----
-
-## Testing
-
-The pure design makes the test suite fast and deterministic — **527 tests complete in ~2 seconds**:
+## Testing & Verification
 
 ```bash
-sbt test                              # all 527 tests
-sbt "testOnly *LogicSpec"             # core protocol unit tests
-sbt "testOnly *IntegrationSpec"       # multi-node cluster tests
-sbt "testOnly *ChaosScenarioSpec"     # adversarial network scenarios
-sbt "testOnly *SafetyPropertySpec"    # property-based safety invariants
-sbt "testOnly *ClusterConfigSpec"     # membership change safety
-sbt "testOnly *MultiRaftNodeSpec"     # multi-raft group tests
+sbt test                    # Fast unit, property, DST, WAL, gRPC, and WGL checker tests (~530 tests)
+sbt "core/test"             # Pure zero-dependency raft-core suite + DeterministicSimulationSpec
+sbt jepsenSmoke             # Jepsen WGL linearizability suite under partitions, restarts & CAS
+sbt jepsenStress            # Long-running 7-node Jepsen chaos & leader-hunting stress suite
+sbt scalafmtCheckAll doc    # Formatting & API Scaladoc verification
 ```
 
 ---
 
-## Documentation
+## Documentation: *Raft: Theory and Practice* (24 Chapters)
 
-The library includes a comprehensive **21-chapter book** covering both Raft theory and practical implementation:
+📖 **[Read the Full Book](docs/book/README.md)** · **[Step-by-Step Tutorials](tutorials/)**
 
-📖 **[Raft: Theory and Practice](docs/book/README.md)**
-
-| Part | Chapters | What You'll Learn |
-|------|----------|-------------------|
-| **I — Foundations** | 1–4 | Consensus theory, Raft protocol, advanced extensions, safety proofs |
-| **II — Architecture** | 5–7 | Pure functional design, Core API, SPI layer |
-| **III — Building** | 8–11 | Setup, replication, performance tuning, failure modes |
-| **IV — Case Studies** | 12–15 | KV store, lock service, counter, transactions |
-| **V — Ecosystem** | 16 | Comparison with etcd/raft, tikv/raft-rs, OpenRaft, SOFAJRaft, MicroRaft |
-| **VI — Operations** | 17–20 | Troubleshooting, integration, property testing, Jepsen verification |
-| **VII — Scaling** | 21 | Multi-Raft group design, transport multiplexing, partitioning strategies |
+| Part | Chapters | Topics |
+|------|----------|--------|
+| **I — Foundations** | 1–4 | FLP & CAP, Raft fundamentals, Pre-Vote / Joint Consensus / ReadIndex, safety invariant proofs |
+| **II — Architecture** | 5–7 | Pure effects-as-data design, Core API, pluggable SPI contracts |
+| **III — Building** | 8–11 | Getting started, log replication & fast conflict backtracking, performance vs. safety, failure modes |
+| **IV — Case Studies** | 12–15 | Linearizable KV store, TTL lock service, replicated counter, distributed transactions |
+| **V — Ecosystem** | 16 | Architectural comparison with `tikv/raft-rs`, `openraft`, `etcd/raft`, HashiCorp Raft, MicroRaft |
+| **VI — Operations & Testing** | 17–20 | Production troubleshooting, SPI integration, ScalaCheck properties, Jepsen WGL verification |
+| **VII — Scaling** | 21 | Multi-Raft partitioning, `GroupEnvelope` routing, shared transport multiplexing |
+| **VIII — Sans-I/O & DST** | 22–24 | `RawNode` & `Ready`/`LightReady` state machine, host runtime/storage integration, Deterministic Simulation Testing |
 
 ---
 
-## Dependencies
+## Dependencies & Toolchain
 
-| Dependency | Version | Purpose |
-|-----------|---------|---------|
-| Scala 3 | 3.3.7 | Language |
-| Cats Effect | 3.6.3 | Concurrent effect system |
-| FS2 | 3.12.2 | Streaming (timer events, message channels) |
-| Log4Cats + Logback | 2.7.1 / 1.5.27 | Structured logging |
-| ScalaTest + ScalaCheck | 3.2.19 | Testing (unit + property-based) |
+| Component | Version | Scope |
+|-----------|---------|-------|
+| Scala | `3.3.9` (LTS) | All modules |
+| sbt | `1.12.15` | Build & multi-module orchestration |
+| Cats Effect / FS2 / Log4Cats | `3.7.1` / `3.14.0` / `2.8.0` | `raft-runtime` (optional host adapter) |
+| ScalaPB / gRPC Netty | `0.11.21` / `1.85.1` | `raft-transport-grpc` (optional transport) |
+| Logback | `1.6.7` | `raft-examples` & `Test` only |
+| ScalaTest / ScalaCheck / CE Testing | `3.2.20` / `3.2.20.0` / `1.8.0` | `Test` only |
 
 ---
 

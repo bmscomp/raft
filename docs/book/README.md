@@ -17,8 +17,9 @@ The approach is deliberately layered:
 - **Part III** gets you building — from a first election in 15 lines of code to a production-ready event loop with batching, pipelining, and parallel replication.
 - **Part IV** applies everything to real-world distributed systems — a KV store, a lock service, a replicated counter, and a transactional engine with serializable isolation.
 - **Part V** puts the library in context by surveying the major Raft implementations across Go, Rust, Java, and Scala.
-- **Part VI** covers operational concerns — troubleshooting production clusters, end-to-end integration, and property-based safety testing.
+- **Part VI** covers operational concerns — troubleshooting production clusters, end-to-end integration, property-based safety testing, and Jepsen linearizability verification.
 - **Part VII** looks ahead to scaling beyond a single Raft group with Multi-Raft architectures.
+- **Part VIII** dives into the zero-dependency Sans-I/O `RawNode` / `Ready` state machine (modeled after `tikv/raft-rs` and `openraft`), host-owned runtime/storage integration, and Deterministic Simulation Testing (DST).
 
 Whether you're learning about distributed consensus for the first time or designing a production system that needs strong consistency guarantees, this book gives you both the *why* and the *how*.
 
@@ -98,6 +99,16 @@ Whether you're learning about distributed consensus for the first time or design
 |---|---------|-------------------|
 | 21 | [Multi-Raft Group Design](21-multi-raft-groups.md) | Partitioning strategies, cross-group transactions, leader balancing, transport multiplexing, resource sharing |
 
+### Part VIII — Sans-I/O Architecture & Deterministic Simulation
+
+*Embedding zero-dependency `raft-core` directly inside your own runtime, storage engine, and deterministic simulator.*
+
+| # | Chapter | What You'll Learn |
+|---|---------|-------------------|
+| 22 | [Sans-I/O `RawNode` & `Ready` Protocol](22-sans-io-rawnode-ready.md) | `RawNode`, `Ready` / `LightReady` two-phase persistence barriers, `ProgressTracker` (`Probe` / `Replicate` / `Snapshot` + `Inflights`), `LogId` |
+| 23 | [Host System Integration](23-host-system-integration.md) | Driving `raft-core` from JDK Virtual Threads, Netty/Pekko/ZIO event loops, and RocksDB/LMDB/custom WALs without Cats Effect |
+| 24 | [Deterministic Simulation Testing (DST)](24-deterministic-simulation-testing.md) | Single-threaded seeded PRNG cluster simulation, packet loss/duplication/reordering, partition healing, bit-for-bit bug replay |
+
 ### Appendices
 
 | | Appendix | Contents |
@@ -111,16 +122,24 @@ Whether you're learning about distributed consensus for the first time or design
 Run an example to see the library in action:
 
 ```bash
-sbt "runMain examples.kvstore.KVStoreExample"
-sbt "runMain examples.cluster.ThreeNodeClusterExample"
-sbt "runMain examples.distributed.DistributedTransactionExample"
-sbt "runMain examples.distributed.MultiGroupExample"
+sbt "examples/runMain examples.rawnode.RawNodeHostLoopExample"
+sbt "examples/runMain examples.simulation.DeterministicSimulationExample"
+sbt "examples/runMain examples.kvstore.KVStoreExample"
+sbt "examples/runMain examples.cluster.ThreeNodeClusterExample"
+sbt "examples/runMain examples.distributed.DistributedTransactionExample"
+sbt "examples/runMain examples.distributed.MultiGroupExample"
 ```
 
-Run the test suite (527 tests, completes in seconds):
+Run the fast unit, property, and deterministic simulation test suites (530 tests across 6 modules, completes in seconds):
 
 ```bash
 sbt test
+```
+
+Run the Jepsen linearizability & fault-injection smoke suite:
+
+```bash
+sbt jepsenSmoke
 ```
 
 Begin reading at [Chapter 1: Why Consensus?](01-why-consensus.md), or jump directly to [Chapter 8: Getting Started](08-getting-started.md) if you want to write code immediately.

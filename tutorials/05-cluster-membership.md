@@ -53,31 +53,31 @@ During the joint phase (`C_old,new`), every decision (election, commit) requires
 The library's `ClusterConfig` encodes the cluster membership state:
 
 ```scala
-import raft.state.{ClusterConfig, NodeId}
+import raft.state.{ClusterConfig, NodeId, NodeRole}
 
 // A normal (non-transitioning) configuration
 val threeNodeCluster = ClusterConfig(
   voters = Set(NodeId("A"), NodeId("B"), NodeId("C"))
 )
 
-// A joint configuration (mid-transition)
-val jointConfig = ClusterConfig(
-  voters = Set(NodeId("A"), NodeId("B"), NodeId("C"), NodeId("D")),
-  oldVoters = Some(Set(NodeId("A"), NodeId("B"), NodeId("C"))),
-  learners = Set.empty,
-  witnesses = Set.empty
+// Entering joint consensus toward a 4-node configuration
+val jointConfig = threeNodeCluster.beginJointConsensus(
+  Map(
+    NodeId("A") -> NodeRole.Voter,
+    NodeId("B") -> NodeRole.Voter,
+    NodeId("C") -> NodeRole.Voter,
+    NodeId("D") -> NodeRole.Voter
+  )
 )
 
-// The final configuration
-val fourNodeCluster = ClusterConfig(
-  voters = Set(NodeId("A"), NodeId("B"), NodeId("C"), NodeId("D"))
-)
+// Finalizing after the joint entry commits
+val fourNodeCluster = jointConfig.completeJointConsensus
 ```
 
 Key invariants enforced by the library:
-- A voter cannot simultaneously be a learner or witness
-- During joint consensus, `oldVoters` is `Some` — the leader requires both majorities
-- The leader automatically transitions from joint to final config after the joint entry is committed
+- Each member holds an explicit `NodeRole` (`Voter`, `Learner`, or `Witness`)
+- During joint consensus (`isInJointConsensus == true`), `jointConfig` retains `C_old` while `pendingConfig` holds `C_new` — `hasQuorum` requires majorities in **both** simultaneously (`Voter` + `Witness` members count toward quorum)
+- `RawNode` automatically appends and commits the `C_new` configuration entry once the `C_old,new` joint entry is committed
 
 ## Operational Runbook: Adding a Node
 
@@ -88,12 +88,10 @@ A learner receives the log but doesn't vote. This lets it catch up without affec
 ```scala
 val newNodeId = NodeId("D")
 
-// On the leader: add D as a learner
-val learnerConfig = currentConfig.copy(
-  learners = currentConfig.learners + newNodeId
-)
-// Propose the new config as a configuration change entry
-raftNode.proposeConfigChange(learnerConfig)
+// On the leader: add D as a learner first so it catches up without affecting quorum
+val learnerConfig = currentConfig.addMember(newNodeId, NodeRole.Learner)
+// Via Sans-I/O RawNode:
+rawNode.proposeConfChange(learnerConfig)
 ```
 
 **Why learner first?** If you add D directly as a voter, it starts with an empty log while A, B, C have millions of entries. Until D catches up, you effectively have a 4-node cluster where only 3 nodes can participate in quorum — one slow node can stall commits.
@@ -121,17 +119,15 @@ Learner D:  [1, 2, 3, ...,   999_950]  ← gap = 50, ready to promote
 ### Step 3: Promote to voter via joint consensus
 
 ```scala
-val jointConfig = ClusterConfig(
-  voters = Set(NodeId("A"), NodeId("B"), NodeId("C"), NodeId("D")),
-  oldVoters = Some(Set(NodeId("A"), NodeId("B"), NodeId("C"))),
-  learners = Set.empty  // D is no longer a learner
+val targetConfig = ClusterConfig(
+  Set(NodeId("A"), NodeId("B"), NodeId("C"), NodeId("D"))
 )
-raftNode.proposeConfigChange(jointConfig)
+rawNode.proposeConfChange(targetConfig)
 ```
 
-This appends a **joint configuration entry** to the log. Once committed:
-- Elections require majority of `{A,B,C}` AND majority of `{A,B,C,D}`
-- The leader automatically appends the **final configuration entry**: `voters = {A,B,C,D}`, `oldVoters = None`
+This appends a **joint configuration entry** (`C_old,new`) to the log. Once committed:
+- Elections and commits require a majority of `{A,B,C}` **and** a majority of `{A,B,C,D}`
+- `RawNode` automatically appends and replicates the **final configuration entry** (`C_new`): `voters = {A,B,C,D}`, `isInJointConsensus = false`
 
 ### Step 4: Verify the final configuration
 
@@ -141,16 +137,16 @@ After both config entries are committed, the cluster is in its new configuration
 def verifyConfig(config: ClusterConfig): IO[Unit] =
   for
     _ <- IO.println(s"Voters: ${config.voters.map(_.value).mkString(", ")}")
-    _ <- IO.println(s"Joint: ${config.isJoint}")
-    _ <- IO.println(s"Cluster size: ${config.voters.size}")
-    _ <- IO.println(s"Quorum size: ${config.quorumSize}")
+    _ <- IO.println(s"Joint: ${config.isInJointConsensus}")
+    _ <- IO.println(s"Voting size: ${config.votingMembers.size}")
+    _ <- IO.println(s"Majority size: ${config.majoritySize}")
   yield ()
 
 // Expected output:
 // Voters: A, B, C, D
 // Joint: false
-// Cluster size: 4
-// Quorum size: 3
+// Voting size: 4
+// Majority size: 3
 ```
 
 ## Operational Runbook: Removing a Node
@@ -168,11 +164,11 @@ raftNode.transferLeadership(NodeId("B"))
 ### Step 2: Initiate removal via joint consensus
 
 ```scala
-val jointConfig = ClusterConfig(
-  voters = Set(NodeId("B"), NodeId("C")),
-  oldVoters = Some(Set(NodeId("A"), NodeId("B"), NodeId("C")))
+val targetMembers = Map(
+  NodeId("B") -> NodeRole.Voter,
+  NodeId("C") -> NodeRole.Voter
 )
-raftNode.proposeConfigChange(jointConfig)
+rawNode.proposeConfChange(targetMembers)
 ```
 
 ### Step 3: Shut down the removed node
@@ -207,12 +203,13 @@ Step 4: Shut down node A
 This can be done as a single joint consensus transition:
 
 ```scala
-// Replace A with D in one step
-val jointConfig = ClusterConfig(
-  voters = Set(NodeId("B"), NodeId("C"), NodeId("D")),
-  oldVoters = Some(Set(NodeId("A"), NodeId("B"), NodeId("C")))
+// Replace A with D in one Joint Consensus transition
+val targetMembers = Map(
+  NodeId("B") -> NodeRole.Voter,
+  NodeId("C") -> NodeRole.Voter,
+  NodeId("D") -> NodeRole.Voter
 )
-raftNode.proposeConfigChange(jointConfig)
+rawNode.proposeConfChange(targetMembers)
 ```
 
 The cluster never drops below 3 voters, and fault tolerance is maintained throughout.
@@ -349,22 +346,26 @@ For cross-datacenter deployments, witnesses provide quorum participation without
 
 ```scala
 val geoConfig = ClusterConfig(
-  voters = Set(NodeId("dc1-a"), NodeId("dc1-b"), NodeId("dc2-a")),
-  witnesses = Set(NodeId("dc2-witness"))
+  Map(
+    NodeId("dc1-a") -> NodeRole.Voter,
+    NodeId("dc1-b") -> NodeRole.Voter,
+    NodeId("dc2-a") -> NodeRole.Voter,
+    NodeId("dc2-witness") -> NodeRole.Witness
+  )
 )
 ```
 
-Witnesses vote in elections and commit decisions but don't store the full log — they're lightweight quorum participants.
+Witnesses vote in elections and contribute to quorum decisions (`votingMembers`) without storing the full state-machine payload.
 
 ### Configuration entry compaction
 
-Configuration changes are stored as special log entries. During log compaction (snapshotting), the current configuration must be preserved in the snapshot metadata:
+Configuration changes are stored as `LogType.Configuration` entries. During log compaction (snapshotting), the active configuration is preserved inside `SnapshotMetadata`:
 
 ```scala
 case class SnapshotMetadata(
   lastIncludedIndex: Long,
   lastIncludedTerm: Long,
-  currentConfig: ClusterConfig  // the active configuration at snapshot time
+  config: Option[ClusterConfig] = None // active configuration at snapshot time
 )
 ```
 
