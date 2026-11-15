@@ -558,6 +558,41 @@ After transition:        Majority of {A, B, C, D} = 3
 
 ---
 
+## Failure Mode 10: Torn Disk Writes, Bit Rot, and the 1,000,000 Snapshot Cliff
+
+### The Scenario
+
+Raft's safety proofs assume durable storage is faithful: once `PersistHardState` or `AppendLogs` returns, the exact `(term, votedFor)` and log entries survive power loss. Real NVMe drives, OS page caches, and filesystem directories violate that assumption in four classic ways:
+
+1. **Silent bit rot or torn `hard_state.bin`**: Writing a CRC32 on `write` without verifying it on `read` allows a flipped bit in `term` or `votedForLen` to silently resurrect an old vote, inflate the cluster's term by billions, or throw `NegativeArraySizeException` on startup.
+2. **Torn `index.ckpt` checkpoint**: Writing an auxiliary WAL offset index directly in place without `tmp + ATOMIC_MOVE` and a checksum means a crash during checkpointing bricks recovery — even though the underlying `.wal` segments are completely intact!
+3. **Lexicographic snapshot sorting cliff (`index >= 1,000,000`)**: Formatting snapshot filenames with 6-digit padding (`snapshot-%06d.bin`) and sorting filenames as strings works up to `snapshot-999999.bin`. At index `1,000,000`, `"snapshot-1000000.bin" < "snapshot-999999.bin"` in ASCII order (`'1' < '9'`), causing recovery to load a stale snapshot and discard committed state!
+4. **Concurrent WAL & snapshot mutation races**: Background log compaction (`discardBefore`), snapshot GC, and active `appendEntries` mutating shared `MemorySegment` offsets without a `Mutex[F]` corrupt segment write pointers under load.
+
+### How `raft-storage-mmap` Defends Against All Four
+
+```mermaid
+flowchart TD
+    OPEN["MmapWalEngine.open(dataDir)"] --> HS["MmapHardState.read (280 bytes)"]
+    HS -->|"Zero-check or CRC32[0..268) + bounds"| HS_OK["Verified HardState(term, votedFor)"]
+    HS -->|"CRC mismatch / invalid votedForLen"| CORRUPT["Fail fast: RaftError.StorageCorruption"]
+
+    HS_OK --> CKPT["Read index.ckpt (WIDX v1 + CRC32)"]
+    CKPT -->|"Valid WIDX + CRC32"| TAIL["Incremental replay of .wal entries > ckptLastIdx"]
+    CKPT -->|"Missing / Torn / Bad CRC32"| REBUILD["Delete corrupt index.ckpt & full replay from .wal segments"]
+
+    TAIL --> SNAP["Numeric parseSnapshotIndex (snapshot-%020d.bin)"]
+    REBUILD --> SNAP
+    SNAP --> READY["Mutex[F]-guarded MmapWalEngine Ready"]
+```
+
+1. **Verified `MmapHardState`**: Zero-fills unused `votedFor` bytes `[12 + len .. 268)` on every `write`, `msync`s via `mapped.force()`, and verifies `CRC32([0..268))` plus `term >= 0` and `0 <= votedForLen <= 256` on every `read`.
+2. **Self-healing `"WIDX"` Checkpoints**: `index.ckpt` is only an acceleration cache over immutable `.wal` segments. `MmapWalEngine` writes `index.ckpt.tmp` with a `"WIDX"` magic header, version byte, and trailing CRC32 before `ATOMIC_MOVE`. If `WalIndex.deserializeChecked` detects truncation or checksum failure on startup, `MmapWalEngine` deletes the corrupt checkpoint and reconstructs the exact index by replaying `.wal` segments.
+3. **20-Digit Numeric Snapshot Ordering**: Snapshots are written as `snapshot-%020d.bin` (covering up to `Long.MaxValue = 9,223,372,036,854,775,807`) and selected via numeric `parseSnapshotIndex` (`maxByOption`), remaining backward-compatible with legacy 6-digit files.
+4. **Serialized `Mutex[F]` Engine Access**: Every mutating WAL, hard-state, truncation, compaction, and snapshot operation acquires `writeMutex: Mutex[F]`, eliminating impure in-place mutations inside `Ref.update`.
+
+---
+
 ## The Taxonomy of Distributed Failures
 
 To wrap up, here is a systematic classification of the failure modes we've covered, organized by the layer at which they occur and the Raft property they threaten:
@@ -573,37 +608,28 @@ To wrap up, here is a systematic classification of the failure modes we've cover
 | Snapshot transfer failure | Storage | Availability | Streaming snapshots, compaction tuning |
 | Clock skew | Infrastructure | Linearizability | `maxClockSkew` margin, ReadIndex fallback |
 | Membership change instability | Protocol | Election Safety | Joint consensus, staged changes |
+| Torn disk writes & snapshot cliff | Storage | Election & State Safety | `MmapHardState` CRC32, atomic `WIDX` fallback, `%020d` numeric snapshots |
 
 ```mermaid
-mindmap
-  root((Raft Failures))
-    Node Failures
-      Leader crash
-        Uncommitted: lost ✓
-        Committed: preserved ✓
-      Follower crash
-        Log catch-up
-        Snapshot transfer
-    Network Failures
-      Partition
-        Stale reads
-        Term inflation
-      Asymmetric partition
-        One-way heartbeat failure
-    Protocol Edge Cases
-      Figure 8
-        Current-term commit rule
-      Split vote
-        Randomized timeouts
-      Membership change
-        Joint consensus
-    Infrastructure
-      Clock skew
-        Lease read violations
-      Disk failure
-        Lost persistence
-      Correlated failures
-        Thundering herd
+flowchart TD
+    ROOT["Raft Failure Modes"] --> NODE["Node Failures"]
+    ROOT --> NET["Network Failures"]
+    ROOT --> PROTO["Protocol Edge Cases"]
+    ROOT --> INFRA["Storage & Infrastructure"]
+
+    NODE --> LC["Leader Crash (isLogUpToDate)"]
+    NODE --> FC["Lagging Follower (Chunked InstallSnapshot)"]
+
+    NET --> PART["Partition Stale Reads (ReadIndex + CheckQuorum)"]
+    NET --> TI["Term Inflation (Pre-Vote)"]
+
+    PROTO --> F8["Figure 8 (Current-Term Commit Rule)"]
+    PROTO --> SV["Split Vote (Randomized Election Timer)"]
+    PROTO --> JC["Membership Change (Joint Consensus + NoOp Guard)"]
+
+    INFRA --> CS["Clock Skew (Monotonic Lease Margin)"]
+    INFRA --> DISK["Torn Disk / Bit Rot (CRC32 HardState + WIDX WAL Fallback)"]
+    INFRA --> SNAP_CLIFF["Snapshot Cliff >1M (%020d Numeric Ordering)"]
 ```
 
 ---

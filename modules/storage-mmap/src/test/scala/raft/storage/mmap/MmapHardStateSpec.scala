@@ -97,4 +97,61 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
     "should create a file of the expected size" in withHardState { (_, path) =>
       Files.size(path) shouldBe 280L
     }
+
+    "should detect single-bit CRC32 corruption on read" in {
+      val tmpDir = Files.createTempDirectory("raft-hs-crc-")
+      val hsPath = tmpDir.resolve("hard_state.bin")
+
+      val hs1 = MmapHardState.open(hsPath)
+      hs1.write(HardState(Term.unsafeFrom(17L), Some(NodeId("voter-alpha"))))
+      hs1.close()
+
+      // Flip 1 bit in the term field on disk without updating CRC32
+      val raw = Files.readAllBytes(hsPath)
+      raw(7) = (raw(7) ^ 0x01).toByte
+      Files.write(hsPath, raw)
+
+      val hs2 = MmapHardState.open(hsPath)
+      try
+        val ex = intercept[raft.state.RaftError.StorageCorruption] {
+          hs2.read
+        }
+        ex.reason should include("CRC32 mismatch")
+      finally
+        hs2.close()
+        Files.deleteIfExists(hsPath)
+        Files.deleteIfExists(tmpDir)
+    }
+
+    "should zero-fill trailing votedFor bytes when overwriting a long NodeId with a shorter one" in {
+      val tmpDir = Files.createTempDirectory("raft-hs-zeropad-")
+      val hsPath = tmpDir.resolve("hard_state.bin")
+
+      val hs = MmapHardState.open(hsPath)
+      try
+        hs.write(
+          HardState(
+            Term.unsafeFrom(2L),
+            Some(NodeId("very-long-candidate-node-identifier-1234567890"))
+          )
+        )
+        hs.write(HardState(Term.unsafeFrom(3L), Some(NodeId("n1"))))
+        hs.read shouldBe HardState(Term.unsafeFrom(3L), Some(NodeId("n1")))
+
+        val raw = Files.readAllBytes(hsPath)
+        // Bytes [14..268) must be strictly zero-padded
+        raw.slice(14, 268).forall(_ == 0.toByte) shouldBe true
+      finally
+        hs.close()
+        Files.deleteIfExists(hsPath)
+        Files.deleteIfExists(tmpDir)
+    }
+
+    "should reject votedFor NodeId exceeding 256 UTF-8 bytes" in withHardState {
+      (hs, _) =>
+        val oversized = NodeId("x" * 257)
+        intercept[IllegalArgumentException] {
+          hs.write(HardState(Term.unsafeFrom(1L), Some(oversized)))
+        }
+    }
   }

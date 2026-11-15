@@ -21,6 +21,26 @@ message WireAck {
   bool accepted = 1;
 }
 
+message RaftWirePayload {
+  oneof message {
+    AppendEntriesRequest append_entries_req = 1;
+    AppendEntriesResponse append_entries_resp = 2;
+    RequestVoteRequest request_vote_req = 3;
+    RequestVoteResponse request_vote_resp = 4;
+    InstallSnapshotChunk install_snapshot_req = 5;
+    InstallSnapshotResponse install_snapshot_resp = 6;
+    TransferLeadershipRequest transfer_leadership_req = 7;
+    TimeoutNowRequest timeout_now_req = 8;
+    ReadIndexRequest read_index_req = 9;
+    ReadIndexResponse read_index_resp = 10;
+    AddServerRequest add_server_req = 11;
+    AddServerResponse add_server_resp = 12;
+    RemoveServerRequest remove_server_req = 13;
+    RemoveServerResponse remove_server_resp = 14;
+    TimerTick timer_tick = 15;
+  }
+}
+
 message AppendEntriesRequest {
   int64 term = 1;
   string leader_id = 2;
@@ -34,6 +54,10 @@ message AppendEntriesResponse {
   int64 term = 1;
   bool success = 2;
   int64 match_index = 3;
+  bool has_conflict_index = 4;
+  int64 conflict_index = 5;
+  bool has_conflict_term = 6;
+  int64 conflict_term = 7;
 }
 
 message RequestVoteRequest {
@@ -42,6 +66,7 @@ message RequestVoteRequest {
   int64 last_log_index = 3;
   int64 last_log_term = 4;
   bool is_pre_vote = 5;
+  bool is_transfer = 6;
 }
 
 message RequestVoteResponse {
@@ -63,6 +88,63 @@ message InstallSnapshotChunk {
 message InstallSnapshotResponse {
   int64 term = 1;
   bool success = 2;
+  int64 match_index = 3;
+}
+
+message TransferLeadershipRequest {
+  int64 term = 1;
+  string target_id = 2;
+}
+
+message TimeoutNowRequest {
+  int64 term = 1;
+  string leader_id = 2;
+}
+
+message ReadIndexRequest {
+  string request_id = 1;
+}
+
+message ReadIndexResponse {
+  string request_id = 1;
+  bool success = 2;
+  int64 read_index = 3;
+}
+
+message AddServerRequest {
+  int64 term = 1;
+  string new_server = 2;
+  bool is_learner = 3;
+}
+
+message AddServerResponse {
+  int64 term = 1;
+  bool success = 2;
+  bool has_leader_hint = 3;
+  string leader_hint = 4;
+}
+
+message RemoveServerRequest {
+  int64 term = 1;
+  string server = 2;
+}
+
+message RemoveServerResponse {
+  int64 term = 1;
+  bool success = 2;
+  bool has_leader_hint = 3;
+  string leader_hint = 4;
+}
+
+enum TimerKind {
+  TIMER_UNSPECIFIED = 0;
+  ELECTION_TIMEOUT = 1;
+  HEARTBEAT_TIMEOUT = 2;
+  CHECK_QUORUM_TIMEOUT = 3;
+}
+
+message TimerTick {
+  TimerKind kind = 1;
 }
 
 message LogEntry {

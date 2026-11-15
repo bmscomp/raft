@@ -212,4 +212,48 @@ class StorageBackedAdaptersSpec
           term <- stableStore.currentTerm
         yield term shouldBe Term.unsafeFrom(3L)
     }
+
+    "should persist term and votedFor atomically via setHardState" in withAdapters {
+      (_, stableStore) =>
+        for
+          _ <- stableStore.setHardState(
+            Term.unsafeFrom(12L),
+            Some(NodeId("atomic-leader"))
+          )
+          hs <- stableStore.hardState
+        yield hs shouldBe HardState(
+          Term.unsafeFrom(12L),
+          Some(NodeId("atomic-leader"))
+        )
+    }
+  }
+
+  "StorageBackedSnapshotStore" - {
+    "should save, loadLatest, list, and delete snapshots over MmapWalEngine" in {
+      val tmpDir = Files.createTempDirectory("raft-snap-adapter-test-")
+      MmapWalEngine.open[IO](tmpDir).flatMap { engine =>
+        val snapStore = StorageBackedSnapshotStore(engine)
+        val snap = raft.state.Snapshot[IO](
+          lastIncludedIndex = 42L,
+          lastIncludedTerm = 4L,
+          data =
+            fs2.Stream.emits("kv-snapshot-payload".getBytes("UTF-8")).covary[IO]
+        )
+        (for
+          initial <- snapStore.loadLatest
+          _ <- snapStore.save(snap)
+          latest <- snapStore.loadLatest
+          latestBytes <- latest.get.data.compile.to(Array)
+          listed <- snapStore.list
+          _ <- snapStore.delete(42L)
+          afterDelete <- snapStore.list
+        yield
+          initial shouldBe None
+          latest.map(_.lastIncludedIndex) shouldBe Some(42L)
+          new String(latestBytes, "UTF-8") shouldBe "kv-snapshot-payload"
+          listed.map(_.lastIncludedIndex) shouldBe Vector(42L)
+          afterDelete shouldBe empty
+        ).guarantee(engine.close *> IO(deleteRecursive(tmpDir)))
+      }
+    }
   }
