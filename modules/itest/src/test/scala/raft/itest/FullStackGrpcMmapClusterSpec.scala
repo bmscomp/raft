@@ -322,7 +322,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       }
     yield ()).use_.guarantee(IO(deleteRecursive(baseDir)))
 
-    prog.unsafeRunSync()
+    prog.timeout(45.seconds).unsafeRunSync()
   }
 
   it should "survive hard leader shutdown, elect a failover leader, and recover the restarted node from on-disk MmapWalEngine" in {
@@ -463,7 +463,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
         )
       }
 
-    prog.unsafeRunSync()
+    prog.timeout(45.seconds).unsafeRunSync()
   }
 
   it should "satisfy WGL linearizability (KVModel) under concurrent multi-client reads and writes over gRPC + MmapWalEngine" in {
@@ -651,5 +651,5 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       }
     yield ()).use_.guarantee(IO(deleteRecursive(baseDir)))
 
-    prog.unsafeRunSync()
+    prog.timeout(45.seconds).unsafeRunSync()
   }

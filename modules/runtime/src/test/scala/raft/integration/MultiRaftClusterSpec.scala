@@ -271,5 +271,5 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
       )
     yield ()
 
-    prog.unsafeRunSync()
+    prog.timeout(45.seconds).unsafeRunSync()
   }

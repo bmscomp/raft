@@ -341,12 +341,12 @@ object GrpcTransport:
   ): RaftServiceGrpc.RaftService =
     new RaftServiceGrpc.RaftService:
       override def sendEnvelope(request: WireEnvelope): Future[WireAck] =
-        val enqueue = incomingQueue.offer(
+        val enqueue = incomingQueue.tryOffer(
           (NodeId(request.senderId), request.payload.toByteArray)
         )
         dispatcher
           .unsafeToFuture(enqueue)
-          .map(_ => WireAck(accepted = true))(
+          .map(accepted => WireAck(accepted = accepted))(
             ExecutionContext.parasitic
           )
 

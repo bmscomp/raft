@@ -16,6 +16,7 @@ jobs:
   lint-and-docs:
     name: Format & Scaladoc (JDK 25)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -35,6 +36,7 @@ jobs:
   compat-jdk21:
     name: JDK 21 Bytecode Compatibility (core & runtime)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -54,6 +56,7 @@ jobs:
   test-and-jepsen:
     name: Unit, DST & Jepsen Smoke (JDK 25)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -73,6 +76,7 @@ jobs:
   coverage:
     name: Scoverage Report (JDK 25)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [lint-and-docs, test-and-jepsen]
     steps:
       - uses: actions/checkout@v7
