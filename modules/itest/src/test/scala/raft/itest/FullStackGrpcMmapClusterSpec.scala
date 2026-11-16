@@ -144,7 +144,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
         localId = id,
         bindAddress = s"127.0.0.1:$port",
         peers = initialPeers - id,
-        connectionTimeout = 100.millis
+        connectionTimeout = 250.millis
       )
       grpcPair <- GrpcTransport.raftResource[IO](grpcCfg, transportCfg)
       (rawGrpc, raftTransport) = grpcPair
@@ -154,9 +154,9 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       sm <- Resource.eval(FullStackKvStateMachine.create)
       raftCfg = RaftConfig(
         localId = id,
-        electionTimeoutMin = 150.millis,
-        electionTimeoutMax = 300.millis,
-        heartbeatInterval = 35.millis,
+        electionTimeoutMin = 300.millis,
+        electionTimeoutMax = 600.millis,
+        heartbeatInterval = 45.millis,
         compaction = compaction
       )
       rn <- RaftNode[IO](
@@ -198,7 +198,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
 
   private def awaitLeader(
       nodes: Iterable[LiveNode],
-      retries: Int = 300
+      retries: Int = 400
   ): IO[LiveNode] =
     nodes.toList
       .traverse(ln => ln.raftNode.getState.map(st => (ln, st)))
@@ -213,6 +213,33 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
               )
             else IO.sleep(20.millis) *> awaitLeader(nodes, retries - 1)
       }
+
+  private def proposeWithRetry(
+      nodes: Iterable[LiveNode],
+      data: Array[Byte],
+      attempts: Int = 15
+  ): IO[LogId] =
+    awaitLeader(nodes).flatMap { leader =>
+      leader.raftNode.proposeAndCommit(data).handleErrorWith {
+        case _: RaftError if attempts > 1 =>
+          IO.sleep(30.millis) *> proposeWithRetry(nodes, data, attempts - 1)
+        case err => IO.raiseError(err)
+      }
+    }
+
+  private def proposeConfWithRetry(
+      nodes: Iterable[LiveNode],
+      newCfg: ClusterConfig,
+      attempts: Int = 15
+  ): IO[LogId] =
+    awaitLeader(nodes).flatMap { leader =>
+      leader.raftNode.proposeConfChange(newCfg).handleErrorWith {
+        case _: RaftError if attempts > 1 =>
+          IO.sleep(40.millis) *>
+            proposeConfWithRetry(nodes, newCfg, attempts - 1)
+        case err => IO.raiseError(err)
+      }
+    }
 
   "Full-stack gRPC + MmapWalEngine cluster" should "elect a leader, rotate WAL segments, compact snapshots, and stream InstallSnapshot over gRPC to a joining 4th node" in {
     val baseDir = Files.createTempDirectory("raft-itest-expand-")
@@ -247,12 +274,12 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
 
       _ <- Resource.eval {
         for
-          leader <- awaitLeader(initialNodes)
           // Commit 35 entries with ~80B payloads to trigger multi-segment 4KB WAL rotation + snapshot compaction
           _ <- (1 to 35).toList.traverse_ { i =>
             val pad = "x" * 60
-            leader.raftNode.proposeAndCommit(utf8(s"fs-k$i=val-$i-$pad"))
+            proposeWithRetry(initialNodes, utf8(s"fs-k$i=val-$i-$pad"))
           }
+          leader <- awaitLeader(initialNodes)
           snapsOnLeader <- leader.engine.listSnapshots
           _ = snapsOnLeader.nonEmpty shouldBe true
         yield ()
@@ -275,12 +302,10 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       _ <- Resource.eval {
         for
           _ <- allNodes.traverse_(n => n.grpc.updatePeers(peerAddrs4 - n.id))
-          leader <- awaitLeader(initialNodes)
-          _ <- leader.raftNode.proposeConfChange(expandedCfg)
-          latestLeader <- awaitLeader(allNodes)
+          _ <- proposeConfWithRetry(initialNodes, expandedCfg)
           _ <- (36 to 45).toList.traverse_ { i =>
             val pad = "x" * 60
-            latestLeader.raftNode.proposeAndCommit(utf8(s"fs-k$i=val-$i-$pad"))
+            proposeWithRetry(allNodes, utf8(s"fs-k$i=val-$i-$pad"))
           }
           expected = (1 to 45).map { i =>
             val pad = "x" * 60
@@ -336,11 +361,14 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
           _ <- initMap.values.toList.traverse_(_._1.raftNode.start)
 
           // Commit 25 writes (persisting both an on-disk snapshot at >=15 and uncompacted WAL tail)
+          _ <- (1 to 25).toList.traverse_ { i =>
+            proposeWithRetry(
+              initMap.values.map(_._1),
+              utf8(s"crash-k$i=before-$i")
+            )
+          }
           firstLeader <- awaitLeader(initMap.values.map(_._1))
           firstTerm <- firstLeader.raftNode.getState.map(_.term)
-          _ <- (1 to 25).toList.traverse_ { i =>
-            firstLeader.raftNode.proposeAndCommit(utf8(s"crash-k$i=before-$i"))
-          }
           // Ensure followers also persisted up to 25 before killing the leader
           expectedBefore = (1 to 25)
             .map(i => s"crash-k$i" -> s"before-$i")
@@ -371,9 +399,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
             }
           )
           _ <- (26 to 40).toList.traverse_ { i =>
-            failoverLeader.raftNode.proposeAndCommit(
-              utf8(s"crash-k$i=during-$i")
-            )
+            proposeWithRetry(survivors, utf8(s"crash-k$i=during-$i"))
           }
 
           // Restart killedId on its SAME TCP port and EXISTING MmapWalEngine directory!

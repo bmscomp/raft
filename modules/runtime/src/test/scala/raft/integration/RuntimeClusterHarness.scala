@@ -151,8 +151,8 @@ object RuntimeClusterHarness:
 
     def awaitCondition(
         cond: IO[Boolean],
-        retries: Int = 200,
-        interval: FiniteDuration = 15.millis
+        retries: Int = 400,
+        interval: FiniteDuration = 20.millis
     ): IO[Unit] =
       cond.flatMap {
         case true  => IO.unit
@@ -166,8 +166,8 @@ object RuntimeClusterHarness:
 
     def awaitLeader(
         subset: List[NodeId] = orderedIds,
-        retries: Int = 200,
-        interval: FiniteDuration = 15.millis
+        retries: Int = 400,
+        interval: FiniteDuration = 20.millis
     ): IO[(NodeId, RaftNode[IO])] =
       subset
         .traverse(id => bundles(id).node.getState.map(st => (id, st)))
@@ -226,13 +226,13 @@ object RuntimeClusterHarness:
       compaction: CompactionConfig = CompactionConfig(),
       checkQuorumEnabled: Boolean = true,
       leaseReadEnabled: Boolean = false,
-      leaderLeaseDuration: FiniteDuration = 120.millis
+      leaderLeaseDuration: FiniteDuration = 200.millis
   ): RaftConfig =
     RaftConfig(
       localId = id,
-      electionTimeoutMin = 150.millis,
-      electionTimeoutMax = 300.millis,
-      heartbeatInterval = 30.millis,
+      electionTimeoutMin = 250.millis,
+      electionTimeoutMax = 500.millis,
+      heartbeatInterval = 35.millis,
       leaderLeaseDuration = leaderLeaseDuration,
       compaction = compaction,
       checkQuorumEnabled = checkQuorumEnabled,

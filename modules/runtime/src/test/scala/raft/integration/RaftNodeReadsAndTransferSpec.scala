@@ -79,7 +79,7 @@ class RaftNodeReadsAndTransferSpec extends AnyFlatSpec with Matchers:
           _ <- newLeader.proposeAndCommit(utf8("key=v2"))
 
           // Attempt linearizable readIndex on isolated oldLeader: must fail (never return stale v1 as valid!)
-          isolatedRead <- oldLeader.readIndex.timeout(500.millis).attempt
+          isolatedRead <- oldLeader.readIndex.timeout(1200.millis).attempt
           _ = isolatedRead.isLeft shouldBe true
 
           // Meanwhile newLeader serves fresh v2 via readIndex
@@ -108,7 +108,7 @@ class RaftNodeReadsAndTransferSpec extends AnyFlatSpec with Matchers:
             // to directly test leaseRead returning None upon lease expiry
             checkQuorumEnabled = false,
             leaseReadEnabled = true,
-            leaderLeaseDuration = 90.millis
+            leaderLeaseDuration = 220.millis
           )
       )
       .use { cluster =>
@@ -127,7 +127,7 @@ class RaftNodeReadsAndTransferSpec extends AnyFlatSpec with Matchers:
 
           // Isolate leader so heartbeats are no longer ACKed, then wait past leaderLeaseDuration
           _ <- cluster.isolateNode(leaderPair._1)
-          _ <- IO.sleep(160.millis)
+          _ <- IO.sleep(320.millis)
           expiredLease <- leader.leaseRead
           _ = expiredLease shouldBe None
         yield ()

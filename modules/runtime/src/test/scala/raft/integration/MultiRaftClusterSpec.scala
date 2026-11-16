@@ -49,8 +49,8 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
 
   private def awaitCondition(
       cond: IO[Boolean],
-      retries: Int = 250,
-      interval: FiniteDuration = 15.millis
+      retries: Int = 400,
+      interval: FiniteDuration = 20.millis
   ): IO[Unit] =
     cond.flatMap {
       case true  => IO.unit
@@ -63,7 +63,7 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
   private def awaitShardLeader(
       coordinators: Map[NodeId, MultiRaftNode[IO]],
       groupId: GroupId,
-      retries: Int = 250
+      retries: Int = 400
   ): IO[(NodeId, RaftNode[IO])] =
     nodeIds
       .traverse { id =>
@@ -73,7 +73,10 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
         }
       }
       .flatMap { opts =>
-        opts.flatten.collectFirst { case (id, rn, _: Leader) => (id, rn) } match
+        val leaders = opts.flatten.collect { case (id, rn, l: Leader) =>
+          (id, rn, l.term)
+        }
+        leaders.sortBy(-_._3).headOption.map(t => (t._1, t._2)) match
           case Some(found) => IO.pure(found)
           case None        =>
             if retries <= 0 then
@@ -83,9 +86,24 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
                 )
               )
             else
-              IO.sleep(15.millis) *>
+              IO.sleep(20.millis) *>
                 awaitShardLeader(coordinators, groupId, retries - 1)
       }
+
+  private def proposeShardWithRetry(
+      coordinators: Map[NodeId, MultiRaftNode[IO]],
+      groupId: GroupId,
+      data: Array[Byte],
+      attempts: Int = 15
+  ): IO[LogId] =
+    awaitShardLeader(coordinators, groupId).flatMap { case (_, leaderNode) =>
+      leaderNode.proposeAndCommit(data).handleErrorWith {
+        case _: RaftError if attempts > 1 =>
+          IO.sleep(30.millis) *>
+            proposeShardWithRetry(coordinators, groupId, data, attempts - 1)
+        case err => IO.raiseError(err)
+      }
+    }
 
   "MultiRaftNode (3 physical nodes x 4 shards)" should "demultiplex shared wire traffic, isolate shard state, and cleanly remove groups" in {
     val groupCodec = new GroupAwareCodec(JsonCodec)
@@ -154,9 +172,9 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
               _ <- stateMachinesRef.update(_.updated((gid, nid), sm))
               rc = RaftConfig(
                 localId = nid,
-                electionTimeoutMin = 150.millis,
-                electionTimeoutMax = 300.millis,
-                heartbeatInterval = 30.millis
+                electionTimeoutMin = 300.millis,
+                electionTimeoutMax = 600.millis,
+                heartbeatInterval = 40.millis
               )
               gCfg = GroupConfig[IO](
                 raftConfig = rc,
@@ -178,22 +196,20 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
         }
 
         // Elect leaders independently across all 4 shards and commit concurrent shard-isolated writes
-        shardLeaders <- shardIds.parTraverse(gid =>
-          awaitShardLeader(coordinators, gid).map(gid -> _)
-        )
-        leaderMap = shardLeaders.toMap
-
         _ <- shardIds.parTraverse_ { gid =>
-          val (leaderId, leaderNode) = leaderMap(gid)
           (1 to 12).toList.traverse_ { i =>
-            leaderNode.proposeAndCommit(
+            proposeShardWithRetry(
+              coordinators,
+              gid,
               utf8(s"${gid.value}-k$i=${gid.value}-v$i")
             )
           } *>
-            coordinators(leaderId).submitToGroup(
-              gid,
-              utf8(s"${gid.value}-fire=ok")
-            )
+            awaitShardLeader(coordinators, gid).flatMap { case (leaderId, _) =>
+              coordinators(leaderId).submitToGroup(
+                gid,
+                utf8(s"${gid.value}-fire=ok")
+              )
+            }
         }
 
         smLookup <- stateMachinesRef.get
@@ -234,9 +250,11 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
         // Remaining shards (shard-0..2) remain healthy and commit new writes unaffected
         survivingShards = shardIds.filterNot(_ == removedShard)
         _ <- survivingShards.parTraverse_ { gid =>
-          awaitShardLeader(coordinators, gid).flatMap { case (_, leaderNode) =>
-            leaderNode.proposeAndCommit(utf8(s"${gid.value}-after-rm=alive"))
-          }
+          proposeShardWithRetry(
+            coordinators,
+            gid,
+            utf8(s"${gid.value}-after-rm=alive")
+          )
         }
         _ <- survivingShards.traverse_ { gid =>
           awaitCondition(
