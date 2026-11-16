@@ -12,6 +12,8 @@ val catsEffectTestingVersion = "1.8.0"
 ThisBuild / organization := "com.github.bmscomp"
 ThisBuild / scalaVersion := scala3Version
 ThisBuild / dynverSeparator := "-"
+ThisBuild / coverageMinimumStmtTotal := 85
+ThisBuild / coverageFailOnMinimum := true
 
 lazy val commonScalacOptions = Seq(
   "-encoding",
@@ -53,6 +55,7 @@ lazy val commonTestDependencies = Seq(
 )
 
 lazy val effectTestDependencies = commonTestDependencies ++ Seq(
+  "org.typelevel" %% "cats-effect-testkit" % catsEffectVersion % Test,
   "org.typelevel" %% "cats-effect-testing-scalatest" % catsEffectTestingVersion % Test,
   "org.typelevel" %% "log4cats-slf4j" % log4catsVersion % Test,
   "ch.qos.logback" % "logback-classic" % logbackVersion % Test
@@ -148,9 +151,20 @@ lazy val examples = project
     ) ++ effectTestDependencies
   )
 
+lazy val itest = project
+  .in(file("modules/itest"))
+  .dependsOn(core, runtime, storageMmap, transportGrpc, jepsen)
+  .settings(
+    name := "raft-itest",
+    publish / skip := true,
+    coverageEnabled := false,
+    scalacOptions ++= commonScalacOptions,
+    libraryDependencies ++= effectTestDependencies
+  )
+
 lazy val root = project
   .in(file("."))
-  .aggregate(core, runtime, storageMmap, transportGrpc, jepsen, examples)
+  .aggregate(core, runtime, storageMmap, transportGrpc, jepsen, examples, itest)
   .settings(
     name := "raft-root",
     publish / skip := true,

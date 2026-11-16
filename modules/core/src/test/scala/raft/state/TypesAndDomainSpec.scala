@@ -199,3 +199,73 @@ class TypesAndDomainSpec
       RaftError.StorageCorruption("CRC mismatch").detail should include("CRC")
     }
   }
+
+  "RaftMessage.term extension and CompactionConfig.shouldCompactPure" - {
+    "should extract Some(term) for RPC messages and None for read/timer messages" in {
+      import raft.message.RaftMessage
+      import raft.message.RaftMessage.*
+
+      val n1 = NodeId("n1")
+      val withTerms: List[(RaftMessage, Long)] = List(
+        AppendEntriesRequest(3L, n1, 0L, 0L, Nil, 0L) -> 3L,
+        AppendEntriesResponse(4L, true, 1L) -> 4L,
+        RequestVoteRequest(5L, n1, 0L, 0L) -> 5L,
+        RequestVoteResponse(6L, true) -> 6L,
+        InstallSnapshotRequest(
+          7L,
+          n1,
+          10L,
+          2L,
+          0L,
+          Array.emptyByteArray,
+          true
+        ) -> 7L,
+        InstallSnapshotResponse(8L, true, 10L) -> 8L,
+        TransferLeadershipRequest(9L, n1) -> 9L,
+        TimeoutNowRequest(10L, n1) -> 10L,
+        AddServerRequest(11L, n1, false) -> 11L,
+        AddServerResponse(12L, true, Some(n1)) -> 12L,
+        RemoveServerRequest(13L, n1) -> 13L,
+        RemoveServerResponse(14L, true, None) -> 14L
+      )
+      withTerms.foreach { case (m, expected) =>
+        m.term shouldBe Some(expected)
+      }
+
+      val withoutTerms: List[RaftMessage] = List(
+        ReadIndexRequest("r1"),
+        ReadIndexResponse("r1", true, 5L),
+        ElectionTimeout,
+        HeartbeatTimeout,
+        CheckQuorumTimeout
+      )
+      withoutTerms.foreach(_.term shouldBe None)
+    }
+
+    "should evaluate pure compaction thresholds across all CompactionLevel presets" in {
+      CompactionConfig(CompactionLevel.Disabled).shouldCompactPure(
+        50_000L,
+        0L
+      ) shouldBe false
+      CompactionConfig(CompactionLevel.Custom).shouldCompactPure(
+        50_000L,
+        0L
+      ) shouldBe false
+      CompactionConfig(CompactionLevel.Aggressive).shouldCompactPure(
+        99L,
+        0L
+      ) shouldBe false
+      CompactionConfig(CompactionLevel.Aggressive).shouldCompactPure(
+        100L,
+        0L
+      ) shouldBe true
+      CompactionConfig(CompactionLevel.Moderate).shouldCompactPure(
+        1_000L,
+        0L
+      ) shouldBe true
+      CompactionConfig(CompactionLevel.Conservative).shouldCompactPure(
+        10_000L,
+        0L
+      ) shouldBe true
+    }
+  }

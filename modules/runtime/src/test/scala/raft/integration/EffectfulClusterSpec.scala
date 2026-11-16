@@ -235,3 +235,62 @@ class EffectfulClusterSpec extends AnyFlatSpec with Matchers:
     req.candidateId shouldBe a
     req.isPreVote shouldBe false
   }
+
+  "Transport.withEffectfulCodec and CodecInterop" should "encode, batch, broadcast, and filter invalid frames" in {
+    import java.nio.charset.StandardCharsets
+    import cats.effect.std.Queue
+    import fs2.Stream
+    import raft.codec.JsonCodec
+    import raft.spi.{CodecInterop, Transport}
+    import raft.spi.CodecInterop.mapWire
+
+    val n1 = NodeId("n1")
+    val n2 = NodeId("n2")
+    val effectfulCodec = CodecInterop
+      .fromSimple[IO, String](JsonCodec)
+      .mapWire[Array[Byte]](
+        _.getBytes(StandardCharsets.UTF_8),
+        new String(_, StandardCharsets.UTF_8)
+      )
+
+    val prog = for
+      q <- Queue.unbounded[IO, (NodeId, Array[Byte])]
+      raw = new Transport[IO, Array[Byte]]:
+        import cats.syntax.all.*
+        def send(to: NodeId, msg: Array[Byte]): IO[Unit] = q.offer((n1, msg))
+        def sendBatch(to: NodeId, msgs: Seq[Array[Byte]]): IO[Unit] =
+          msgs.toList.traverse_(m => q.offer((n1, m)))
+        def broadcast(msg: Array[Byte]): IO[Unit] = q.offer((n1, msg))
+        def receive: Stream[IO, (NodeId, Array[Byte])] =
+          Stream.fromQueueUnterminated(q)
+        def localAddress: IO[String] = IO.pure("mem://n1")
+        def shutdown: IO[Unit] = IO.unit
+
+      wrapped = Transport.withEffectfulCodec(raw, effectfulCodec)
+      addr <- wrapped.localAddress
+      _ <- wrapped.send(n2, HeartbeatTimeout)
+      _ <- q.offer((n2, "not-valid-json".getBytes(StandardCharsets.UTF_8)))
+      _ <- wrapped.sendBatch(
+        n2,
+        Seq(ElectionTimeout, CheckQuorumTimeout)
+      )
+      _ <- wrapped.broadcast(RequestVoteResponse(3L, voteGranted = true))
+      decoded <- wrapped.receive.take(4).compile.toVector
+      _ <- wrapped.shutdown
+      timerSvc <- DefaultTimerServiceFactory[IO].create
+      timeout <- timerSvc.randomElectionTimeout(
+        scala.concurrent.duration.DurationInt(100).millis
+      )
+    yield {
+      addr shouldBe "mem://n1"
+      decoded.map(_._2) shouldBe Vector(
+        HeartbeatTimeout,
+        ElectionTimeout,
+        CheckQuorumTimeout,
+        RequestVoteResponse(3L, voteGranted = true)
+      )
+      timeout.toMillis should be >= 100L
+    }
+
+    prog.unsafeRunSync()
+  }

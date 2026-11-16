@@ -1,227 +1,255 @@
-# Chapter 18: End-to-End Integration with RaftNode
+# Chapter 18: End-to-End Integration & Full-Stack Cluster Lifecycle
 
-*The previous chapters built your understanding from pure functions to complete applications. This chapter shows how to wire everything together using `RaftNode[F, M]` — the library's ready-made runtime that combines the pure protocol logic with real SPI implementations into a running Raft cluster.*
+*Previous chapters explored the pure `RaftLogic` state machine, the `RawNode` Sans-I/O harness, the SPI contracts, the FFM `MmapWalEngine`, and the Netty `GrpcTransport`. This chapter shows how all layers compose into a production `Resource` hierarchy using `RaftNode[F]`, how crash recovery reconstructs exact cluster state from disk, and how multi-tier integration suites verify every seam.*
 
 ---
 
-## The Gap Between Pure Logic and a Running Cluster
+## Composing the Full Stack as a Cats Effect `Resource`
 
-Throughout this book, we've called `RaftLogic.onMessage` directly and manually interpreted effects. This is powerful for learning and testing, but for production you need:
-
-- A **message loop** that continuously receives and processes events
-- **Concurrent timers** that fire election timeouts and heartbeat ticks
-- **Persistent storage** that survives process restarts
-- **Network transport** that delivers messages to the right nodes
-- **Thread safety** for concurrent event sources
-
-The `RaftNode` class handles all of these concerns:
+A running Raft node owns multiple stateful lifecycles: memory-mapped `Arena` segments, HTTP/2 Netty servers and `ManagedChannel` pools, background election/heartbeat/quorum-check fibers, and an inbound RPC event loop. Wrapping each layer in `cats.effect.Resource` guarantees **deterministic LIFO teardown** — on shutdown or error, `RaftNode` cancels its fibers and fails in-flight client `Deferred`s *before* `GrpcTransport` closes sockets and *before* `MmapWalEngine` unmaps `MemorySegment` arenas:
 
 ```mermaid
-flowchart TB
-    subgraph RaftNode["RaftNode[IO, MyCommand]"]
-        direction TB
-        ML["Message Loop\n(FS2 Stream)"]
-        EI["Effect Interpreter\n(pattern match)"]
-        SR["State Ref\n(cats.effect.Ref)"]
+flowchart TD
+    subgraph Lifecycle["Cats Effect Resource Acquisition (Top-Down) & Release (Bottom-Up)"]
+        WAL["1. MmapWalEngine.resource (hard_state.bin + .wal segments + snapshots/)"]
+        ADAPT["2. Storage Adapters (StorageBackedLogStore / StableStore / SnapshotStore)"]
+        GRPC["3. GrpcTransport.raftResource (Netty HTTP/2 Server + ProtobufMessageCodec)"]
+        TIMER["4. DefaultTimerService + Application StateMachine"]
+        NODE["5. RaftNode.apply (Mutex + Event Loop + Election / Heartbeat / CheckQuorum Fibers)"]
     end
 
-    subgraph SPIs["SPI Implementations"]
-        T["Transport[IO]"]
-        LS["LogStore[IO]"]
-        SS["StableStore[IO]"]
-        SM["StateMachine[IO, Response]"]
-        TS["TimerService[IO]"]
-    end
-
-    T --> ML
-    TS --> ML
-    ML --> SR
-    SR --> EI
-    EI --> T
-    EI --> LS
-    EI --> SS
-    EI --> SM
-    EI --> TS
+    WAL --> ADAPT
+    ADAPT --> NODE
+    GRPC --> NODE
+    TIMER --> NODE
 ```
 
-## Creating a RaftNode
+### Production Wiring Example
 
 ```scala
-import cats.effect.{IO, IOApp, Ref}
-import raft.*
+import java.nio.charset.StandardCharsets
+import java.nio.file.Path
+import scala.concurrent.duration.*
+
+import cats.effect.{IO, IOApp, Ref, Resource}
+import fs2.{Chunk, Stream}
+
+import raft.RaftNode
+import raft.impl.DefaultTimerService
+import raft.spi.{CompactionPolicy, StateMachine, TransportConfig}
 import raft.state.*
-import raft.spi.*
-import raft.impl.*
+import raft.storage.{
+  StorageBackedLogStore,
+  StorageBackedSnapshotStore,
+  StorageBackedStableStore
+}
+import raft.storage.mmap.MmapWalEngine
+import raft.transport.grpc.{GrpcConfig, GrpcTransport}
 
-object MyRaftApp extends IOApp.Simple:
+final class KvStore(ref: Ref[IO, Map[String, String]])
+    extends StateMachine[IO, Unit]:
 
-  val nodeId = NodeId("node-1")
-  val peers  = List(NodeId("node-2"), NodeId("node-3"))
+  def apply(log: Log): IO[Unit] =
+    new String(log.data, StandardCharsets.UTF_8).split("=", 2) match
+      case Array(k, v) => ref.update(_.updated(k, v))
+      case _           => IO.unit
 
-  val config = RaftConfig(
-    localId = nodeId,
-    preVoteEnabled = true,
-    heartbeatInterval = 150.millis,
-    electionTimeoutMin = 1500.millis,
-    electionTimeoutMax = 3000.millis,
-    batching = BatchConfig(enabled = true, maxSize = 100, maxWait = 10.millis),
-    pipelining = PipelineConfig(enabled = true, maxInflight = 10),
-    parallelReplicationEnabled = true
-  )
+  def snapshot: IO[Stream[IO, Byte]] =
+    ref.get.map { entries =>
+      val bytes = entries.toSeq
+        .sortBy(_._1)
+        .map((k, v) => s"$k=$v")
+        .mkString("\n")
+        .getBytes(StandardCharsets.UTF_8)
+      Stream.chunk(Chunk.array(bytes)).covary[IO]
+    }
 
-  def run: IO[Unit] =
+  def restore(data: Stream[IO, Byte]): IO[Unit] =
+    data.compile.to(Array).flatMap { bytes =>
+      val text = new String(bytes, StandardCharsets.UTF_8)
+      val restored =
+        if text.isEmpty then Map.empty[String, String]
+        else
+          text
+            .split("\n")
+            .flatMap { line =>
+              line.split("=", 2) match
+                case Array(k, v) => Some(k -> v)
+                case _           => None
+            }
+            .toMap
+      ref.set(restored)
+    }
+
+  def get(key: String): IO[Option[String]] = ref.get.map(_.get(key))
+
+object ProductionNode:
+
+  def resource(
+      localId: NodeId,
+      dataDir: Path,
+      bindPort: Int,
+      peers: Map[NodeId, String],
+      bootstrapCluster: ClusterConfig
+  ): Resource[IO, (RaftNode[IO], KvStore)] =
     for
-      // Initialize SPI implementations
-      transport   <- InMemTransport[IO]
-      logStore    <- InMemLogStore[IO]
-      stableStore <- InMemStableStore[IO]
-      timerSvc    <- DefaultTimerService[IO](config)
+      engine <- MmapWalEngine.resource[IO](dataDir)
+      logStore = StorageBackedLogStore(engine)
+      stableStore = StorageBackedStableStore(engine)
+      snapStore = StorageBackedSnapshotStore(engine)
 
-      // Define your state machine
-      stateMachine = new StateMachine[IO, String]:
-        private val state = Ref.unsafe[IO, Map[String, String]](Map.empty)
-        def apply(entry: Log): IO[String] =
-          val cmd = new String(entry.data)
-          val Array(key, value) = cmd.split("=", 2)
-          state.modify(s => (s + (key -> value), s"OK: $key=$value"))
-        def snapshot: IO[Array[Byte]] = state.get.map(_.toString.getBytes)
-        def restore(data: Array[Byte]): IO[Unit] = IO.unit
+      grpcCfg = GrpcConfig(
+        host = "0.0.0.0",
+        port = bindPort,
+        maxInboundQueueSize = 4096
+      )
+      transportCfg = TransportConfig(
+        localId = localId,
+        bindAddress = s"0.0.0.0:$bindPort",
+        peers = peers - localId
+      )
+      grpcPair <- GrpcTransport.raftResource[IO](grpcCfg, transportCfg)
+      (_, raftTransport) = grpcPair
 
-      // Create and start the RaftNode
-      node <- RaftNode.create(config, transport, logStore, stableStore,
-                              stateMachine, timerSvc, peers)
-      _    <- node.start
-    yield ()
+      timerSvc <- Resource.eval(DefaultTimerService[IO])
+      smRef <- Resource.eval(Ref.of[IO, Map[String, String]](Map.empty))
+      kv = new KvStore(smRef)
+
+      raftCfg = RaftConfig(
+        localId = localId,
+        electionTimeoutMin = 150.millis,
+        electionTimeoutMax = 300.millis,
+        heartbeatInterval = 50.millis,
+        compaction = CompactionConfig(
+          level = CompactionLevel.Custom,
+          snapshotChunkSize = 64 * 1024,
+          retainedEntries = 250L,
+          policy = Some(CompactionPolicy.threshold[IO](5_000L))
+        )
+      )
+
+      node <- RaftNode[IO](
+        config = raftCfg,
+        cluster = bootstrapCluster,
+        transport = raftTransport,
+        logStore = logStore,
+        stableStore = stableStore,
+        stateMachine = kv,
+        timerService = timerSvc,
+        snapshotStoreOpt = Some(snapStore)
+      )
+      _ <- Resource.eval(node.start)
+    yield (node, kv)
 ```
 
-## How Event Processing Works
+---
 
-The `RaftNode` event loop follows a strict sequence for each incoming event:
+## End-to-End Write, Compaction, and Crash-Recovery Path
+
+When a client calls `proposeAndCommit` on the active leader, every layer participates in strict causal order:
 
 ```mermaid
 sequenceDiagram
-    participant S as Event Source
-    participant R as Ref[NodeState]
-    participant L as RaftLogic
-    participant E as Effect Interpreter
+    participant C as Client Fiber
+    participant RN as Leader RaftNode
+    participant WAL as MmapWalEngine
+    participant GRPC as GrpcTransport
+    participant F as Follower Quorum
+    participant SM as StateMachine
 
-    S->>R: Incoming event (message or timer)
-    R->>R: Atomically read current state
-    R->>L: RaftLogic.onMessage(state, event, ...)
-    L-->>R: Transition(newState, effects)
-    R->>R: Atomically set new state
-    R->>E: Execute effects sequentially
-
-    Note over E: PersistHardState FIRST
-    Note over E: Then AppendLogs
-    Note over E: Then SendMessage / Broadcast
-    Note over E: Then ResetTimer
+    C->>RN: proposeAndCommit(payload)
+    RN->>WAL: append(Log.command) + forceRange
+    RN->>GRPC: AppendEntriesRequest (Protobuf WireEnvelope)
+    GRPC->>F: HTTP/2 unary RPC
+    F-->>GRPC: AppendEntriesResponse(success = true, matchIndex)
+    GRPC-->>RN: Deliver response to event loop
+    RN->>SM: apply(entry) at commitIndex
+    RN->>WAL: CompactionManager saveSnapshot + discardBefore (when policy fires)
+    RN-->>C: LogId(term, index)
 ```
 
 > [!IMPORTANT]
-> **Persistence before communication.** The effect interpreter must execute `PersistHardState` and `AppendLogs` effects **before** sending any messages. This ordering is critical for safety — if the node crashes after sending a message but before persisting its state, it could violate Raft's safety invariants on restart. The `RaftNode` runtime enforces this ordering automatically.
+> **Persistence before external visibility.** `RaftNode` persists `HardState` (`term`, `votedFor`) atomically via `StableStore.setHardState` and flushes log entries via `LogStore.append` before emitting outbound RPCs or completing client `Deferred`s.
 
-## Implementing Production SPIs
+### Crash Recovery Sequence on Restart
 
-The in-memory SPI implementations are perfect for testing and examples but not for production. Here's guidance for building real implementations:
+When a node crashes (`SIGKILL` or power loss) and restarts against an existing `MmapWalEngine` directory, `MmapWalEngine.open` and `RaftNode.start` cooperate in four deterministic phases:
 
-### Transport: Network Communication
-
-For production, you need a real network transport. Common choices:
-
-| Technology | Pros | Cons |
-|-----------|------|------|
-| **gRPC** | Strong typing, streaming, HTTP/2 multiplexing | Complexity, code generation |
-| **HTTP/2** | Simple, widely supported | Overhead for high-frequency messages |
-| **TCP sockets** | Lowest latency, full control | Must handle framing, reconnection |
-
-Key requirements from the `Transport[F]` SPI (see [Chapter 7](07-spi-layer.md)):
-- Messages must be delivered **in order** between any two nodes
-- The transport must handle reconnection transparently
-- Broadcast should be concurrent (don't let a slow node block others)
-
-### LogStore: Persistent Log
-
-The log must survive process restarts. Options:
-
-| Technology | Append Throughput | Recovery Time |
-|-----------|------------------|---------------|
-| **Write-ahead log (custom)** | Highest (sequential I/O) | Fast (replay from last checkpoint) |
-| **RocksDB / LevelDB** | High (LSM-tree) | Medium (compaction needed) |
-| **SQLite** | Medium | Fast |
-| **Flat files** | Low | Slow (full scan) |
-
-> [!WARNING]
-> The `LogStore` must call `fsync()` (or equivalent) after every write. Without `fsync`, the OS may buffer writes in memory, and a power failure could lose acknowledged entries. This is the most common source of data loss in Raft deployments.
-
-### StableStore: Term and VotedFor
-
-The `StableStore` persists exactly two values: the current `term` and `votedFor`. These must be durable and survive crashes. A single file with two fields, fsynced on every write, is sufficient.
-
-### TimerService: Election and Heartbeat Timers
-
-The `DefaultTimerService` implementation uses FS2 streams with `Stream.fixedDelay`. For production, ensure:
-
-- Election timeouts are **randomized** on each reset
-- Heartbeat ticks are **regular** with minimal jitter
-- Timer resolution is sufficient for your timeout settings (avoid timers with >50ms jitter if your election timeout is 500ms)
-
-## Testing Your Integration
-
-The pure protocol tests (350 of them) verify the library's internal logic. You need additional tests for your SPI integration:
-
-```scala
-class IntegrationSpec extends AnyFlatSpec:
-
-  "A 3-node cluster" should "elect a leader within one election timeout" in:
-    // Create 3 RaftNode instances with InMemTransport
-    // Connect them (register in each other's transport)
-    // Wait for election timeout
-    // Assert exactly one node reports Leader state
-
-  it should "replicate and commit a write" in:
-    // Submit a write to the leader
-    // Wait for commit
-    // Verify all nodes have the entry in their log
-    // Verify state machine was applied on all nodes
-
-  it should "survive leader failure" in:
-    // Stop the leader (disconnect from transport)
-    // Wait for new election
-    // Verify a new leader is elected
-    // Verify writes continue to work
-```
-
-## Deployment Topology
-
-```mermaid
-flowchart TB
-    subgraph DC1["Data Center 1"]
-        N1["RaftNode-1\n(Leader)"]
-    end
-
-    subgraph DC2["Data Center 2"]
-        N2["RaftNode-2\n(Follower)"]
-    end
-
-    subgraph DC3["Data Center 3"]
-        N3["RaftNode-3\n(Follower)"]
-    end
-
-    N1 <-->|"gRPC / TCP"| N2
-    N1 <-->|"gRPC / TCP"| N3
-    N2 <-->|"gRPC / TCP"| N3
-
-    C1["Client"] --> N1
-    C2["Client"] --> N1
-```
-
-For WAN deployments, consider:
-- **Higher election timeouts** (2–5 seconds) to avoid flaky elections across data centers
-- **Pipelining** to overlap round-trips (see [Chapter 9](09-log-replication-practice.md))
-- **Lease-based reads** at followers to distribute read load (see [Chapter 3](03-raft-advanced-theory.md))
-- **Learner nodes** in remote data centers for read replicas without affecting write quorum
+1. **HardState Recovery**: `MmapHardState` reads and CRC32-verifies `hard_state.bin`, restoring `(term, votedFor)`.
+2. **WAL Index Recovery**: `MmapWalEngine` validates `index.ckpt` (`"WIDX"` v1 header + CRC32) or falls back to scanning `.wal` segment headers and entries, replaying any entries newer than the checkpoint.
+3. **Snapshot & Membership Restoration**: `RaftNode.start` loads the highest numeric `snapshot-%020d.bin` via `SnapshotStore.loadLatest`, streams it into `StateMachine.restore`, advances `lastApplied` to `snap.lastIncludedIndex`, and reconstructs the latest `ClusterConfig` from the snapshot header plus any post-snapshot `LogType.Configuration` WAL entries.
+4. **Follower Catch-Up**: The node enters `Follower(hs.term, hs.votedFor, None)`. On the next leader `AppendEntriesRequest`, `commitIndex` advances and `applyCommittedEntries` replays only the uncompacted tail `(snap.lastIncludedIndex + 1 .. commitIndex)` onto the restored `StateMachine`.
 
 ---
 
-*Next: [Chapter 19 — Property-Based Testing](19-property-based-testing.md) shows how to express Raft's safety invariants as ScalaCheck properties and verify them with random message schedules.*
+## Multi-Tier Integration Testing Architecture
+
+The repository verifies runtime and cross-module behavior at two complementary integration tiers:
+
+| Tier | Module | Transport & Storage | What It Proves |
+|------|--------|---------------------|----------------|
+| **Runtime Cluster Suites** | `raft-runtime` (`modules/runtime/src/test/scala/raft/integration/`) | Partitionable `InMemTransport` + `InMemLogStore` / `InMemSnapshotStore` + `TestControl` | Virtual-time deterministic elections, 50-fiber concurrent `proposeAndCommit`, `CheckQuorum` minority step-down, `readIndex` / `leaseRead` safety, `transferLeadership`, `3 -> 5` Joint Consensus, leader self-removal, multi-chunk `SnapshotTransfer`, and `MultiRaftNode` 4-shard multiplexing |
+| **Full-Stack E2E Suite** | `raft-itest` (`modules/itest/src/test/scala/raft/itest/`) | Live Netty HTTP/2 `GrpcTransport` (`127.0.0.1:0`) + FFM `MmapWalEngine` (`4 KB` segments) | Ephemeral gRPC peer discovery & `updatePeers`, multi-segment `.wal` rotation, on-disk snapshot compaction, chunked gRPC `InstallSnapshot` to a joining 4th node, hard leader kill + disk crash recovery on the same port, and concurrent WGL linearizability (`KVModel`) |
+
+### Deterministic Virtual-Time Cluster Tests with `TestControl`
+
+Because `DefaultTimerService` schedules timeouts via `Async[F].sleep` and accepts a seeded `cats.effect.std.Random[F]`, entire multi-node `RaftNode[IO]` elections and commits can execute inside Cats Effect's `TestControl.executeEmbed` in milliseconds of CPU time with **zero wall-clock sleeps**:
+
+```scala
+import cats.effect.testkit.TestControl
+import raft.integration.RuntimeClusterHarness
+
+val program = RuntimeClusterHarness
+  .clusterResource(
+    allIds = List(NodeId("n1"), NodeId("n2"), NodeId("n3")),
+    initialClusterFor = _ => ClusterConfig(Set(NodeId("n1"), NodeId("n2"), NodeId("n3"))),
+    deterministicSeed = Some(42L)
+  )
+  .use { cluster =>
+    for
+      (_, leader) <- cluster.awaitLeader()
+      logId       <- leader.proposeAndCommit("k=v".getBytes("UTF-8"))
+      readIdx     <- leader.readIndex
+    yield assert(readIdx >= logId.index)
+  }
+
+TestControl.executeEmbed(program).unsafeRunSync()
+```
+
+---
+
+## WAN & Multi-AZ Deployment Tuning
+
+```mermaid
+flowchart LR
+    subgraph AZ1["Availability Zone 1"]
+        N1["Node 1 (Voter / Leader)"]
+    end
+
+    subgraph AZ2["Availability Zone 2"]
+        N2["Node 2 (Voter / Follower)"]
+    end
+
+    subgraph AZ3["Availability Zone 3"]
+        N3["Node 3 (Voter / Follower)"]
+    end
+
+    subgraph RemoteRegion["DR Region"]
+        L1["Node 4 (Non-Voting Learner)"]
+    end
+
+    N1 <-->|"HTTP/2 gRPC"| N2
+    N1 <-->|"HTTP/2 gRPC"| N3
+    N2 <-->|"HTTP/2 gRPC"| N3
+    N1 -->|"Async Replication / Snapshot"| L1
+```
+
+For cross-AZ and cross-region deployments:
+
+- **Timeout Ratio (`electionTimeoutMin >= 5 * heartbeatInterval`)**: Keep `heartbeatInterval` at least 3x the p99 inter-AZ RTT so transient TCP retransmissions never trigger spurious `PreVote` rounds.
+- **Dynamic Peer Updates (`GrpcTransport.updatePeers`)**: Whenever `proposeConfChange` adds or decommissions nodes, invoke `updatePeers` so Netty `ManagedChannel`s to removed hosts are evicted cleanly without socket leaks.
+- **Remote `Learner` Replicas**: Place `NodeRole.Learner` replicas in distant DR regions so cross-continent links receive continuous WAL/snapshot replication without adding WAN latency to local write quorums.
+
+---
+
+*Next: [Chapter 19 — Property-Based Testing](19-property-based-testing.md) shows how ScalaCheck generators verify wire codecs, state invariants, and protocol transitions across randomized inputs.*

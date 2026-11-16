@@ -466,6 +466,10 @@ private final class RaftNodeImpl[F[_]: Async](
                 }
                 _ <- stateRef.set(updatedLeader)
                 _ <-
+                  if config.checkQuorumEnabled && addedPeers.nonEmpty then
+                    resetCheckQuorumTimer
+                  else Async[F].unit
+                _ <-
                   if entersJoint then
                     jointWaiterRef.update(_.updated(newIndex, waiter))
                   else
@@ -679,31 +683,60 @@ private final class RaftNodeImpl[F[_]: Async](
       msg: RaftMessage
   ): F[Unit] =
     for
-      _ <- accumulateSnapshotChunk(msg)
+      chunkValid <- accumulateSnapshotChunk(msg)
       state <- stateRef.get
-      cluster <- clusterRef.get
-      lastCoord <- effectiveLastLog
-      lastLogIndex = lastCoord._1
-      lastLogTerm = lastCoord._2
-      snapOpt <- latestSnapMetaRef.get
-      termCache <- prefetchTerms(state, msg, lastLogIndex, snapOpt)
-      getTermAt = (idx: Long) => termCache.get(idx)
-      transition = RaftLogic.onMessage(
-        state = state,
-        message = msg,
-        config = config,
-        lastLogIndex = lastLogIndex,
-        lastLogTerm = lastLogTerm,
-        clusterSize = cluster.voters.size,
-        getTermAt = getTermAt,
-        sender = senderOpt,
-        clusterOpt = Some(cluster)
-      )
-      _ <- stateRef.set(transition.state)
-      _ <- maybeRefreshLeaderLease(msg, transition.state, cluster)
-      _ <- maybeRearmCheckQuorum(msg, transition.state)
-      _ <- executeEffects(transition.effects)
-      _ <- maybeSendCatchUpEntries(msg, senderOpt)
+      _ <-
+        if !chunkValid then
+          msg match
+            case req: InstallSnapshotRequest =>
+              val stepDownEffs =
+                if req.term > state.term then
+                  val stopEff = state match
+                    case _: Leader => handleLeaderStepDown
+                    case _         => Async[F].unit
+                  stopEff *>
+                    stableStore.setHardState(Term.unsafeFrom(req.term), None) *>
+                    stateRef.set(Follower(req.term, None, Some(req.leaderId)))
+                else Async[F].unit
+              val replyTerm = math.max(state.term, req.term)
+              stepDownEffs *>
+                (if req.term >= state.term then resetElectionTimer
+                 else Async[F].unit) *>
+                transport.send(
+                  req.leaderId,
+                  InstallSnapshotResponse(
+                    replyTerm,
+                    success = false,
+                    matchIndex = 0L
+                  )
+                )
+            case _ => Async[F].unit
+        else
+          for
+            cluster <- clusterRef.get
+            lastCoord <- effectiveLastLog
+            lastLogIndex = lastCoord._1
+            lastLogTerm = lastCoord._2
+            snapOpt <- latestSnapMetaRef.get
+            termCache <- prefetchTerms(state, msg, lastLogIndex, snapOpt)
+            getTermAt = (idx: Long) => termCache.get(idx)
+            transition = RaftLogic.onMessage(
+              state = state,
+              message = msg,
+              config = config,
+              lastLogIndex = lastLogIndex,
+              lastLogTerm = lastLogTerm,
+              clusterSize = cluster.voters.size,
+              getTermAt = getTermAt,
+              sender = senderOpt,
+              clusterOpt = Some(cluster)
+            )
+            _ <- stateRef.set(transition.state)
+            _ <- maybeRefreshLeaderLease(msg, transition.state, cluster)
+            _ <- maybeRearmCheckQuorum(msg, transition.state)
+            _ <- executeEffects(transition.effects)
+            _ <- maybeSendCatchUpEntries(msg, senderOpt)
+          yield ()
     yield ()
 
   private def maybeRefreshLeaderLease(
@@ -732,28 +765,34 @@ private final class RaftNodeImpl[F[_]: Async](
       case _ => Async[F].unit
 
   /** Buffer incoming `InstallSnapshotRequest` chunks prior to final
-    * installation.
+    * installation, returning `false` if a non-initial chunk arrives with a gap
+    * (e.g., when earlier chunks were dropped across a network partition).
     */
-  private def accumulateSnapshotChunk(msg: RaftMessage): F[Unit] =
+  private def accumulateSnapshotChunk(msg: RaftMessage): F[Boolean] =
     msg match
       case req: InstallSnapshotRequest =>
-        pendingSnapRef.update {
+        pendingSnapRef.modify {
           case _ if req.offset == 0L =>
-            Some(
-              PendingSnapshot(
-                lastIncludedIndex = req.lastIncludedIndex,
-                lastIncludedTerm = req.lastIncludedTerm,
-                offset = 0L,
-                chunks = Vector.empty
-              ).appendChunk(req.data)
+            (
+              Some(
+                PendingSnapshot(
+                  lastIncludedIndex = req.lastIncludedIndex,
+                  lastIncludedTerm = req.lastIncludedTerm,
+                  offset = 0L,
+                  chunks = Vector.empty
+                ).appendChunk(req.data)
+              ),
+              true
             )
           case Some(pending)
               if pending.lastIncludedIndex == req.lastIncludedIndex &&
+                pending.lastIncludedTerm == req.lastIncludedTerm &&
                 pending.offset == req.offset =>
-            Some(pending.appendChunk(req.data))
-          case other => other
+            (Some(pending.appendChunk(req.data)), true)
+          case _ =>
+            (None, false)
         }
-      case _ => Async[F].unit
+      case _ => Async[F].pure(true)
 
   /** Pre-fetch log terms needed for pure transition validation (`AppendEntries`
     * consistency, full-term fast conflict backtracking, snapshot boundaries,
@@ -772,7 +811,18 @@ private final class RaftNodeImpl[F[_]: Async](
         .toMap
 
     logStore.lastIndex.flatMap { storeLast =>
-      if storeLast.value <= 0L then Async[F].pure(snapSeed)
+      if storeLast.value <= 0L then
+        msg match
+          case snap: InstallSnapshotRequest =>
+            lastAppliedRef.get.map { applied =>
+              val alreadyCommitted =
+                snap.lastIncludedIndex <= applied ||
+                  snapOpt.exists(_.lastIncludedIndex >= snap.lastIncludedIndex)
+              if alreadyCommitted then
+                snapSeed + (snap.lastIncludedIndex -> snap.lastIncludedTerm)
+              else snapSeed
+            }
+          case _ => Async[F].pure(snapSeed)
       else
         val minRetained = snapOpt match
           case Some(s) =>
@@ -860,14 +910,27 @@ private final class RaftNodeImpl[F[_]: Async](
               )
 
           case (_, snap: InstallSnapshotRequest) =>
-            val idx =
-              math.min(storeLast.value, math.max(1L, snap.lastIncludedIndex))
-            logStore
-              .termAt(LogIndex.unsafeFrom(idx))
-              .map {
-                case Some(t) => snapSeed + (idx -> t.value)
-                case None    => snapSeed
-              }
+            lastAppliedRef.get.flatMap { applied =>
+              val alreadyCommitted =
+                snap.lastIncludedIndex <= applied ||
+                  snapOpt.exists(_.lastIncludedIndex >= snap.lastIncludedIndex)
+              if alreadyCommitted then
+                Async[F].pure(
+                  snapSeed + (snap.lastIncludedIndex -> snap.lastIncludedTerm)
+                )
+              else
+                val idx =
+                  math.min(
+                    storeLast.value,
+                    math.max(1L, snap.lastIncludedIndex)
+                  )
+                logStore
+                  .termAt(LogIndex.unsafeFrom(idx))
+                  .map {
+                    case Some(t) => snapSeed + (idx -> t.value)
+                    case None    => snapSeed
+                  }
+            }
 
           case _ =>
             logStore
@@ -962,21 +1025,22 @@ private final class RaftNodeImpl[F[_]: Async](
       for
         snapMetaOpt <- latestSnapMetaRef.get
         firstEntryOpt <- logStore.get(LogIndex.unsafeFrom(safeFrom))
+        prevIdx = safeFrom - 1L
+        prevTermOpt <- termAtWithSnapshot(prevIdx)
         needsSnapshot =
-          firstEntryOpt.isEmpty &&
+          (firstEntryOpt.isEmpty || prevTermOpt.isEmpty) &&
             snapMetaOpt.exists(_.lastIncludedIndex >= safeFrom)
         _ <-
           if needsSnapshot then triggerSnapshotTransfer(peerId, leader.term)
           else
-            val prevIdx = safeFrom - 1L
             val batchEnd = LogIndex.unsafeFrom(
               math.min(
                 lastIdx.value,
                 safeFrom + config.maxEntriesPerRequest.toLong - 1L
               )
             )
+            val prevTerm = prevTermOpt.getOrElse(0L)
             for
-              prevTerm <- termAtWithSnapshot(prevIdx).map(_.getOrElse(0L))
               entries <- logStore.getRange(
                 LogIndex.unsafeFrom(safeFrom),
                 batchEnd
@@ -1055,7 +1119,21 @@ private final class RaftNodeImpl[F[_]: Async](
           }
 
   private def executeEffects(effects: List[Eff]): F[Unit] =
-    effects.traverse_ {
+    effects match
+      case Nil                          => Async[F].unit
+      case (s: Eff.SendMessage) :: tail =>
+        val (moreSends, rest) = tail.span(_.isInstanceOf[Eff.SendMessage])
+        val allSends =
+          s :: moreSends.collect { case sm: Eff.SendMessage => sm }
+        val byPeer = allSends.groupBy(_.to).toList
+        byPeer.parTraverse_ { case (peer, msgs) =>
+          msgs.traverse_(m => transport.send(peer, m.message))
+        } *> executeEffects(rest)
+      case head :: tail =>
+        executeSingleEffect(head) *> executeEffects(tail)
+
+  private def executeSingleEffect(effect: Eff): F[Unit] =
+    effect match
       case Eff.SendMessage(to, msg) =>
         transport.send(to, msg)
 
@@ -1119,49 +1197,69 @@ private final class RaftNodeImpl[F[_]: Async](
 
       case Eff.InstallSnapshot(metadata) =>
         for
-          _ <- logger.info(
-            s"Installing snapshot at index=${metadata.lastIncludedIndex} term=${metadata.lastIncludedTerm}"
-          )
           pendingOpt <- pendingSnapRef.getAndSet(None)
-          rawBytes = pendingOpt.map(_.toBytes).getOrElse(Array.emptyByteArray)
-          (decodedCfg, stateBytes) = SnapshotMetadata.decodePayload(rawBytes)
-          effectiveCfg = decodedCfg.orElse(metadata.config)
-          restoreStream =
-            if stateBytes.nonEmpty then
-              Stream.chunk(Chunk.array(stateBytes)).covary[F]
-            else Stream.empty.covary[F]
-          _ <- stateMachine.restore(restoreStream)
-          _ <- snapshotStoreOpt.traverse_ { store =>
-            val persistStream =
-              if stateBytes.nonEmpty then
-                Stream.chunk(Chunk.array(stateBytes)).covary[F]
-              else Stream.empty.covary[F]
-            store.save(
-              Snapshot[F](
-                metadata.lastIncludedIndex,
-                metadata.lastIncludedTerm,
-                persistStream,
-                effectiveCfg
+          currentApplied <- lastAppliedRef.get
+          curSnapOpt <- latestSnapMetaRef.get
+          isStale =
+            metadata.lastIncludedIndex <= currentApplied ||
+              curSnapOpt.exists(
+                _.lastIncludedIndex >= metadata.lastIncludedIndex
               )
-            )
-          }
-          _ <- effectiveCfg.traverse_(clusterRef.set)
-          _ <- latestSnapMetaRef.set(
-            Some(
-              SnapshotMetadata(
-                metadata.lastIncludedIndex,
-                metadata.lastIncludedTerm,
-                effectiveCfg
+          _ <-
+            if isStale then
+              logger.debug(
+                s"Ignoring stale snapshot at index=${metadata.lastIncludedIndex} (lastApplied=$currentApplied)"
               )
-            )
-          )
-          _ <- logStore.clear
-          _ <- lastAppliedRef.set(metadata.lastIncludedIndex)
-          _ <- completeReadApplyWaitersUpTo(metadata.lastIncludedIndex)
-          _ <- metrics.onSnapshotTaken(
-            config.localId,
-            metadata.lastIncludedIndex
-          )
+            else
+              val rawBytes =
+                pendingOpt.map(_.toBytes).getOrElse(Array.emptyByteArray)
+              val (decodedCfg, stateBytes) =
+                SnapshotMetadata.decodePayload(rawBytes)
+              val effectiveCfg = decodedCfg.orElse(metadata.config)
+              val restoreStream =
+                if stateBytes.nonEmpty then
+                  Stream.chunk(Chunk.array(stateBytes)).covary[F]
+                else Stream.empty.covary[F]
+              for
+                _ <- logger.info(
+                  s"Installing snapshot at index=${metadata.lastIncludedIndex} term=${metadata.lastIncludedTerm}"
+                )
+                _ <- stateMachine.restore(restoreStream)
+                _ <- snapshotStoreOpt.traverse_ { store =>
+                  val persistStream =
+                    if stateBytes.nonEmpty then
+                      Stream.chunk(Chunk.array(stateBytes)).covary[F]
+                    else Stream.empty.covary[F]
+                  store.save(
+                    Snapshot[F](
+                      metadata.lastIncludedIndex,
+                      metadata.lastIncludedTerm,
+                      persistStream,
+                      effectiveCfg
+                    )
+                  )
+                }
+                _ <- compactionMgrOpt.traverse_(
+                  _.recordInstalledSnapshot(metadata.lastIncludedIndex)
+                )
+                _ <- effectiveCfg.traverse_(clusterRef.set)
+                _ <- latestSnapMetaRef.set(
+                  Some(
+                    SnapshotMetadata(
+                      metadata.lastIncludedIndex,
+                      metadata.lastIncludedTerm,
+                      effectiveCfg
+                    )
+                  )
+                )
+                _ <- logStore.clear
+                _ <- lastAppliedRef.set(metadata.lastIncludedIndex)
+                _ <- completeReadApplyWaitersUpTo(metadata.lastIncludedIndex)
+                _ <- metrics.onSnapshotTaken(
+                  config.localId,
+                  metadata.lastIncludedIndex
+                )
+              yield ()
         yield ()
 
       case Eff.BecomeLeader =>
@@ -1228,7 +1326,6 @@ private final class RaftNodeImpl[F[_]: Async](
 
       case Eff.ApplyClusterConfig(newConfig, _, _) =>
         clusterRef.set(newConfig)
-    }
 
   private def handleLeaderStepDown: F[Unit] =
     for
@@ -1327,7 +1424,7 @@ private final class RaftNodeImpl[F[_]: Async](
     for
       _ <- cancelFiber(checkQuorumFiberRef)
       fiber <- timerService.scheduleElection(
-        config.electionTimeoutMin,
+        config.electionTimeoutMax,
         msgQueue.offer(CheckQuorumTimeout)
       )
       _ <- checkQuorumFiberRef.set(Some(fiber))
@@ -1369,14 +1466,18 @@ private final class RaftNodeImpl[F[_]: Async](
     for
       lastCoord <- effectiveLastLog
       lastLogIndex = lastCoord._1
+      snapOpt <- latestSnapMetaRef.get
+      snapIdx = snapOpt.map(_.lastIncludedIndex).getOrElse(0L)
       cluster <- clusterRef.get
       followers = cluster.allNodes - config.localId
       noOpIndex = lastLogIndex + 1L
       noOpEntry = Log.noOp(noOpIndex, term)
       _ <- logStore.append(Seq(noOpEntry))
       _ <- stateRef.update {
-        case l: Leader => l.initializeIndices(followers, lastLogIndex)
-        case s         => s
+        case l: Leader =>
+          l.initializeIndices(followers, lastLogIndex)
+            .withCommitIndex(math.max(l.commitIndex, snapIdx))
+        case s => s
       }
       _ <-
         if cluster.hasQuorum(Set(config.localId)) && config.leaseReadEnabled
@@ -1497,6 +1598,9 @@ private final class RaftNodeImpl[F[_]: Async](
                 )
                 _ <- logStore.append(Seq(cNewEntry))
                 _ <- clusterRef.set(finalCfg)
+                _ <-
+                  if config.checkQuorumEnabled then resetCheckQuorumTimer
+                  else Async[F].unit
                 transferredWaiterOpt <- jointWaiterRef
                   .modify(m => (m - committedIdx, m.get(committedIdx)))
                 _ <- transferredWaiterOpt.traverse_ { w =>

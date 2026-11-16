@@ -76,6 +76,12 @@ class InMemTransport[F[_]: Async] private (
   ): F[Unit] =
     peers.update(_.updated(peerId, peerQueue))
 
+  /** Remove a peer's inbox queue to simulate a directional or symmetric network
+    * partition.
+    */
+  def unregisterPeer(peerId: NodeId): F[Unit] =
+    peers.update(_.removed(peerId))
+
 /** Companion for [[InMemTransport]] providing factory methods. */
 object InMemTransport:
   /** Create a single [[InMemTransport]] for the given node.

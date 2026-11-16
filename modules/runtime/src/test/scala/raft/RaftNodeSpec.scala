@@ -125,10 +125,10 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
       resources = ids.map { id =>
         val cfg = RaftConfig(
           localId = id,
-          electionTimeoutMin = 60.millis,
-          electionTimeoutMax = 120.millis,
-          heartbeatInterval = 20.millis,
-          leaderLeaseDuration = 200.millis,
+          electionTimeoutMin = 150.millis,
+          electionTimeoutMax = 300.millis,
+          heartbeatInterval = 30.millis,
+          leaderLeaseDuration = 250.millis,
           leaseReadEnabled = true,
           checkQuorumEnabled = true
         )
@@ -220,9 +220,9 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
       mkNode = (id: NodeId, cl: ClusterConfig) =>
         val cfg = RaftConfig(
           localId = id,
-          electionTimeoutMin = 60.millis,
-          electionTimeoutMax = 120.millis,
-          heartbeatInterval = 20.millis,
+          electionTimeoutMin = 150.millis,
+          electionTimeoutMax = 300.millis,
+          heartbeatInterval = 30.millis,
           compaction = CompactionConfig(
             level = CompactionLevel.Custom,
             snapshotChunkSize = 32,

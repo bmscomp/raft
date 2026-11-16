@@ -1,281 +1,261 @@
 # Tutorial 10: Exactly-Once Delivery with Client Sessions
 
-*How to guarantee that a client's retried request doesn't execute twice — the session table pattern used by etcd, ZooKeeper, and every production Raft system.*
+*How to guarantee that a retried client command never executes twice — implementing the replicated session deduplication table used by etcd, ZooKeeper, CockroachDB, and TiKV on top of `RaftNode[F]`.*
 
 ---
 
-## The Problem
+## The Problem: Consensus Alone Is At-Least-Once for Clients
 
-Consider this sequence:
+Raft guarantees that every committed log entry is applied **once per state machine** in identical order across all replicas. However, the network between the **client** and the **leader** can drop the leader's acknowledgment *after* the entry commits:
 
-```
-t=0   Client sends "transfer $100 from Alice to Bob"
-t=1   Leader commits the transfer
-t=2   Leader sends response to client
-t=3   Network drops the response — client never receives it
-t=4   Client retries: "transfer $100 from Alice to Bob"
-t=5   Leader commits the transfer AGAIN — Alice loses $200
-```
+```mermaid
+sequenceDiagram
+    participant C as Client A
+    participant L1 as Leader 1
+    participant L2 as Failover Leader 2
 
-The Raft consensus layer guarantees that committed commands are durable and applied exactly once **within the cluster**. But the client doesn't know whether its command was committed or not. Its only safe option is to retry — and retries cause duplicates.
-
-This isn't a theoretical concern. Every production Raft system (etcd, CockroachDB, TiKV) implements client sessions to solve it.
-
-## The Session Table Pattern
-
-The idea is simple: track what the cluster has already done for each client.
-
-```
-┌──────────────────────────────────────────────────────────┐
-│ Session Table (part of the replicated state machine)      │
-│                                                          │
-│ ClientId      LastSeqNum    LastResult                    │
-│ ─────────     ──────────    ──────────                    │
-│ client-A      42            "OK:transferred $100"         │
-│ client-B      17            "OK:balance=$350"             │
-│ client-C      3             "ERR:insufficient funds"      │
-└──────────────────────────────────────────────────────────┘
+    C->>L1: proposeAndCommit("transfer 100 USD Alice->Bob", seq=42)
+    Note over L1: Quorum commits entry at index 88; Alice debited 100 USD
+    L1--xC: ACK lost (leader crash or TCP reset)
+    Note over C: Outcome indeterminate — client MUST retry seq=42!
+    C->>L2: proposeAndCommit("transfer 100 USD Alice->Bob", seq=42)
+    Note over L2: Without session table: debits Alice a SECOND 100 USD!
+    Note over L2: With replicated session table: sees seq=42 cached -> returns stored receipt!
+    L2-->>C: Cached receipt ("OK:tx-88")
 ```
 
-Every client command carries a `(clientId, sequenceNumber)` pair. The state machine checks:
+Without client session tracking inside the replicated `StateMachine`, retrying after a timeout or `ProposalDropped` risks applying non-idempotent commands twice (charging Alice \$200 instead of \$100).
 
-1. If `seqNum > lastSeqNum` → execute the command, store the result
-2. If `seqNum == lastSeqNum` → return the stored result (this is a retry)
-3. If `seqNum < lastSeqNum` → reject as stale (client bug or replay attack)
+---
 
-## Implementation
+## Replicated Session Deduplication Architecture
 
-### Client-side: Tagging requests
+Every client attaches a `(ClientId, sequenceNumber)` header to its command payload. Inside `StateMachine.apply`, the state machine consults a replicated `Map[ClientId, SessionEntry]` **before** mutating domain state:
+
+```mermaid
+flowchart LR
+    CMD["Committed Log Entry (clientId, seqNum, payload)"] --> CHECK{"Compare seqNum vs session(clientId).lastSeq"}
+    CHECK -->|"seqNum > lastSeq"| EXEC["Execute inner StateMachine + record (seqNum, result, log.index)"]
+    CHECK -->|"seqNum == lastSeq"| HIT["Skip execution (idempotent retry hit)"]
+    CHECK -->|"seqNum < lastSeq"| STALE["Ignore stale replay"]
+```
+
+Because `SessionState` lives inside the `StateMachine` — and is serialized inside `StateMachine.snapshot` / `restore` — every follower, compacted snapshot, and crash-recovered `MmapWalEngine` node preserves identical deduplication state!
+
+---
+
+## Complete Implementation on `RaftNode[IO]`
+
+### 1. Wire Framing for Session-Tagged Commands
 
 ```scala
-import java.util.concurrent.atomic.AtomicLong
-
-case class ClientId(value: String) extends AnyVal
-
-class RaftClient(clientId: ClientId, raftNode: RaftNodeApi):
-  private val seqCounter = new AtomicLong(0)
-
-  def execute(command: Array[Byte]): IO[String] =
-    val seqNum = seqCounter.incrementAndGet()
-    val tagged = TaggedCommand.encode(
-      TaggedCommand(clientId, seqNum, command)
-    )
-    raftNode.propose(Log.Command(0, 0, tagged)).flatMap { result =>
-      if result.startsWith("RETRY:") then
-        // Possible stale response — retry with SAME seqNum
-        IO.sleep(100.millis) *> retryWithSeq(seqNum, command)
-      else
-        IO.pure(result)
-    }
-
-  private def retryWithSeq(seqNum: Long, command: Array[Byte]): IO[String] =
-    val tagged = TaggedCommand.encode(
-      TaggedCommand(clientId, seqNum, command)
-    )
-    raftNode.propose(Log.Command(0, 0, tagged))
-```
-
-### Wire format
-
-```scala
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
-case class TaggedCommand(
-  clientId: ClientId,
-  sequenceNumber: Long,
-  payload: Array[Byte]
+final case class ClientId(value: String)
+
+final case class TaggedCommand(
+    clientId: ClientId,
+    sequenceNumber: Long,
+    payload: Array[Byte]
 )
 
 object TaggedCommand:
   def encode(cmd: TaggedCommand): Array[Byte] =
-    val header = s"${cmd.clientId.value}|${cmd.sequenceNumber}|"
-      .getBytes(StandardCharsets.UTF_8)
-    header ++ cmd.payload
+    val cidBytes = cmd.clientId.value.getBytes(StandardCharsets.UTF_8)
+    val buf = ByteBuffer.allocate(4 + cidBytes.length + 8 + cmd.payload.length)
+    buf.putInt(cidBytes.length)
+    buf.put(cidBytes)
+    buf.putLong(cmd.sequenceNumber)
+    buf.put(cmd.payload)
+    buf.array()
 
-  def decode(data: Array[Byte]): TaggedCommand =
-    val str = new String(data, StandardCharsets.UTF_8)
-    val firstPipe = str.indexOf('|')
-    val secondPipe = str.indexOf('|', firstPipe + 1)
-    val clientId = ClientId(str.substring(0, firstPipe))
-    val seqNum = str.substring(firstPipe + 1, secondPipe).toLong
-    val payload = data.drop(secondPipe + 1)
-    TaggedCommand(clientId, seqNum, payload)
+  def decode(bytes: Array[Byte]): TaggedCommand =
+    val buf = ByteBuffer.wrap(bytes)
+    val cidLen = buf.getInt()
+    val cidBytes = new Array[Byte](cidLen)
+    buf.get(cidBytes)
+    val seqNum = buf.getLong()
+    val payload = new Array[Byte](buf.remaining())
+    buf.get(payload)
+    TaggedCommand(
+      ClientId(new String(cidBytes, StandardCharsets.UTF_8)),
+      seqNum,
+      payload
+    )
 ```
 
-### State machine: Deduplication layer
+### 2. Snapshot-Safe `SessionAwareStateMachine`
 
-Wrap any existing state machine with session tracking:
+Notice how both `snapshot` and `restore` use streaming `fs2.Stream[IO, Byte]` and persist **both** the inner domain snapshot and the session deduplication table so `CompactionManager` log truncation never erases recent client receipts:
 
 ```scala
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 import cats.effect.{IO, Ref}
-import raft.state.Log
+import fs2.{Chunk, Stream}
 import raft.spi.StateMachine
+import raft.state.Log
 
-case class SessionEntry(
-  lastSequenceNumber: Long,
-  lastResult: String,
-  lastActivityIndex: Long   // for session expiration
+final case class SessionEntry(
+    lastSequenceNumber: Long,
+    lastResult: String,
+    lastActivityIndex: Long
 )
 
-case class SessionState(
-  sessions: Map[ClientId, SessionEntry],
-  maxSessions: Int = 10_000
-)
-
-class SessionAwareStateMachine[R](
-  inner: StateMachine[IO, R],
-  sessionRef: Ref[IO, SessionState],
-  resultToString: R => String = (r: R) => r.toString
+final class SessionAwareStateMachine[R](
+    inner: StateMachine[IO, R],
+    sessionsRef: Ref[IO, Map[ClientId, SessionEntry]],
+    encodeResult: R => String,
+    maxSessionAgeEntries: Long = 50_000L
 ) extends StateMachine[IO, String]:
 
   def apply(log: Log): IO[String] =
     val tagged = TaggedCommand.decode(log.data)
-
-    sessionRef.get.flatMap { sessions =>
-      sessions.sessions.get(tagged.clientId) match
+    sessionsRef.get.flatMap { sessions =>
+      sessions.get(tagged.clientId) match
         case Some(entry) if tagged.sequenceNumber == entry.lastSequenceNumber =>
-          // Duplicate — return cached result without re-executing
-          IO.pure(s"CACHED:${entry.lastResult}")
+          IO.pure(entry.lastResult)
 
         case Some(entry) if tagged.sequenceNumber < entry.lastSequenceNumber =>
-          // Stale — reject
-          IO.pure(s"STALE:seq=${tagged.sequenceNumber}:expected>${entry.lastSequenceNumber}")
+          IO.pure(s"STALE:${entry.lastSequenceNumber}")
 
         case _ =>
-          // New command — execute and cache result
           for
-            result <- inner.apply(log.copy(data = tagged.payload))
-            resultStr = resultToString(result)
-            _ <- sessionRef.update { state =>
-              val entry = SessionEntry(
-                tagged.sequenceNumber,
-                resultStr,
-                log.index
+            rawResult <- inner.apply(log.copy(data = tagged.payload))
+            rendered = encodeResult(rawResult)
+            _ <- sessionsRef.update { cur =>
+              val updated = cur.updated(
+                tagged.clientId,
+                SessionEntry(tagged.sequenceNumber, rendered, log.index)
               )
-              state.copy(
-                sessions = state.sessions + (tagged.clientId -> entry)
-              )
+              // Deterministic log-index TTL eviction (identical across all replicas!)
+              updated.filter { case (_, e) =>
+                log.index - e.lastActivityIndex <= maxSessionAgeEntries
+              }
             }
-          yield resultStr
+          yield rendered
     }
 
-  def snapshot: IO[Array[Byte]] =
+  def readSessionReceipt(clientId: ClientId, seqNum: Long): IO[Option[String]] =
+    sessionsRef.get.map { sessions =>
+      sessions
+        .get(clientId)
+        .filter(_.lastSequenceNumber == seqNum)
+        .map(_.lastResult)
+    }
+
+  def snapshot: IO[Stream[IO, Byte]] =
     for
-      innerSnap <- inner.snapshot
-      sessions  <- sessionRef.get
-      sessionSnap = sessions.sessions.map { (cid, entry) =>
-        s"${cid.value}|${entry.lastSequenceNumber}|${entry.lastResult}|${entry.lastActivityIndex}"
-      }.mkString("\n").getBytes(StandardCharsets.UTF_8)
-      // Combine inner snapshot + session snapshot
-      combined = s"${innerSnap.length}\n".getBytes(StandardCharsets.UTF_8) ++
-                 innerSnap ++ sessionSnap
-    yield combined
+      innerStream <- inner.snapshot
+      innerBytes <- innerStream.compile.to(Array)
+      sessions <- sessionsRef.get
+    yield
+      val sessionLines = sessions.toSeq
+        .sortBy(_._1.value)
+        .map { case (cid, e) =>
+          s"${cid.value}\t${e.lastSequenceNumber}\t${e.lastActivityIndex}\t${e.lastResult}"
+        }
+        .mkString("\n")
+        .getBytes(StandardCharsets.UTF_8)
+      val buf = ByteBuffer.allocate(4 + innerBytes.length + 4 + sessionLines.length)
+      buf.putInt(innerBytes.length)
+      buf.put(innerBytes)
+      buf.putInt(sessionLines.length)
+      buf.put(sessionLines)
+      Stream.chunk(Chunk.array(buf.array())).covary[IO]
 
-  def restore(data: Array[Byte]): IO[Unit] =
-    // Restore both inner state and session table from snapshot
-    inner.restore(data) // simplified — production would split the data
+  def restore(data: Stream[IO, Byte]): IO[Unit] =
+    data.compile.to(Array).flatMap { all =>
+      val buf = ByteBuffer.wrap(all)
+      val innerLen = buf.getInt()
+      val innerBytes = new Array[Byte](innerLen)
+      buf.get(innerBytes)
+      val sessLen = buf.getInt()
+      val sessBytes = new Array[Byte](sessLen)
+      buf.get(sessBytes)
+
+      val parsedSessions =
+        val text = new String(sessBytes, StandardCharsets.UTF_8)
+        if text.isEmpty then Map.empty[ClientId, SessionEntry]
+        else
+          text
+            .split("\n")
+            .flatMap { line =>
+              line.split("\t", 4) match
+                case Array(cid, seq, idx, res) =>
+                  Some(ClientId(cid) -> SessionEntry(seq.toLong, res, idx.toLong))
+                case _ => None
+            }
+            .toMap
+
+      inner.restore(Stream.chunk(Chunk.array(innerBytes)).covary[IO]) *>
+        sessionsRef.set(parsedSessions)
+    }
 ```
 
-### Why the session table must be replicated
+> [!IMPORTANT]
+> **Never use wall-clock `System.currentTimeMillis()` to expire sessions inside `StateMachine.apply`!** Different nodes apply the same log entry at slightly different wall-clock instants, which would cause state-machine divergence across replicas. Always base deterministic eviction on `log.index` (as shown above with `maxSessionAgeEntries`) or on a timestamp explicitly recorded inside the replicated `Log` entry.
 
-The session table is part of the state machine — it's replicated via Raft like any other state. This is critical because:
+### 3. Retry-Safe Client Wrapper Using `proposeAndCommit` & `NotLeader` Hints
 
-- After a leader failure, the new leader has the same session table
-- A retried request that reaches the new leader sees the same cached response
-- The deduplication guarantee survives any single-node failure
-
-If the session table were local to the leader, a leader change would lose all session state, and retries would re-execute.
-
-## Session Lifecycle
-
-### Registration
-
-Clients register a session before sending commands:
+On `RaftNode[IO]`, followers reject writes with `RaftError.NotLeader(Some(leaderId))`, allowing the client to immediately route to the hinted leader while preserving the **exact same `sequenceNumber`** across retries:
 
 ```scala
-enum SessionCommand:
-  case OpenSession(clientId: ClientId, ttlMs: Long)
-  case CloseSession(clientId: ClientId)
-  case KeepAlive(clientId: ClientId, timestampMs: Long)
+import java.util.concurrent.atomic.AtomicLong
+import scala.concurrent.duration.*
+import cats.effect.IO
+import raft.RaftNode
+import raft.state.{NodeId, RaftError}
+
+final class ExactlyOnceClient(
+    clientId: ClientId,
+    nodes: Map[NodeId, (RaftNode[IO], SessionAwareStateMachine[?])]
+):
+  private val seqGen = new AtomicLong(0L)
+
+  def execute(payload: Array[Byte], maxAttempts: Int = 10): IO[String] =
+    val seqNum = seqGen.incrementAndGet()
+    val wireBytes = TaggedCommand.encode(TaggedCommand(clientId, seqNum, payload))
+    attempt(nodes.keys.head, seqNum, wireBytes, maxAttempts)
+
+  private def attempt(
+      targetId: NodeId,
+      seqNum: Long,
+      wireBytes: Array[Byte],
+      remaining: Int
+  ): IO[String] =
+    if remaining <= 0 then
+      IO.raiseError(new RuntimeException(s"Exhausted retries for seq=$seqNum"))
+    else
+      val (raftNode, localSm) = nodes(targetId)
+      raftNode.proposeAndCommit(wireBytes).attempt.flatMap {
+        case Right(_) =>
+          // Linearizable local receipt lookup on the node that just committed & applied wireBytes
+          localSm.readSessionReceipt(clientId, seqNum).flatMap {
+            case Some(result) => IO.pure(result)
+            case None         => IO.raiseError(new RuntimeException("Session evicted"))
+          }
+
+        case Left(RaftError.NotLeader(Some(leaderHint))) if nodes.contains(leaderHint) =>
+          attempt(leaderHint, seqNum, wireBytes, remaining - 1)
+
+        case Left(_) =>
+          val nextTarget = nodes.keys.find(_ != targetId).getOrElse(targetId)
+          IO.sleep(50.millis) *> attempt(nextTarget, seqNum, wireBytes, remaining - 1)
+      }
 ```
-
-### Expiration
-
-Sessions that don't send `KeepAlive` within their TTL are expired. This bounds memory usage:
-
-```scala
-def expireSessions(state: SessionState, currentIndex: Long, maxAge: Long): SessionState =
-  val active = state.sessions.filter { (_, entry) =>
-    currentIndex - entry.lastActivityIndex < maxAge
-  }
-  state.copy(sessions = active)
-```
-
-### Sequence number overflow
-
-With `Long` sequence numbers (2^63), a client sending 1 million requests per second won't overflow for ~292,000 years. This is not a practical concern.
-
-## Failure Scenarios
-
-### Scenario 1: Client retries to same leader
-
-```
-t=0   Client sends (clientId=A, seq=42, transfer $100) → committed
-t=1   Response lost
-t=2   Client retries (clientId=A, seq=42, transfer $100)
-t=3   Session table: seq=42 already seen → return cached "OK:transferred $100"
-```
-
-Result: Transfer happens exactly once.
-
-### Scenario 2: Client retries to new leader
-
-```
-t=0   Client sends (clientId=A, seq=42, transfer $100) → committed on old leader
-t=1   Old leader crashes before sending response
-t=3   New leader elected — session table includes (A, seq=42, "OK:transferred")
-t=4   Client retries (clientId=A, seq=42) to new leader
-t=5   Session table hit → return cached result
-```
-
-Result: Transfer happens exactly once, despite leader change.
-
-### Scenario 3: Command was never committed
-
-```
-t=0   Client sends (clientId=A, seq=42, transfer $100)
-t=1   Leader crashes BEFORE committing
-t=3   New leader elected — session table does NOT have (A, seq=42)
-t=4   Client retries (clientId=A, seq=42) → new command, executes normally
-```
-
-Result: Transfer happens exactly once. The first attempt was lost (never committed), and the retry is treated as a new command.
-
-## Integrating with Other Tutorials
-
-The session table pattern wraps **any** state machine. Apply it to previous tutorials:
-
-```scala
-// Configuration service with exactly-once writes
-val configSM = new ConfigStateMachine(configRef)
-val sessionConfigSM = new SessionAwareStateMachine(configSM, sessionRef)
-
-// Task queue with deduplicated enqueue
-val taskSM = new TaskQueueStateMachine(queueRef)
-val sessionTaskSM = new SessionAwareStateMachine(taskSM, sessionRef)
-
-// Rate limiter with deduplicated recording
-val rateSM = new RateLimitStateMachine(rateRef)
-val sessionRateSM = new SessionAwareStateMachine(rateSM, sessionRef)
-```
-
-## Production Considerations
-
-- **Session table size**: With 10,000 concurrent clients and one cached response per client, the table is ~1MB. This is negligible compared to application state.
-- **Response size**: Cache only a summary/ID, not the full response body. Large responses should use a reference (e.g., "result stored at key X").
-- **Client library**: Embed the session logic in a client library so application developers don't need to manage sequence numbers manually.
-- **Idempotency keys vs. sessions**: For HTTP APIs, idempotency keys (Tutorial 6) are simpler. Sessions are better for persistent, long-lived client connections (gRPC streams, WebSockets).
 
 ---
 
-*Next: [Tutorial 11 — Snapshot & Log Compaction Cookbook](11-snapshot-compaction.md) — managing log growth in long-running production clusters.*
+## Verifying All Three Failure Scenarios
+
+| Failure Timing | What Happens on Retry (`seq = 42`) | Transfers Executed |
+|----------------|------------------------------------|--------------------|
+| **Leader commits, response lost, client retries same leader** | `sessions(clientId).lastSequenceNumber == 42` hits cache immediately; `inner.apply` is skipped | **1** (\$100) |
+| **Leader commits, crashes before ACK, client retries new leader** | New leader already replicated log entry `#88` (including `SessionEntry(42, ...)`); retry hits cache on new leader | **1** (\$100) |
+| **Leader crashes before replicating to quorum, client retries new leader** | Uncommitted entry `#88` is absent on new leader; retry commits `seq = 42` for the first time | **1** (\$100) |
+
+---
+
+*Next: [Tutorial 11 — Snapshot & Log Compaction Cookbook](11-snapshot-compaction.md) — bounding WAL disk usage while keeping lagging followers synchronized.*

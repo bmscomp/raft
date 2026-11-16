@@ -256,4 +256,30 @@ class StorageBackedAdaptersSpec
         ).guarantee(engine.close *> IO(deleteRecursive(tmpDir)))
       }
     }
+
+    "should support generic StorageBackedSnapshotStore.fromEngine and MmapWalEngine.factory" in {
+      val tmpDir = Files.createTempDirectory("raft-snap-factory-test-")
+      MmapWalEngine
+        .factory[IO]
+        .open(tmpDir.toString)
+        .use { genericEngine =>
+          val genericSnapStore =
+            StorageBackedSnapshotStore.fromEngine(genericEngine)
+          val snap = raft.state.Snapshot[IO](
+            lastIncludedIndex = 19L,
+            lastIncludedTerm = 2L,
+            data = fs2.Stream.emits("generic-snap".getBytes("UTF-8")).covary[IO]
+          )
+          for
+            emptyList <- genericSnapStore.list
+            _ <- genericSnapStore.save(snap)
+            nonEmptyList <- genericSnapStore.list
+            _ <- genericSnapStore.delete(19L)
+          yield
+            emptyList shouldBe empty
+            nonEmptyList.map(_.lastIncludedIndex) shouldBe Vector(19L)
+            nonEmptyList.head.sizeBytes shouldBe 12L
+        }
+        .guarantee(IO(deleteRecursive(tmpDir)))
+    }
   }

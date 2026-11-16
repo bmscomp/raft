@@ -8,6 +8,7 @@ import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
 import cats.effect.{Async, Resource, Sync}
+import cats.effect.implicits.*
 import cats.effect.std.{Dispatcher, Queue}
 import cats.syntax.all.*
 import com.google.protobuf.ByteString
@@ -69,6 +70,7 @@ class GrpcTransport[F[_]: Async](
   }
 
   private val channels = new ConcurrentHashMap[String, ManagedChannel]()
+  @volatile private var closed: Boolean = false
 
   private[grpc] def activeChannelAddresses: Set[String] =
     channels.keySet().asScala.toSet
@@ -129,7 +131,13 @@ class GrpcTransport[F[_]: Async](
         )
         _ <- Async[F].fromFuture(
           Sync[F].delay(
-            RaftServiceGrpc.stub(channel).sendEnvelope(envelope)
+            RaftServiceGrpc
+              .stub(channel)
+              .withDeadlineAfter(
+                transportConfig.connectionTimeout.toMillis,
+                TimeUnit.MILLISECONDS
+              )
+              .sendEnvelope(envelope)
           )
         )
       yield ()
@@ -171,7 +179,7 @@ class GrpcTransport[F[_]: Async](
   def broadcast(msg: Array[Byte]): F[Unit] =
     Sync[F]
       .delay(peerMap.keySet().asScala.toList)
-      .flatMap(_.traverse_(peer => send(peer, msg)))
+      .flatMap(_.parTraverse_(peer => send(peer, msg)))
 
   def receive: Stream[F, (NodeId, Array[Byte])] =
     Stream.fromQueueUnterminated(incomingQueue)
@@ -185,8 +193,13 @@ class GrpcTransport[F[_]: Async](
   def shutdown: F[Unit] =
     logger.info("Shutting down gRPC transport") *>
       Sync[F].blocking {
-        channels.values().asScala.foreach(shutdownChannel(_, 2L))
-        channels.clear()
+        val toClose = this.synchronized {
+          closed = true
+          val snapshot = channels.values().asScala.toList
+          channels.clear()
+          snapshot
+        }
+        toClose.foreach(shutdownChannel(_, 2L))
         serverOpt.foreach { srv =>
           val _ = srv.shutdown()
           if !srv.awaitTermination(5, TimeUnit.SECONDS) then
@@ -201,25 +214,33 @@ class GrpcTransport[F[_]: Async](
 
   private def getOrCreateChannel(address: String): F[ManagedChannel] =
     Sync[F].delay {
-      channels.computeIfAbsent(
-        address,
-        target => {
-          val base = NettyChannelBuilder
-            .forTarget(target)
-            .maxInboundMessageSize(config.maxMessageSize)
-            .keepAliveTime(
-              config.keepAliveInterval.toMillis,
-              TimeUnit.MILLISECONDS
-            )
-            .keepAliveTimeout(
-              config.keepAliveTimeout.toMillis,
-              TimeUnit.MILLISECONDS
-            )
-          val configured =
-            if config.useTls then base else base.usePlaintext()
-          configured.build()
-        }
-      )
+      Option(channels.get(address)) match
+        case Some(existing) if !closed => existing
+        case _                         =>
+          this.synchronized {
+            if closed then
+              throw Status.UNAVAILABLE
+                .withDescription("GrpcTransport is shut down")
+                .asRuntimeException()
+            Option(channels.get(address)).getOrElse {
+              val base = NettyChannelBuilder
+                .forTarget(address)
+                .maxInboundMessageSize(config.maxMessageSize)
+                .keepAliveTime(
+                  config.keepAliveInterval.toMillis,
+                  TimeUnit.MILLISECONDS
+                )
+                .keepAliveTimeout(
+                  config.keepAliveTimeout.toMillis,
+                  TimeUnit.MILLISECONDS
+                )
+              val configured =
+                if config.useTls then base else base.usePlaintext()
+              val built = configured.build()
+              val _ = channels.put(address, built)
+              built
+            }
+          }
     }
 
 object GrpcTransport:
@@ -292,6 +313,11 @@ object GrpcTransport:
         grpcConfig.keepAliveTimeout.toMillis,
         TimeUnit.MILLISECONDS
       )
+      .permitKeepAliveTime(
+        math.min(5000L, grpcConfig.keepAliveInterval.toMillis),
+        TimeUnit.MILLISECONDS
+      )
+      .permitKeepAliveWithoutCalls(true)
       .addService(
         RaftServiceGrpc.bindService(service, ExecutionContext.global)
       )
