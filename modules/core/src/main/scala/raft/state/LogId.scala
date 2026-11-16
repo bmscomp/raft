@@ -34,10 +34,24 @@ final case class HardState(
     votedFor: Option[NodeId] = None,
     commitIndex: Long = 0L
 ):
+  require(term >= 0L, s"HardState.term must be >= 0, got $term")
+  require(
+    commitIndex >= 0L,
+    s"HardState.commitIndex must be >= 0, got $commitIndex"
+  )
+
+  /** Typed [[Term]] view of [[term]] for storage and runtime SPIs. */
+  def currentTerm: Term = Term.unsafeFrom(term)
+
   def isEmpty: Boolean = term == 0L && votedFor.isEmpty && commitIndex == 0L
 
 object HardState:
   val Empty: HardState = HardState(0L, None, 0L)
+  val empty: HardState = Empty
+
+  /** Construct a [[HardState]] from typed [[Term]] and optional vote. */
+  def apply(currentTerm: Term, votedFor: Option[NodeId]): HardState =
+    HardState(currentTerm.value, votedFor, 0L)
 
 /** Linearizable read confirmation emitted once leadership is verified at
   * `index` (modeled after `tikv/raft-rs`'s `ReadState`).

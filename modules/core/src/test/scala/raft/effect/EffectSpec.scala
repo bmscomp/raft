@@ -4,11 +4,12 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 import raft.state.*
-import raft.message.*
 import raft.message.RaftMessage.*
 import raft.effect.Effect.*
 
-/** Comprehensive tests for all pure, monomorphic [[Effect]] variants. */
+/** Comprehensive tests for all pure, monomorphic [[Effect]] variants emitted by
+  * [[raft.logic.RaftLogic]].
+  */
 class EffectSpec extends AnyFlatSpec with Matchers:
 
   val node1 = NodeId("node-1")
@@ -73,15 +74,6 @@ class EffectSpec extends AnyFlatSpec with Matchers:
       case _                => fail("Match failed")
   }
 
-  "ApplyToStateMachine effect" should "hold log entry" in {
-    val entry = Log.command(5, 2, "data".getBytes)
-    val effect: Effect = ApplyToStateMachine(entry)
-
-    effect match
-      case ApplyToStateMachine(e) => e shouldBe entry
-      case _                      => fail("Match failed")
-  }
-
   "CommitEntries effect" should "hold upToIndex" in {
     val effect: Effect = CommitEntries(LogIndex.unsafeFrom(100))
 
@@ -90,14 +82,24 @@ class EffectSpec extends AnyFlatSpec with Matchers:
       case _                  => fail("Match failed")
   }
 
-  "ResetElectionTimer effect" should "be a singleton" in {
-    val effect: Effect = ResetElectionTimer
-    effect shouldBe ResetElectionTimer
+  "ResetElectionTimer and ResetHeartbeatTimer effects" should "be singletons" in {
+    (ResetElectionTimer: Effect) shouldBe ResetElectionTimer
+    (ResetHeartbeatTimer: Effect) shouldBe ResetHeartbeatTimer
   }
 
-  "ResetHeartbeatTimer effect" should "be a singleton" in {
-    val effect: Effect = ResetHeartbeatTimer
-    effect shouldBe ResetHeartbeatTimer
+  "BecomeLeader and StopLeader effects" should "be singletons" in {
+    (BecomeLeader: Effect) shouldBe BecomeLeader
+    (StopLeader: Effect) shouldBe StopLeader
+  }
+
+  "ReadIndex effects" should "capture confirmation, readiness, and rejection" in {
+    val confirm: Effect = ConfirmLeadership(5L, "r-1")
+    val ready: Effect = ReadIndexReady("r-1", 42L)
+    val rejected: Effect = ReadIndexRejected("r-2", "Not leader", Some(node1))
+
+    confirm shouldBe ConfirmLeadership(5L, "r-1")
+    ready shouldBe ReadIndexReady("r-1", 42L)
+    rejected shouldBe ReadIndexRejected("r-2", "Not leader", Some(node1))
   }
 
   "RequestSnapshot effect" should "hold lastApplied and logSize" in {
@@ -110,117 +112,52 @@ class EffectSpec extends AnyFlatSpec with Matchers:
       case _ => fail("Match failed")
   }
 
-  "InstallSnapshot effect" should "hold pure SnapshotMetadata with structural equality" in {
-    val meta = SnapshotMetadata(200, 7, Some(ClusterConfig(Set(node1, node2))))
-    val e1: Effect = InstallSnapshot(meta)
-    val e2: Effect = InstallSnapshot(meta)
+  "InstallSnapshot effect" should "hold pure SnapshotMetadata with byte-array structural equality" in {
+    val cfg = Some(ClusterConfig(Set(node1, node2)))
+    val meta1 = SnapshotMetadata(200, 7, cfg, "state-bytes".getBytes)
+    val meta2 = SnapshotMetadata(200, 7, cfg, "state-bytes".getBytes)
+    val e1: Effect = InstallSnapshot(meta1)
+    val e2: Effect = InstallSnapshot(meta2)
     e1 shouldBe e2
+    e1.hashCode() shouldBe e2.hashCode()
   }
 
-  "BecomeLeader effect" should "be a singleton" in {
-    val effect: Effect = BecomeLeader
-    effect shouldBe BecomeLeader
+  "TransferLeadership and TimeoutNow effects" should "hold target node" in {
+    val transfer: Effect = TransferLeadership(node2)
+    val timeoutNow: Effect = TimeoutNow(node2)
+
+    transfer shouldBe TransferLeadership(node2)
+    timeoutNow shouldBe TimeoutNow(node2)
   }
 
-  "TransferLeadership effect" should "hold target node" in {
-    val effect: Effect = TransferLeadership(node2)
-
-    effect match
-      case TransferLeadership(target) => target shouldBe node2
-      case _                          => fail("Match failed")
+  "ApplyClusterConfig effect" should "hold config, index, and term" in {
+    val cfg = ClusterConfig(Set(node1, node2, node3))
+    val eff: Effect = ApplyClusterConfig(cfg, 12L, Term.unsafeFrom(4L))
+    eff shouldBe ApplyClusterConfig(cfg, 12L, Term.unsafeFrom(4L))
   }
 
-  "InitializeLeaderState effect" should "hold followers and lastLogIndex" in {
-    val followers = Set(node2, node3)
-    val effect: Effect = InitializeLeaderState(followers, 50)
-
-    effect match
-      case InitializeLeaderState(f, idx) =>
-        f shouldBe followers
-        idx shouldBe 50
-      case _ => fail("Match failed")
-  }
-
-  "UpdateFollowerIndex effect" should "hold all indices" in {
-    val effect: Effect = UpdateFollowerIndex(
-      node2,
-      matchIndex = LogIndex.unsafeFrom(99),
-      nextIndex = LogIndex.unsafeFrom(100)
+  "Transition helpers" should "construct pure and effectful transitions cleanly" in {
+    val st = NodeState.Follower(1L, None, None)
+    Transition.pure(st) shouldBe Transition(st, Nil)
+    Transition.withEffect(st, BecomeLeader) shouldBe Transition(
+      st,
+      List(BecomeLeader)
     )
-
-    effect match
-      case UpdateFollowerIndex(id, matchIdx, nextIdx) =>
-        id shouldBe node2
-        matchIdx shouldBe LogIndex.unsafeFrom(99)
-        nextIdx shouldBe LogIndex.unsafeFrom(100)
-      case _ => fail("Match failed")
+    Transition.withEffects(
+      st,
+      BecomeLeader,
+      ResetHeartbeatTimer
+    ) shouldBe Transition(st, List(BecomeLeader, ResetHeartbeatTimer))
   }
 
-  "ParallelReplicate effect" should "hold targets and message" in {
-    val targets = Set(node2, node3)
-    val msg = AppendEntriesRequest(1, node1, 0, 0, Seq.empty, 0)
-    val effect: Effect = ParallelReplicate(targets, msg)
-
-    effect match
-      case ParallelReplicate(t, m) =>
-        t shouldBe targets
-        m shouldBe msg
-      case _ => fail("Match failed")
-  }
-
-  "BatchAppend effect" should "hold entries and pure batchId" in {
-    val entries = Seq(Log.command(1, 1, "x".getBytes))
-    val effect: Effect = BatchAppend(entries, "batch-7")
-
-    effect match
-      case BatchAppend(e, id) =>
-        e shouldBe entries
-        id shouldBe "batch-7"
-      case _ => fail("Match failed")
-  }
-
-  "BatchComplete effect" should "hold batchId and result" in {
-    val effect: Effect = BatchComplete("batch-42", Right(()))
-
-    effect match
-      case BatchComplete(id, res) =>
-        id shouldBe "batch-42"
-        res shouldBe Right(())
-      case _ => fail("Match failed")
-  }
-
-  "PipelinedSend effect" should "hold target, message, and pipelineId" in {
-    val msg = AppendEntriesRequest(1, node1, 0, 0, Seq.empty, 0)
-    val effect: Effect = PipelinedSend(node2, msg, "pipe-1")
-
-    effect match
-      case PipelinedSend(to, m, pid) =>
-        to shouldBe node2
-        m shouldBe msg
-        pid shouldBe "pipe-1"
-      case _ => fail("Match failed")
-  }
-
-  "TrackInflight effect" should "hold node, messageId, and maxIndex with value equality" in {
-    val e1: Effect = TrackInflight(node2, "msg-123", 42L)
-    val e2: Effect = TrackInflight(node2, "msg-123", 42L)
-    e1 shouldBe e2
-  }
-
-  "Effects" should "be equal when constructed with same values" in {
+  "Effects" should "be equal when constructed with same values and unequal otherwise" in {
     val e1: Effect =
       SendMessage(node2, AppendEntriesRequest(1, node1, 0, 0, Seq.empty, 0))
     val e2: Effect =
       SendMessage(node2, AppendEntriesRequest(1, node1, 0, 0, Seq.empty, 0))
-
-    e1 shouldBe e2
-  }
-
-  it should "not be equal when constructed with different values" in {
-    val e1: Effect =
-      SendMessage(node2, AppendEntriesRequest(1, node1, 0, 0, Seq.empty, 0))
-    val e2: Effect =
+    val e3: Effect =
       SendMessage(node3, AppendEntriesRequest(1, node1, 0, 0, Seq.empty, 0))
 
-    e1 should not be e2
+    e1 shouldBe e2
+    e1 should not be e3
   }

@@ -42,10 +42,41 @@ class ReadIndexSpec extends AnyFlatSpec with Matchers:
     step1.effects should contain(ConfirmLeadership(5L, "read-123"))
     step1.state.asInstanceOf[Leader].pendingReads should contain key "read-123"
 
+    // ReadIndex must send per-peer heartbeats anchored at each peer's nextIndex - 1 (100L)
+    val peerHeartbeats = step1.effects.collect {
+      case SendMessage(peer, hb: AppendEntriesRequest) => peer -> hb
+    }.toMap
+    peerHeartbeats.keySet shouldBe Set(node2, node3)
+    peerHeartbeats(node2).prevLogIndex shouldBe 100L
+    peerHeartbeats(node2).prevLogTerm shouldBe 5L
+    peerHeartbeats(node2).leaderCommit shouldBe 100L
+
+    // Delivering that ReadIndex heartbeat to follower node-2 verifies prefix and advances follower commit!
+    val followerStep = RaftLogic.onMessage(
+      Follower(term = 5, votedFor = Some(node1), leaderId = Some(node1)),
+      peerHeartbeats(node2),
+      RaftConfig(localId = node2, preVoteEnabled = false),
+      lastLogIndex = 100L,
+      lastLogTerm = 5L,
+      clusterSize = 3,
+      getTermAt = { case 100L => Some(5L); case _ => None }
+    )
+    followerStep.effects should contain(
+      CommitEntries(LogIndex.unsafeFrom(100L))
+    )
+    val followerAck = followerStep.effects.collectFirst {
+      case SendMessage(_, resp: AppendEntriesResponse) => resp
+    }.get
+    followerAck shouldBe AppendEntriesResponse(
+      term = 5,
+      success = true,
+      matchIndex = 100L
+    )
+
     // Peer node-2 acknowledges heartbeat -> quorum {node-1, node-2} reached!
     val step2 = RaftLogic.onMessage(
       step1.state,
-      AppendEntriesResponse(term = 5, success = true, matchIndex = 100L),
+      followerAck,
       config,
       lastLogIndex = 100L,
       lastLogTerm = 5L,
@@ -59,6 +90,30 @@ class ReadIndexSpec extends AnyFlatSpec with Matchers:
     step2.state.asInstanceOf[Leader].pendingReads should not contain key(
       "read-123"
     )
+  }
+
+  "ReadIndex on freshly elected Leader with commitIndex == 0 and uncommitted NoOp" should "reject until NoOp commits" in {
+    val newLeader = Leader(
+      term = 2,
+      nextIndex = Map(node2 -> 2L, node3 -> 2L),
+      matchIndex = Map(node2 -> 0L, node3 -> 0L),
+      commitIndex = 0L
+    )
+
+    val trans = RaftLogic.onMessage(
+      newLeader,
+      ReadIndexRequest("before-noop"),
+      config,
+      lastLogIndex = 1L,
+      lastLogTerm = 2L,
+      clusterSize = 3,
+      getTermAt = { case 1L => Some(2L); case _ => None },
+      clusterOpt = Some(cluster)
+    )
+
+    trans.effects.collectFirst { case r: ReadIndexRejected =>
+      r.id
+    } shouldBe Some("before-noop")
   }
 
   "ReadIndex on single-node Leader" should "return ReadIndexReady immediately without network round-trip" in {

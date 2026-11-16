@@ -99,7 +99,16 @@ object RaftLogic:
         onInstallSnapshotResponse(state, resp, sender)
 
       case req: ReadIndexRequest =>
-        onReadIndex(state, req, config, clusterSize, getTermAt, clusterOpt)
+        onReadIndex(
+          state,
+          req,
+          config,
+          lastLogIndex,
+          lastLogTerm,
+          clusterSize,
+          getTermAt,
+          clusterOpt
+        )
 
       case req: TransferLeadershipRequest =>
         onTransferLeadership(
@@ -826,6 +835,46 @@ object RaftLogic:
             clusterOpt
           )
 
+  private def buildHeartbeatEffects(
+      l: Leader,
+      config: RaftConfig,
+      lastLogIndex: Long,
+      lastLogTerm: Long,
+      getTermAt: Long => Option[Long]
+  ): List[Effect] =
+    if l.nextIndex.nonEmpty then
+      l.nextIndex.toList.map { case (peerId, nextIdx) =>
+        val prevIdx = math.max(0L, nextIdx - 1L)
+        val prevTerm =
+          if prevIdx == 0L then 0L
+          else if prevIdx == lastLogIndex then lastLogTerm
+          else getTermAt(prevIdx).getOrElse(lastLogTerm)
+        SendMessage(
+          peerId,
+          AppendEntriesRequest(
+            term = l.term,
+            leaderId = config.localId,
+            prevLogIndex = prevIdx,
+            prevLogTerm = prevTerm,
+            entries = Seq.empty,
+            leaderCommit = math.min(l.commitIndex, prevIdx)
+          )
+        )
+      }
+    else
+      List(
+        Broadcast(
+          AppendEntriesRequest(
+            term = l.term,
+            leaderId = config.localId,
+            prevLogIndex = lastLogIndex,
+            prevLogTerm = lastLogTerm,
+            entries = Seq.empty,
+            leaderCommit = l.commitIndex
+          )
+        )
+      )
+
   private def onHeartbeatTimeout(
       state: NodeState,
       config: RaftConfig,
@@ -835,37 +884,9 @@ object RaftLogic:
   ): Transition =
     state match
       case l: Leader =>
-        if l.nextIndex.nonEmpty then
-          val perPeerEffects = l.nextIndex.toList.map {
-            case (peerId, nextIdx) =>
-              val prevIdx = math.max(0L, nextIdx - 1L)
-              val prevTerm =
-                if prevIdx == 0L then 0L
-                else if prevIdx == lastLogIndex then lastLogTerm
-                else getTermAt(prevIdx).getOrElse(lastLogTerm)
-              SendMessage(
-                peerId,
-                AppendEntriesRequest(
-                  term = l.term,
-                  leaderId = config.localId,
-                  prevLogIndex = prevIdx,
-                  prevLogTerm = prevTerm,
-                  entries = Seq.empty,
-                  leaderCommit = math.min(l.commitIndex, prevIdx)
-                )
-              )
-          }
-          Transition(l, perPeerEffects :+ ResetHeartbeatTimer)
-        else
-          val heartbeat = AppendEntriesRequest(
-            term = l.term,
-            leaderId = config.localId,
-            prevLogIndex = lastLogIndex,
-            prevLogTerm = lastLogTerm,
-            entries = Seq.empty,
-            leaderCommit = l.commitIndex
-          )
-          Transition.withEffects(l, Broadcast(heartbeat), ResetHeartbeatTimer)
+        val hbEffects =
+          buildHeartbeatEffects(l, config, lastLogIndex, lastLogTerm, getTermAt)
+        Transition(l, hbEffects :+ ResetHeartbeatTimer)
       case _ =>
         Transition.pure(state)
 
@@ -876,6 +897,8 @@ object RaftLogic:
       state: NodeState,
       req: ReadIndexRequest,
       config: RaftConfig,
+      lastLogIndex: Long,
+      lastLogTerm: Long,
       clusterSize: Int,
       getTermAt: Long => Option[Long],
       clusterOpt: Option[ClusterConfig]
@@ -886,12 +909,11 @@ object RaftLogic:
           case Some(cl) => cl.hasQuorum(Set(config.localId))
           case None     => clusterSize == 1
 
-        if singleNodeQuorum then
-          Transition.withEffect(l, ReadIndexReady(req.requestId, l.commitIndex))
-        else if l.commitIndex > 0L && !getTermAt(l.commitIndex).forall(
-            _ == l.term
-          )
-        then
+        val currentTermCommitted =
+          if l.commitIndex == 0L then lastLogIndex == 0L
+          else getTermAt(l.commitIndex).contains(l.term)
+
+        if !currentTermCommitted then
           Transition.withEffect(
             l,
             ReadIndexRejected(
@@ -900,6 +922,8 @@ object RaftLogic:
               Some(config.localId)
             )
           )
+        else if singleNodeQuorum then
+          Transition.withEffect(l, ReadIndexReady(req.requestId, l.commitIndex))
         else
           val pending = PendingRead(
             requestId = req.requestId,
@@ -910,18 +934,16 @@ object RaftLogic:
             l.copy(pendingReads =
               l.pendingReads.updated(req.requestId, pending)
             )
-          val heartbeat = AppendEntriesRequest(
-            term = l.term,
-            leaderId = config.localId,
-            prevLogIndex = 0L,
-            prevLogTerm = 0L,
-            entries = Seq.empty,
-            leaderCommit = l.commitIndex
+          val hbEffects = buildHeartbeatEffects(
+            l,
+            config,
+            lastLogIndex,
+            lastLogTerm,
+            getTermAt
           )
-          Transition.withEffects(
+          Transition(
             updatedLeader,
-            ConfirmLeadership(l.term, req.requestId),
-            Broadcast(heartbeat)
+            ConfirmLeadership(l.term, req.requestId) :: hbEffects
           )
 
       case f: Follower =>

@@ -26,8 +26,8 @@ import raft.state.Log
   * @tparam R
   *   the result type returned when a command is applied
   * @see
-  *   [[raft.effect.Effect.ApplyToStateMachine]] for the effect that triggers
-  *   application
+  *   [[raft.effect.Effect.CommitEntries]] for the effect that triggers
+  *   commitment and subsequent application
   * @see
   *   [[raft.state.Log]] for the entry structure passed to `apply`
   */

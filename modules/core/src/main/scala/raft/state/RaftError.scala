@@ -34,6 +34,15 @@ object RaftError:
         "Another cluster configuration change is already pending commitment"
       )
 
+  /** Leader cannot propose a membership change until at least one entry from
+    * its current term (such as its initial `NoOp`) has been committed (§4.1 /
+    * §6).
+    */
+  final case class LeaderNotReadyInTerm(term: Long)
+      extends RaftError(
+        s"Leader in term $term has not yet committed an entry in its current term"
+      )
+
   /** Proposal was dropped by the consensus state machine. */
   final case class ProposalDropped(reason: String)
       extends RaftError(s"Proposal dropped: $reason")

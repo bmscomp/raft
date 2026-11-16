@@ -378,9 +378,6 @@ private final class RaftNodeImpl[F[_]: Async](
       case Eff.TruncateLog(fromIndex) =>
         logStore.truncateFrom(LogIndex.unsafeFrom(fromIndex))
 
-      case Eff.ApplyToStateMachine(entry) =>
-        applyEntry(entry)
-
       case Eff.ResetElectionTimer =>
         resetElectionTimer
 
@@ -440,9 +437,6 @@ private final class RaftNodeImpl[F[_]: Async](
           )
         yield ()
 
-      case Eff.SendSnapshotChunk(to, req) =>
-        transport.send(to, req)
-
       case Eff.BecomeLeader =>
         for
           _ <- cancelFiber(electionFiberRef)
@@ -465,39 +459,9 @@ private final class RaftNodeImpl[F[_]: Async](
       case Eff.TransferLeadership(target) =>
         logger.info(s"Transferring leadership to ${target.value}")
 
-      case Eff.InitializeLeaderState(followers, lastLog) =>
-        stateRef.update {
-          case l: Leader => l.initializeIndices(followers, lastLog)
-          case s         => s
-        }
-
-      case Eff.UpdateFollowerIndex(followerId, matchIdx, nextIdx) =>
-        stateRef.update {
-          case l: Leader =>
-            l.withMatchIndex(followerId, matchIdx.value)
-              .withNextIndex(followerId, nextIdx.value)
-          case s => s
-        }
-
       case Eff.CommitEntries(upToIndex) =>
         applyCommittedEntries(upToIndex) *>
           metrics.onEntriesCommitted(config.localId, upToIndex.value)
-
-      case Eff.ParallelReplicate(targets, msg) =>
-        targets.toList.parTraverse_(t => transport.send(t, msg))
-
-      case Eff.BatchAppend(entries, _) =>
-        logStore.append(entries) *>
-          metrics.onEntriesAppended(config.localId, entries.size)
-
-      case Eff.BatchComplete(_, _) =>
-        Async[F].unit
-
-      case Eff.PipelinedSend(to, msg, _) =>
-        transport.send(to, msg)
-
-      case Eff.TrackInflight(_, _, _) =>
-        Async[F].unit
 
       case Eff.ReadIndexReady(_, _) =>
         Async[F].unit
@@ -512,21 +476,6 @@ private final class RaftNodeImpl[F[_]: Async](
         logger.info(
           s"TimeoutNow -> ${target.value}: triggering immediate election"
         )
-
-      case Eff.ExtendLease(_) =>
-        Async[F].unit
-
-      case Eff.LeaseReadReady(_) =>
-        Async[F].unit
-
-      case Eff.RunReadIndex(_) =>
-        Async[F].unit
-
-      case Eff.SendReadIndexResponse(_, _) =>
-        Async[F].unit
-
-      case Eff.VerifyLease(_) =>
-        Async[F].unit
 
       case Eff.ApplyClusterConfig(newConfig, _, _) =>
         clusterRef.set(newConfig)

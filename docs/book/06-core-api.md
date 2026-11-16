@@ -214,29 +214,28 @@ Internal events like `ElectionTimeout` and `HeartbeatTimeout` are modeled as mes
 
 ## The Effect Catalog
 
-Every effect the protocol logic can produce is documented here. Understanding this catalog is essential for writing a correct effect interpreter.
+`Effect` is a minimal, exhaustive 18-case pure algebra — every variant below is actively emitted by `RaftLogic` transitions and carries structural value equality (`==`) with zero closure callbacks:
 
 | Effect | When It's Produced | What the Runtime Should Do |
 |--------|-------------------|---------------------------|
-| `SendMessage(to, msg)` | Responding to a specific peer (vote reply, append reply) | Deliver `msg` to node `to` via transport |
-| `Broadcast(msg)` | Starting an election, sending heartbeats | Deliver `msg` to **all** peers |
-| `PersistHardState(term, votedFor)` | Term changes, votes cast | fsync `term` and `votedFor` to durable storage |
-| `AppendLogs(entries)` | Follower accepts entries from leader | Append entries to log store (atomic, durable) |
-| `TruncateLog(fromIndex)` | Log conflict detected | Remove entries at and after `fromIndex` |
-| `CommitEntries(upToIndex)` | Commit index advances | Apply entries through `upToIndex` to the state machine |
-| `BecomeLeader` | Election won | Initialize leader state (send heartbeats, etc.) |
-| `ResetElectionTimer` | Heartbeat received, or vote granted | Restart the election countdown |
-| `ResetHeartbeatTimer` | Became leader, or heartbeat interval elapsed | Schedule the next heartbeat |
-| `ConfirmLeadership(commitIndex)` | ReadIndex requested | Start a heartbeat round to confirm leadership |
-| `ReadIndexReady(commitIndex)` | Leadership confirmed for a read | Serve the linearizable read after applying through `commitIndex` |
-| `ReadIndexRejected(hint)` | Non-leader asked to serve a read | Return error to client (with optional leader hint) |
-| `LeaseReadReady(commitIndex)` | Lease-based read requested and lease is valid | Serve the read immediately |
-| `ExtendLease(duration)` | Heartbeat acknowledged by majority | Extend the leadership lease |
-| `TimeoutNow(target)` | Leadership transfer initiated | Send `TimeoutNow` to the target node |
-| `TransferLeadership(target)` | Admin requests leadership transfer | Begin the transfer process (catch up target, then TimeoutNow) |
-| `ParallelReplicate(peers, msg)` | Parallel replication enabled | Send `AppendEntries` to multiple peers concurrently |
-| `BatchAppend(batchId, entries)` | Batching enabled | Batch multiple entries into a single log append |
-| `BatchComplete(batchId, results)` | Batch of entries committed | Notify clients of batch results |
+| `SendMessage(to, msg)` | Responding to or probing a specific peer (vote reply, per-peer heartbeat, append probe) | Deliver `msg` to node `to` via transport |
+| `Broadcast(msg)` | Starting a pre-vote/election or fallback broadcast | Deliver `msg` to **all** peers |
+| `PersistHardState(term, votedFor)` | Term changes or votes cast | Atomically `fsync` `term` and `votedFor` to durable storage |
+| `AppendLogs(entries)` | Leader or follower appends entries | Append entries to durable log store |
+| `TruncateLog(fromIndex)` | Log conflict detected (§5.3) | Remove entries at and after `fromIndex` |
+| `CommitEntries(upToIndex)` | Commit index advances | Apply committed entries through `upToIndex` in index order |
+| `BecomeLeader` | Election won | Cancel election timer, append `NoOp`, start leader replication |
+| `StopLeader` | Higher term discovered or `CheckQuorum` step-down | Cancel leader heartbeat/quorum timers |
+| `ResetElectionTimer` | Valid leader RPC received or vote granted | Restart randomized election countdown |
+| `ResetHeartbeatTimer` | Periodic leader heartbeat tick | Reschedule next leader heartbeat |
+| `ConfirmLeadership(term, roundId)` | `ReadIndex` round initiated on leader | Track quorum heartbeat confirmation round |
+| `ReadIndexReady(id, index)` | `ReadIndex` quorum confirmed at `index` | Wait until `lastApplied >= index`, then complete client read |
+| `ReadIndexRejected(id, reason, leaderHint)` | Non-leader or leader before current-term commit asked to read | Fail read fast with optional `leaderHint` |
+| `RequestSnapshot(lastApplied, logSize)` | Compaction threshold reached | Capture state-machine snapshot and compact WAL prefix |
+| `InstallSnapshot(metadata)` | Final `InstallSnapshotRequest` chunk accepted | Restore state machine, persist snapshot, update `ClusterConfig` |
+| `TransferLeadership(target)` | Leadership transfer initiated (§3.10) | Reject new proposals while catching up `target` |
+| `TimeoutNow(target)` | Target voter caught up during leadership transfer | Send `TimeoutNowRequest` so `target` campaigns immediately |
+| `ApplyClusterConfig(config, index, term)` | Membership configuration appended/installed | Update active `ClusterConfig` (`C_old,new` or `C_new`) |
 
 > **Note — Effect ordering matters.** The runtime should execute `PersistHardState` **before** `SendMessage` or `Broadcast`. The reason: if the node crashes after sending a message but before persisting the term/vote, it might restart and repeat an action that violates safety (like voting twice in the same term). Persist first, communicate second. This is a standard pattern in distributed systems, sometimes called "write-ahead".
 

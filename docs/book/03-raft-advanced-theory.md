@@ -159,6 +159,30 @@ Joint consensus is safe because at no point can two disjoint majorities independ
 
 What if the membership change goes wrong? Maybe the new nodes are unreachable, or an operator changes their mind. Joint consensus supports **safe abortion**: if the C_old,new entry hasn't been committed yet, it can be discarded, and the cluster reverts to C_old. If it has been committed, a new C_old entry can be appended to the log to "undo" the transition. In either case, safety is preserved.
 
+### The Current-Term Commit Guard Before Membership Changes (Ongaro §4.1)
+
+Even with Joint Consensus, there is a famous subtle safety trap discovered by Diego Ongaro after publishing the original Raft paper (documented in §4.1 of his PhD dissertation and independently encountered in production by `etcd` and Consul): **a newly elected leader must not append a membership change until it has committed at least one entry from its own term** (specifically, its initial `LogType.NoOp` entry).
+
+Why? When a leader wins election in term `T`, its `commitIndex` may still sit below an uncommitted configuration entry `C_1` left in its log from term `T - 1`. Because Raft's Figure 8 rule (§5.4.2) forbids committing prior-term entries directly by counting replicas, the leader does not yet know whether `C_1` was already committed on a majority before the crash. If the new leader immediately accepts a new configuration request `C_2` before committing its term-`T` `NoOp`, two overlapping configuration transitions can be active before `C_1` stabilizes.
+
+`RawNode.proposeConfChange` enforces this invariant explicitly by returning `Left(RaftError.LeaderNotReadyInTerm(term))` until `hasCommittedInCurrentTerm(term)` holds:
+
+```mermaid
+sequenceDiagram
+    participant Admin as "Control Plane"
+    participant L as "New Leader (term T)"
+    participant F as "Followers"
+
+    Note over L: "Elected in term T; appends NoOp at index k (commitIndex < k)"
+    Admin->>L: "proposeConfChange(newMembers)"
+    L-->>Admin: "Left(LeaderNotReadyInTerm(T))"
+    L->>F: "AppendEntries(term=T, entries=[NoOp@k])"
+    F-->>L: "AppendEntriesResponse(success=true, matchIndex=k)"
+    Note over L: "commitIndex advances to k (term(k) == T)"
+    Admin->>L: "proposeConfChange(newMembers)"
+    L-->>Admin: "Right(k + 1) — C_old,new safely appended"
+```
+
 ## Linearizable Reads
 
 ### The Problem: Stale Reads from Deposed Leaders
@@ -227,6 +251,15 @@ sequenceDiagram
 ```
 
 > **Note — ReadIndex and Followers:** A variation of ReadIndex allows **followers** to serve linearizable reads. The follower asks the leader for the current commit index, the leader confirms its leadership via heartbeat, and then the follower waits until it has applied entries through that index before serving the read. This distributes read load across the cluster. etcd implements this as "serializable reads" at followers.
+
+### Why `ReadIndex` Heartbeats Must Carry Per-Peer `(prevLogIndex, prevLogTerm)`
+
+A subtle implementation pitfall when building `ReadIndex` is broadcasting an identical dummy heartbeat `AppendEntriesRequest(prevLogIndex = 0, prevLogTerm = 0, leaderCommit = commitIndex)` to every peer:
+
+1. **Broken Follower Commit Advancement**: Under Raft's `AppendEntries` receiver rule (§5.3), a follower sets `commitIndex = min(leaderCommit, indexOfLastNewEntry)`. When `prevLogIndex = 0` and `entries` is empty, `indexOfLastNewEntry` evaluates to `0`, so `min(leaderCommit, 0) = 0` — followers never advance their `commitIndex` on read-confirmation heartbeats!
+2. **Skipped Log-Prefix Verification**: Setting `prevLogIndex = 0` trivially passes the log consistency check even on a follower whose suffix diverges from the leader.
+
+`RaftLogic.onReadIndex` avoids both pitfalls by constructing **per-peer heartbeats** anchored at each follower's tracked `prevIdx = nextIndex(peer) - 1` and `prevTerm = getTermAt(prevIdx)`, with `leaderCommit = min(commitIndex, prevIdx)` — sharing the exact same consistency envelope as periodic leader heartbeats. Also, if a freshly elected leader has `commitIndex == 0` while its initial `NoOp` at `lastLogIndex >= 1` is still uncommitted, `onReadIndex` rejects the read until `NoOp` commits (§5.4.2 / §6.4).
 
 ### Approach 3: Lease-Based Reads (Zero RTT, Requires Clock Assumptions)
 
