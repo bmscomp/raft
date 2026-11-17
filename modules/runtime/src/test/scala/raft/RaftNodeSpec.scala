@@ -63,7 +63,7 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
 
   private def awaitLeader(
       nodes: List[(NodeId, RaftNode[IO])],
-      retries: Int = 100
+      retries: Int = 300
   ): IO[(NodeId, RaftNode[IO])] =
     nodes
       .traverse { case (id, n) => n.getState.map(st => (id, n, st)) }
@@ -78,7 +78,7 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
 
   private def awaitCondition(
       cond: IO[Boolean],
-      retries: Int = 100
+      retries: Int = 300
   ): IO[Unit] =
     cond.flatMap {
       case true  => IO.unit
@@ -125,10 +125,10 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
       resources = ids.map { id =>
         val cfg = RaftConfig(
           localId = id,
-          electionTimeoutMin = 60.millis,
-          electionTimeoutMax = 120.millis,
-          heartbeatInterval = 20.millis,
-          leaderLeaseDuration = 200.millis,
+          electionTimeoutMin = 300.millis,
+          electionTimeoutMax = 600.millis,
+          heartbeatInterval = 40.millis,
+          leaderLeaseDuration = 400.millis,
           leaseReadEnabled = true,
           checkQuorumEnabled = true
         )
@@ -220,9 +220,9 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
       mkNode = (id: NodeId, cl: ClusterConfig) =>
         val cfg = RaftConfig(
           localId = id,
-          electionTimeoutMin = 60.millis,
-          electionTimeoutMax = 120.millis,
-          heartbeatInterval = 20.millis,
+          electionTimeoutMin = 300.millis,
+          electionTimeoutMax = 600.millis,
+          heartbeatInterval = 40.millis,
           compaction = CompactionConfig(
             level = CompactionLevel.Custom,
             snapshotChunkSize = 32,

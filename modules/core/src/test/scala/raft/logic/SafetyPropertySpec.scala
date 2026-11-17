@@ -1,4 +1,4 @@
-package raft.integration
+package raft.logic
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -6,22 +6,11 @@ import org.scalatestplus.scalacheck.ScalaCheckPropertyChecks
 import org.scalacheck.Gen
 import raft.state.*
 import raft.state.NodeState.*
-import raft.logic.*
 import raft.message.*
 import raft.message.RaftMessage.*
 import raft.effect.Effect.*
 
-/** Property-based tests verifying formal RAFT safety invariants.
-  *
-  * Uses ScalaCheck generators to create randomized message sequences, then
-  * asserts that fundamental safety properties hold regardless of the specific
-  * input combination.
-  *
-  * Safety properties from Ongaro's dissertation §3.2:
-  *   - Election Safety: at most one leader per term
-  *   - Leader Append-Only: leader never overwrites its log
-  *   - Log Matching: if two logs agree at an index, they agree on all prior
-  *   - State Machine Safety: committed entries are never contradicted
+/** Property-based tests verifying formal RAFT safety invariants on RaftLogic.
   */
 class SafetyPropertySpec
     extends AnyFlatSpec
@@ -35,7 +24,6 @@ class SafetyPropertySpec
   val config = RaftConfig.default(n1).copy(preVoteEnabled = false)
 
   val termGen: Gen[Long] = Gen.choose(1L, 100L)
-  val indexGen: Gen[Long] = Gen.choose(0L, 200L)
 
   "Election Safety" should "ensure at most one leader per term across randomized elections" in {
     forAll(termGen, termGen) { (term1: Long, term2: Long) =>
@@ -45,7 +33,6 @@ class SafetyPropertySpec
         val candidate2: Candidate =
           Candidate(term = term1, votesReceived = Set(n2))
 
-        // Candidate1 gets majority vote
         val vote1: RequestVoteResponse = RequestVoteResponse(
           term = term1,
           voteGranted = true,
@@ -54,8 +41,6 @@ class SafetyPropertySpec
         val trans1 = RaftLogic.onVoteResponse(candidate1, n3, vote1, config, 3)
 
         if trans1.state.isInstanceOf[Leader] then
-          // If candidate1 became leader, candidate2 should NOT also become leader
-          // at the same term because n3 already voted for candidate1
           val vote2: RequestVoteResponse = RequestVoteResponse(
             term = term1,
             voteGranted = false,
@@ -76,15 +61,6 @@ class SafetyPropertySpec
   it should "never produce two leaders via vote splitting" in {
     forAll(termGen) { (term: Long) =>
       whenever(term > 0) {
-        // In a 5-node cluster, majority is 3. Two candidates each need 3 votes
-        // but with 5 votes total, at most one can reach 3.
-        val maxVotesForCandidate1 = 2 // self + 1 peer
-        val maxVotesForCandidate2 = 2 // self + 1 peer
-
-        // Neither reaches majority of 3
-        maxVotesForCandidate1 should be < 3
-        maxVotesForCandidate2 should be < 3
-
         val c1: Candidate = Candidate(term, Set(n1, n2))
         val c2: Candidate = Candidate(term, Set(n3, NodeId("node-4")))
 
@@ -113,7 +89,6 @@ class SafetyPropertySpec
         val oldTerm = state.term
         val trans = RaftLogic.onMessage(state, msg, config, 0, 0, 3)
 
-        // Term never decreases
         trans.state.term should be >= oldTerm
         state = trans.state
     }
@@ -144,7 +119,6 @@ class SafetyPropertySpec
       whenever(term > 0) {
         val follower = Follower(term = term, votedFor = None, leaderId = None)
 
-        // First vote request: should be granted
         val req1 = RequestVoteRequest(
           term = term,
           candidateId = n2,
@@ -158,7 +132,6 @@ class SafetyPropertySpec
         }.get
 
         if resp1.voteGranted then
-          // Second request from DIFFERENT candidate at same term: must be denied
           val req2 = RequestVoteRequest(
             term = term,
             candidateId = n3,
@@ -235,12 +208,11 @@ class SafetyPropertySpec
 
   "Commit calculation" should "require majority for any cluster size" in {
     val clusterSizeGen =
-      Gen.choose(3, 9).suchThat(_ % 2 == 1) // odd cluster sizes
+      Gen.choose(3, 9).suchThat(_ % 2 == 1)
 
     forAll(clusterSizeGen) { (size: Int) =>
       val majority = size / 2 + 1
 
-      // With majority-1 followers replicated, commit should NOT advance
       val notEnough = (1 until majority)
         .map(i => NodeId(s"f-$i") -> 10L)
         .toMap ++ (majority until size).map(i => NodeId(s"f-$i") -> 0L).toMap
@@ -256,12 +228,7 @@ class SafetyPropertySpec
         case _  => None
       }
 
-      // Need to check if leader + (majority-1) followers = majority
-      // Leader counts as having index 10 implicitly via commitIndex logic
       val newCommit = leader.calculateCommitIndex(size, getTermAt)
-
-      // The exact behavior depends on implementation details
-      // but the commit should never exceed what majority has
       newCommit should be >= 0L
     }
   }

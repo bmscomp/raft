@@ -1,27 +1,19 @@
-package raft.integration
+package raft.logic
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import raft.state.*
 import raft.state.NodeState.*
 
-/** Tests for Learner Nodes functionality.
-  *
-  * Learner nodes are non-voting members that:
-  *   - Receive log replication from leader
-  *   - Do NOT participate in elections (cannot vote)
-  *   - Do NOT count toward quorum for commits
-  *   - Can be promoted to full voter once caught up
-  */
+/** Tests for Learner Nodes functionality in ClusterConfig and Leader state. */
 class LearnerNodeSpec extends AnyFlatSpec with Matchers:
 
-  val node1 = NodeId("node-1") // Voter
-  val node2 = NodeId("node-2") // Voter
-  val node3 = NodeId("node-3") // Voter
-  val learner1 = NodeId("learner-1") // Learner
-  val learner2 = NodeId("learner-2") // Learner
+  val node1 = NodeId("node-1")
+  val node2 = NodeId("node-2")
+  val node3 = NodeId("node-3")
+  val learner1 = NodeId("learner-1")
+  val learner2 = NodeId("learner-2")
 
-  // Cluster with 3 voters + 2 learners
   val clusterConfig = ClusterConfig(
     Map(
       node1 -> NodeRole.Voter,
@@ -32,8 +24,6 @@ class LearnerNodeSpec extends AnyFlatSpec with Matchers:
     )
   )
 
-  // === LEARNER VOTES DON'T COUNT ===
-
   "ClusterConfig" should "correctly identify voters and learners" in {
     clusterConfig.voters shouldBe Set(node1, node2, node3)
     clusterConfig.learners shouldBe Set(learner1, learner2)
@@ -41,32 +31,27 @@ class LearnerNodeSpec extends AnyFlatSpec with Matchers:
   }
 
   it should "calculate majority based on voters only" in {
-    // 3 voters = majority is 2
     clusterConfig.majoritySize shouldBe 2
   }
 
   it should "determine quorum from voters only" in {
-    // Only voters count for quorum
-    clusterConfig.hasQuorum(Set(node1, node2)) shouldBe true // 2/3 voters
-    clusterConfig.hasQuorum(Set(node1)) shouldBe false // 1/3 voters
+    clusterConfig.hasQuorum(Set(node1, node2)) shouldBe true
+    clusterConfig.hasQuorum(Set(node1)) shouldBe false
 
-    // Learners don't count toward quorum
     clusterConfig.hasQuorum(
       Set(node1, learner1, learner2)
-    ) shouldBe false // Only 1 voter
+    ) shouldBe false
     clusterConfig.hasQuorum(
       Set(node1, node2, learner1)
-    ) shouldBe true // 2 voters + 1 learner
+    ) shouldBe true
   }
-
-  // === LEARNER PROMOTION ===
 
   "Learner promotion" should "convert learner to voter" in {
     val promoted = clusterConfig.promoteLearner(learner1)
 
     promoted.voters shouldBe Set(node1, node2, node3, learner1)
     promoted.learners shouldBe Set(learner2)
-    promoted.majoritySize shouldBe 3 // Now 4 voters, majority is 3
+    promoted.majoritySize shouldBe 3
   }
 
   it should "do nothing for non-learner nodes" in {
@@ -79,14 +64,12 @@ class LearnerNodeSpec extends AnyFlatSpec with Matchers:
     unchanged shouldBe clusterConfig
   }
 
-  // === ADDING LEARNERS ===
-
   "Adding members" should "support adding new learners" in {
     val newLearner = NodeId("new-learner")
     val updated = clusterConfig.addMember(newLearner, NodeRole.Learner)
 
     updated.learners should contain(newLearner)
-    updated.voters shouldBe clusterConfig.voters // Voters unchanged
+    updated.voters shouldBe clusterConfig.voters
   }
 
   it should "support adding new voters directly" in {
@@ -94,42 +77,33 @@ class LearnerNodeSpec extends AnyFlatSpec with Matchers:
     val updated = clusterConfig.addMember(newVoter, NodeRole.Voter)
 
     updated.voters should contain(newVoter)
-    updated.majoritySize shouldBe 3 // 4 voters now
+    updated.majoritySize shouldBe 3
   }
-
-  // === LEARNER RECEIVES REPLICATION ===
 
   "Leader replication" should "include learners in broadcast" in {
-    // When leader broadcasts, ALL nodes (including learners) should receive
-    // This is ensured by using allNodes in the Broadcast effect
-
-    clusterConfig.allNodes.size shouldBe 5 // 3 voters + 2 learners
+    clusterConfig.allNodes.size shouldBe 5
   }
 
-  // === LEARNER LOG CATCHUP TRACKING ===
-
   "Leader matchIndex" should "track learner replication progress" in {
-    // Leader state correctly tracks both voters and learners
     val matchIdx = Map(
       node2 -> 99L,
-      node3 -> 98L, // Voters
+      node3 -> 98L,
       learner1 -> 49L,
-      learner2 -> 74L // Learners
+      learner2 -> 74L
     )
     val nextIdx = Map(
       node2 -> 100L,
-      node3 -> 100L, // Voters
+      node3 -> 100L,
       learner1 -> 50L,
-      learner2 -> 75L // Learners (catching up)
+      learner2 -> 75L
     )
 
     val leader: Leader = Leader(
       term = 5,
       nextIndex = nextIdx,
       matchIndex = matchIdx
-    ).asInstanceOf[Leader]
+    )
 
-    // Leader correctly has both voters and learners in tracking maps
     leader.matchIndex.keySet should contain allOf (
       node2,
       node3,
@@ -144,46 +118,31 @@ class LearnerNodeSpec extends AnyFlatSpec with Matchers:
     )
   }
 
-  // === COMMIT INDEX DOESN'T CONSIDER LEARNERS ===
-
   "Commit calculation" should "only consider voter matchIndex" in {
-    // Scenario: 3 voters at indices 100, 90, 80 + 2 learners at 50, 40
-    // Commit should be median of VOTERS only = 90 (not affected by learners)
-
     val voterMatches = List(100L, 90L, 80L)
     val allMatches = List(100L, 90L, 80L, 50L, 40L)
 
-    // Median of voters (3 nodes): sorted = [80, 90, 100], median = 90
     val sortedVoters = voterMatches.sorted
     val voterMedian = sortedVoters(sortedVoters.size / 2)
     voterMedian shouldBe 90
 
-    // If we incorrectly included learners: sorted = [40, 50, 80, 90, 100], median = 80
     val sortedAll = allMatches.sorted
     val allMedian = sortedAll(sortedAll.size / 2)
-    allMedian shouldBe 80 // Wrong! This is why we must exclude learners
+    allMedian shouldBe 80
   }
 
-  // === LEARNER PROMOTION WORKFLOW ===
-
   "Full learner workflow" should "add learner, catch up, then promote" in {
-    // Step 1: Start with 3-node cluster
     val initial = ClusterConfig(Set(node1, node2, node3))
     initial.voters.size shouldBe 3
     initial.learners.size shouldBe 0
 
-    // Step 2: Add learner
     val withLearner = initial.addMember(learner1, NodeRole.Learner)
     withLearner.voters.size shouldBe 3
     withLearner.learners.size shouldBe 1
-    withLearner.majoritySize shouldBe 2 // Still 2 (learner doesn't affect quorum)
+    withLearner.majoritySize shouldBe 2
 
-    // Step 3: Learner catches up (tracked in Leader.matchIndex)
-    // ... replication happens ...
-
-    // Step 4: Promote to voter
     val promoted = withLearner.promoteLearner(learner1)
     promoted.voters.size shouldBe 4
     promoted.learners.size shouldBe 0
-    promoted.majoritySize shouldBe 3 // Now needs 3 for quorum
+    promoted.majoritySize shouldBe 3
   }

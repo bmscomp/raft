@@ -14,6 +14,16 @@ Your Raft application works perfectly in testing: three nodes on localhost, no c
 
 The Raft library guarantees correctness of the **consensus protocol**. But your **state machine** — the application logic — can introduce bugs that break the assumptions Raft depends on. Chaos testing systematically injects failures to find these bugs.
 
+```mermaid
+flowchart TD
+    L1["Layer 1: Algebraic & Codec Properties (ScalaCheck, ~100ms)"] --> L2["Layer 2: Seeded Sans-I/O DST (RawNode + MemStorage, ~1s)"]
+    L2 --> L3["Layer 3: Effectful Fiber Chaos (RaftNode + InMemTransport + Nemesis)"]
+    L3 --> L4["Layer 4: Full-Stack Crash Recovery (GrpcTransport + MmapWalEngine + WGL Checker)"]
+```
+
+> [!TIP]
+> Run **Layer 1 & Layer 2** (`DeterministicSimulationSpec`) on every edit for instant, 100% deterministic feedback on state serialization and snapshot restore logic, then run **Layer 3 & Layer 4** (`ChaosAgent` + `LinearizabilityChecker`) to catch thread-safety races, mutable reference leaks, and disk recovery bugs in your `IO` state machine!
+
 ## What Can Go Wrong in Your State Machine
 
 | Bug category | Example | Consequence |
