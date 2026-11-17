@@ -1,6 +1,7 @@
 package raft.spi
 
-import cats.effect.kernel.Resource
+import cats.effect.kernel.{Async, Resource}
+import cats.syntax.all.*
 import raft.state.Snapshot
 
 /** Service Provider Interface for snapshot persistence.
@@ -59,3 +60,13 @@ final case class SnapshotMetadata(
 /** Factory for creating [[SnapshotStore]] instances with resource lifecycle. */
 trait SnapshotStoreFactory[F[_]]:
   def create(path: String): Resource[F, SnapshotStore[F]]
+
+object SnapshotStoreFactory:
+  /** Create an in-memory [[SnapshotStoreFactory]] for testing and prototyping.
+    */
+  def inMemory[F[_]: Async]: SnapshotStoreFactory[F] =
+    new SnapshotStoreFactory[F]:
+      def create(path: String): Resource[F, SnapshotStore[F]] =
+        Resource.eval(
+          raft.impl.InMemSnapshotStore[F]().map(s => s: SnapshotStore[F])
+        )

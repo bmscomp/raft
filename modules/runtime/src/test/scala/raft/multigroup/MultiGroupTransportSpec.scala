@@ -105,3 +105,49 @@ class MultiGroupTransportSpec extends AnyFunSuite with Matchers:
     captured should have size 2
     captured(0).to shouldBe Some(NodeId("node2"))
     captured(1).to shouldBe None
+
+  test(
+    "dispatch before receive subscription should buffer messages without loss"
+  ):
+    val localId = NodeId("node1")
+    val groupA = GroupId("shard-eager")
+    val transport =
+      MultiGroupTransport[IO](localId, _ => IO.unit).unsafeRunSync()
+
+    // Dispatch BEFORE transportForGroup / receive fiber is even started!
+    transport
+      .dispatch(GroupEnvelope(groupA, NodeId("node2"), ElectionTimeout))
+      .unsafeRunSync()
+    transport
+      .dispatch(GroupEnvelope(groupA, NodeId("node3"), HeartbeatTimeout))
+      .unsafeRunSync()
+
+    val tpA = transport.transportForGroup(groupA)
+    val received = tpA.receive.take(2).compile.toList.unsafeRunSync()
+    received shouldBe List(
+      (NodeId("node2"), ElectionTimeout),
+      (NodeId("node3"), HeartbeatTimeout)
+    )
+
+  test("unregisterGroup should drop buffered mailbox and ignore late packets"):
+    val localId = NodeId("node1")
+    val groupGone = GroupId("shard-removed")
+    val transport =
+      MultiGroupTransport[IO](localId, _ => IO.unit).unsafeRunSync()
+
+    transport.registerGroup(groupGone).unsafeRunSync()
+    transport
+      .dispatch(GroupEnvelope(groupGone, NodeId("node2"), ElectionTimeout))
+      .unsafeRunSync()
+    transport.unregisterGroup(groupGone).unsafeRunSync()
+    transport
+      .dispatch(GroupEnvelope(groupGone, NodeId("node3"), HeartbeatTimeout))
+      .unsafeRunSync()
+
+    // Re-registering starts from a clean empty queue
+    val tpFresh = transport.registerGroup(groupGone).unsafeRunSync()
+    transport
+      .dispatch(GroupEnvelope(groupGone, NodeId("node4"), CheckQuorumTimeout))
+      .unsafeRunSync()
+    val received = tpFresh.receive.take(1).compile.toList.unsafeRunSync()
+    received shouldBe List((NodeId("node4"), CheckQuorumTimeout))

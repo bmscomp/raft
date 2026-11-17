@@ -35,3 +35,9 @@ class StorageBackedStableStore[F[_]: Monad](engine: StorageEngine[F])
     engine.readHardState.flatMap(s =>
       engine.writeHardState(s.copy(votedFor = nodeId))
     )
+
+  def hardState: F[HardState] =
+    engine.readHardState
+
+  def setHardState(term: Term, votedFor: Option[NodeId]): F[Unit] =
+    engine.writeHardState(HardState(term.value, votedFor))

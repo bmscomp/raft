@@ -137,5 +137,7 @@ object CompactionPolicy:
       case Some(p: CompactionPolicy[?]) => p.asInstanceOf[CompactionPolicy[F]]
       case _                            =>
         cfg.level match
-          case raft.state.CompactionLevel.Disabled => disabled[F]
+          case raft.state.CompactionLevel.Disabled |
+              raft.state.CompactionLevel.Custom =>
+            disabled[F]
           case lvl => threshold[F](lvl.defaultThreshold)

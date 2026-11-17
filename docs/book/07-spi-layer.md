@@ -237,7 +237,29 @@ trait StableStore[F[_]]:
   def setCurrentTerm(term: Term): F[Unit]
   def votedFor: F[Option[NodeId]]
   def setVotedFor(nodeId: Option[NodeId]): F[Unit]
+  def hardState: F[HardState]
+  def setHardState(term: Term, votedFor: Option[NodeId]): F[Unit]
 ```
+
+### Why Atomic `setHardState(term, votedFor)` Is Critical for Election Safety
+
+Suppose a node in term `4` (having previously voted for `node-A` in term `4`) receives a higher-term `RequestVote` or `AppendEntries` in term `5` and needs to persist `(term = 5, votedFor = None)`. If the runtime persists `setCurrentTerm(5)` and `setVotedFor(None)` as **two separate disk writes** (`fsync` #1 followed by `fsync` #2), an OS crash between the two flushes leaves `(term = 5, votedFor = Some(node-A))` — or conversely, if `votedFor` were written before `term`, `(term = 4, votedFor = Some(node-B))` — corrupting the cross-field invariant between `currentTerm` and `votedFor`:
+
+```mermaid
+sequenceDiagram
+    participant Node as "RaftNode[F]"
+    participant Broken as "Two-Write Store (Unsafe)"
+    participant Atomic as "Atomic setHardState (Safe)"
+
+    Note over Node,Broken: "Anti-pattern: split term & vote flushes"
+    Node->>Broken: "1. setCurrentTerm(5) + fsync"
+    Note right of Broken: "CRASH! Disk holds (term=5, votedFor=node-A)"
+    Note over Node,Atomic: "Correct pattern: single atomic record"
+    Node->>Atomic: "setHardState(5, None) — single CRC32 record + msync/fsync"
+    Note right of Atomic: "Crash at any instant recovers either (4, Some(A)) or (5, None)"
+```
+
+`RaftNode` always invokes `stableStore.setHardState(term, votedFor)` when executing `Effect.PersistHardState` and `stableStore.hardState` on startup, guaranteeing a single `msync` / `WriteBatch` boundary on `StorageBackedStableStore`.
 
 ### Why These Two Values Matter
 

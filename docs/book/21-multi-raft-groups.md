@@ -164,9 +164,9 @@ This library provides first-class multi-raft support through the `raft.multigrou
 |------|--------|
 | `GroupId` | Opaque type for type-safe group identifiers (zero runtime cost) |
 | `GroupEnvelope` | Wire-level wrapper tagging each `RaftMessage` with its target `GroupId` |
-| `GroupConfig[F]` | Per-group dependency bundle (log store, stable store, state machine, timers) |
+| `GroupConfig[F]` | Per-group dependency bundle (log store, stable store, state machine, timers, optional `SnapshotStore[F]`) |
 | `MultiRaftNode[F]` | Coordinator managing group lifecycle and command routing |
-| `MultiGroupTransport[F]` | FS2 Topic-based transport multiplexing across groups |
+| `MultiGroupTransport[F]` | `O(1)` per-group bounded `Queue` demultiplexer over shared wire connections |
 | `GroupAwareCodec` | Envelope-aware serialization wrapping `SimpleMessageCodec` |
 
 ### Creating Multiple Groups
@@ -203,17 +203,28 @@ for
 yield ()
 ```
 
-### Transport Multiplexing
+### Transport Multiplexing: `O(1)` Bounded Mailboxes vs. `O(G)` Broadcast
 
-The `MultiGroupTransport` uses an FS2 `Topic` for fan-out: incoming `GroupEnvelope` messages are published once and filtered by each per-group subscriber, so only messages for a given group reach its `RaftNode`.
+A naive multi-group router built on a pub-sub `Topic` suffers from two production hazards:
+1. **`O(G)` Fan-Out Amplification**: Publishing every inbound packet to all `G` group streams forces `G - 1` groups to wake up, inspect, and discard packets meant for other shards.
+2. **Startup Subscription Races**: Because `createGroup(shardId)` starts asynchronously across nodes, peer A may send its initial `RequestVote` or `AppendEntries` milliseconds before peer B's fiber subscribes to a lazy `Topic` stream — dropping startup RPCs and stalling initial election for a full timeout cycle.
 
-```scala
-// Per-group transport is created automatically
-val groupTransport: RaftTransport[IO] = transport.transportForGroup(GroupId("shard-0"))
-// group transport only sees messages tagged with GroupId("shard-0")
+`MultiGroupTransport` solves both problems by maintaining a lock-free `Ref[F, Map[GroupId, Queue[F, (NodeId, RaftMessage)]]]` of **per-group bounded mailboxes**:
+
+```mermaid
+flowchart LR
+    WIRE["Inbound GroupEnvelope (groupId, from, to, msg)"] --> DEMUX["MultiGroupTransport.dispatch — O(1) Map Lookup"]
+    DEMUX --> Q0["Bounded Queue: shard-0"]
+    DEMUX --> Q1["Bounded Queue: shard-1"]
+    DEMUX --> QN["Bounded Queue: shard-k"]
+    Q0 --> N0["RaftNode (shard-0)"]
+    Q1 --> N1["RaftNode (shard-1)"]
+    QN --> NN["RaftNode (shard-k)"]
 ```
 
-Because `RaftLogic.onMessage` is a pure function with no global state, there are no concurrency hazards between groups. Each group's state is isolated in its own `Ref[IO, NodeState]`.
+- **Zero Startup Drops**: Envelopes arriving for `shard-0` before `RaftNode.start` begins pulling from `receive` are buffered in `shard-0`'s bounded `Queue` and drained in arrival order as soon as the event loop starts.
+- **Non-Blocking Isolation (`tryOffer`)**: If one shard's state machine stalls and fills its bounded queue (`maxQueueSize = 1024`), `dispatch` drops excess packets for that single shard without blocking the shared TCP/gRPC reader serving healthy shards.
+- **Clean Lifecycle Reclamation**: `MultiRaftNode.removeGroup(groupId)` calls `transport.unregisterGroup(groupId)`, releasing the mailbox and ignoring any late in-flight packets for the retired group.
 
 > **Run the example:** `sbt "runMain examples.distributed.MultiGroupExample"` demonstrates a sharded key-value store partitioning keys across two independent Raft groups.
 

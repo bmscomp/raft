@@ -77,7 +77,7 @@ private final class MultiRaftNodeImpl[F[_]: Async](
               s"Creating raft group ${groupId.value} with ${config.cluster.voters.size} voters"
             )
             resolvedMetrics = config.metrics.getOrElse(RaftMetrics.noop[F])
-            groupTransport = transport.transportForGroup(groupId)
+            groupTransport <- transport.registerGroup(groupId)
             nodeResource = RaftNode[F](
               config.raftConfig,
               config.cluster,
@@ -87,6 +87,7 @@ private final class MultiRaftNodeImpl[F[_]: Async](
               config.stateMachine,
               config.timerService,
               Some(resolvedMetrics),
+              snapshotStoreOpt = config.snapshotStore,
               loggerOpt = Some(logger)
             )
             pair <- nodeResource.allocated
@@ -106,7 +107,7 @@ private final class MultiRaftNodeImpl[F[_]: Async](
       }
       _ <- maybeEntry match
         case Some((node, release)) =>
-          node.shutdown *> release *>
+          node.shutdown *> release *> transport.unregisterGroup(groupId) *>
             logger.info(s"Group ${groupId.value} removed and shut down")
         case None =>
           logger.warn(s"Group ${groupId.value} not found for removal")
