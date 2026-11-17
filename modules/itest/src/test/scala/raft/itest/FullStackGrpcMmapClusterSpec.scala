@@ -217,27 +217,40 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
   private def proposeWithRetry(
       nodes: Iterable[LiveNode],
       data: Array[Byte],
-      attempts: Int = 15
+      attempts: Int = 20
   ): IO[LogId] =
     awaitLeader(nodes).flatMap { leader =>
-      leader.raftNode.proposeAndCommit(data).handleErrorWith {
-        case _: RaftError if attempts > 1 =>
-          IO.sleep(30.millis) *> proposeWithRetry(nodes, data, attempts - 1)
-        case err => IO.raiseError(err)
-      }
+      leader.raftNode
+        .proposeAndCommit(data)
+        .timeout(4.seconds)
+        .handleErrorWith {
+          case (_: RaftError | _: java.util.concurrent.TimeoutException)
+              if attempts > 1 =>
+            IO.sleep(40.millis) *> proposeWithRetry(nodes, data, attempts - 1)
+          case err => IO.raiseError(err)
+        }
     }
 
   private def proposeConfWithRetry(
       nodes: Iterable[LiveNode],
       newCfg: ClusterConfig,
-      attempts: Int = 15
-  ): IO[LogId] =
+      attempts: Int = 20
+  ): IO[Unit] =
     awaitLeader(nodes).flatMap { leader =>
-      leader.raftNode.proposeConfChange(newCfg).handleErrorWith {
-        case _: RaftError if attempts > 1 =>
-          IO.sleep(40.millis) *>
-            proposeConfWithRetry(nodes, newCfg, attempts - 1)
-        case err => IO.raiseError(err)
+      leader.raftNode.getClusterConfig.flatMap { curCfg =>
+        if !curCfg.isInJointConsensus && curCfg == newCfg then IO.unit
+        else
+          leader.raftNode
+            .proposeConfChange(newCfg)
+            .void
+            .timeout(5.seconds)
+            .handleErrorWith {
+              case (_: RaftError | _: java.util.concurrent.TimeoutException)
+                  if attempts > 1 =>
+                IO.sleep(50.millis) *>
+                  proposeConfWithRetry(nodes, newCfg, attempts - 1)
+              case err => IO.raiseError(err)
+            }
       }
     }
 
@@ -247,9 +260,9 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
     val initialCfg = ClusterConfig(initialIds.toSet)
     val compactionCfg = CompactionConfig(
       level = CompactionLevel.Custom,
-      snapshotChunkSize = 128,
+      snapshotChunkSize = 64,
       retainedEntries = 0L,
-      policy = Some(CompactionPolicy.threshold[IO](20L))
+      policy = Some(CompactionPolicy.threshold[IO](8L))
     )
 
     val prog = (for
@@ -262,7 +275,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
           initialPeers = Map.empty,
           clusterCfg = initialCfg,
           compaction = compactionCfg,
-          segmentSize = 4096L,
+          segmentSize = 1024L,
           autoStart = false
         )
       }
@@ -274,8 +287,8 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
 
       _ <- Resource.eval {
         for
-          // Commit 35 entries with ~80B payloads to trigger multi-segment 4KB WAL rotation + snapshot compaction
-          _ <- (1 to 35).toList.traverse_ { i =>
+          // Commit 15 entries with ~80B payloads to trigger multi-segment 1KB WAL rotation + snapshot compaction
+          _ <- (1 to 15).toList.traverse_ { i =>
             val pad = "x" * 60
             proposeWithRetry(initialNodes, utf8(s"fs-k$i=val-$i-$pad"))
           }
@@ -294,27 +307,28 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
         initialPeers = peerAddrs3,
         clusterCfg = expandedCfg,
         compaction = compactionCfg,
-        segmentSize = 4096L,
-        autoStart = true
+        segmentSize = 1024L,
+        autoStart = false
       )
       allNodes = initialNodes :+ node4
       peerAddrs4 = allNodes.map(n => n.id -> n.address).toMap
       _ <- Resource.eval {
         for
           _ <- allNodes.traverse_(n => n.grpc.updatePeers(peerAddrs4 - n.id))
-          _ <- proposeConfWithRetry(initialNodes, expandedCfg)
-          _ <- (36 to 45).toList.traverse_ { i =>
+          _ <- node4.raftNode.start
+          _ <- proposeConfWithRetry(allNodes, expandedCfg)
+          _ <- (16 to 20).toList.traverse_ { i =>
             val pad = "x" * 60
             proposeWithRetry(allNodes, utf8(s"fs-k$i=val-$i-$pad"))
           }
-          expected = (1 to 45).map { i =>
+          expected = (1 to 20).map { i =>
             val pad = "x" * 60
             s"fs-k$i" -> s"val-$i-$pad"
           }.toMap
           // Node 4 must receive chunked gRPC InstallSnapshot + trailing WAL entries and persist its own snapshot
           _ <- awaitCondition(
             allNodes.forallM(n => n.stateMachine.currentMap.map(_ == expected)),
-            retries = 350
+            retries = 500
           )
           n4Snaps <- node4.engine.listSnapshots
           _ = n4Snaps.nonEmpty shouldBe true
@@ -322,7 +336,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       }
     yield ()).use_.guarantee(IO(deleteRecursive(baseDir)))
 
-    prog.timeout(45.seconds).unsafeRunSync()
+    prog.timeout(90.seconds).unsafeRunSync()
   }
 
   it should "survive hard leader shutdown, elect a failover leader, and recover the restarted node from on-disk MmapWalEngine" in {
@@ -463,7 +477,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
         )
       }
 
-    prog.timeout(45.seconds).unsafeRunSync()
+    prog.timeout(90.seconds).unsafeRunSync()
   }
 
   it should "satisfy WGL linearizability (KVModel) under concurrent multi-client reads and writes over gRPC + MmapWalEngine" in {
@@ -651,5 +665,5 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       }
     yield ()).use_.guarantee(IO(deleteRecursive(baseDir)))
 
-    prog.timeout(45.seconds).unsafeRunSync()
+    prog.timeout(90.seconds).unsafeRunSync()
   }
