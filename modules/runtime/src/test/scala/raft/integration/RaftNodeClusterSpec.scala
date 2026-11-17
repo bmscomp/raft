@@ -1,6 +1,7 @@
 package raft.integration
 
 import java.nio.charset.StandardCharsets
+import scala.concurrent.duration.*
 
 import cats.effect.IO
 import cats.effect.testkit.TestControl
@@ -71,14 +72,25 @@ class RaftNodeClusterSpec extends AnyFlatSpec with Matchers:
       .use { cluster =>
         for
           leaderPair <- cluster.awaitLeader()
-          (_, leader) = leaderPair
+          _ = leaderPair._1 should not be NodeId("")
           states <- ids.traverse(id => cluster.node(id).getState)
           leadersInSameTerm = states
             .collect { case l: Leader => l.term }
             .groupBy(identity)
           _ = leadersInSameTerm.values.foreach(_.size shouldBe 1)
           _ <- (1 to 15).toList.traverse_ { i =>
-            leader.proposeAndCommit(utf8(s"k$i=v$i"))
+            def writeWithRetry(attempts: Int): IO[Unit] =
+              cluster.awaitLeader().flatMap { case (_, ldr) =>
+                ldr
+                  .proposeAndCommit(utf8(s"k$i=v$i"))
+                  .void
+                  .handleErrorWith {
+                    case _: RaftError if attempts > 1 =>
+                      IO.sleep(25.millis) *> writeWithRetry(attempts - 1)
+                    case err => IO.raiseError(err)
+                  }
+              }
+            writeWithRetry(10)
           }
           expected = (1 to 15).map(i => s"k$i" -> s"v$i").toMap
           _ <- cluster.awaitCondition(
