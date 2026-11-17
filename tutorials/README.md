@@ -38,6 +38,7 @@
 | 12 | [Chaos Testing](12-chaos-testing.md) | Verifying correctness under adversarial conditions | Fault injection, invariant checking, common bug catalog |
 | 13 | [Monitoring & Observability](13-observability.md) | Running a Raft cluster in production | Metrics, dashboards, alert rules, debugging playbooks |
 | 14 | [Multi-Datacenter Deployment](14-multi-datacenter.md) | Disaster recovery across data centers | Witness nodes, latency-aware reads, DC failover |
+| 15 | [High-Throughput Batching & Pipelining](15-batching-and-pipelining.md) | Scaling write throughput across NVMe WAL and WAN links | Group-commit `BatchConfig`, `proposeBatchAndCommit`, `Inflights` pipelining |
 
 ## How These Differ from the Book
 
@@ -52,5 +53,5 @@ The [book's case studies](../docs/book/README.md#part-iv--case-studies) (chapter
 All tutorials reference code that runs with the library's in-memory infrastructure:
 
 ```bash
-sbt test    # 527 tests — verifies all library functionality the tutorials depend on
+sbt test    # 600+ tests — verifies all library functionality the tutorials depend on
 ```

@@ -1,402 +1,266 @@
 # Chapter 10: Performance vs. Safety — The Optimization Tradeoffs
 
-*The Raft paper was designed for correctness, not throughput. Every production Raft deployment adds optimizations that aren't in the original paper — and every optimization introduces a tension between performance and safety. This chapter maps each optimization to its theoretical justification, explains exactly what safety guarantees it preserves or weakens, and shows how to configure them in the library.*
+*The Raft paper was designed for clarity and correctness first, throughput second. Every production Raft deployment layers systems optimizations on top of the baseline algorithm — and every optimization requires a clear accounting of which invariants hold unconditionally and which depend on protocol state or physical clock bounds. This chapter maps every optimization in the library to its exact safety proof and configuration API.*
 
 ---
 
 ## The Fundamental Tension
 
-Raft's baseline protocol makes conservative choices at every step:
+Raft's baseline textbook protocol makes conservative choices at every step:
 
-- **Stop-and-wait replication**: the leader sends `AppendEntries` to one follower, waits for the response, then sends to the next.
-- **Per-entry fsync**: every log entry is fsynced to disk before acknowledging.
-- **Leader-only reads**: every read goes through the leader's log as a write operation.
-- **Sequential heartbeats**: heartbeats are sent one follower at a time.
+- **Per-entry `fsync` / `msync`**: every client proposal flushes its own WAL write before replication.
+- **Stop-and-wait replication**: the leader sends 1 `AppendEntriesRequest` per follower and waits a full network RTT before sending the next chunk.
+- **Sequential peer iteration**: replication iterates through followers one by one.
+- **Log-committed reads**: reads go through the Raft log as full quorum writes.
 
-These choices guarantee safety but produce dismal throughput — often under 1,000 writes/second on modern hardware. Production systems like etcd, CockroachDB, and TiKV achieve 10,000–100,000+ writes/second by relaxing these constraints. The art is knowing *which* constraints can be relaxed without breaking Raft's safety properties.
+Production engines (`etcd`, TiKV's `raft-rs`, CockroachDB) achieve orders-of-magnitude higher throughput by eliminating redundant disk syncs and network round-trips while keeping Raft's five core safety properties intact:
 
-```
-Performance ←──────────────── Spectrum ──────────────────→ Safety
+```mermaid
+flowchart LR
+    subgraph Strict["Zero-Assumption Consensus Safety"]
+        B["Group-Commit Batching (BatchConfig)"]
+        PR["Parallel Peer Dispatch (parallelReplicationEnabled)"]
+        PIPE["Sliding-Window Pipelining (Inflights + Monotonic matchIndex)"]
+        RI["Quorum ReadIndex (1-RTT Read Confirmation)"]
+        PV["Pre-Vote + CheckQuorum"]
+    end
 
-High throughput                                    Strict correctness
-Low latency                                        Crash recovery
-  ▲                                                      ▲
-  │                                                      │
-  Batching                                     Per-entry fsync
-  Pipelining                               Stop-and-wait replication
-  Lease reads                               ReadIndex with heartbeat
-  Parallel replication                       Sequential replication
+    subgraph ClockBounded["Bounded Physical Clock Assumption"]
+        LR["Zero-RTT LeaseRead (Requires maxClockDrift < Lease Margin)"]
+    end
+
+    Strict --> ClockBounded
 ```
 
 ---
 
-## Optimization 1: Batching — Amortizing fsync
+## Optimization 1: Group-Commit Batching — Amortizing WAL `msync`
 
 ### The Problem
 
-Every individual `fsync()` call costs 1–10ms on an SSD, 5–15ms on a spinning disk. If the leader fsyncs after every log entry, throughput is capped at roughly `1 / fsync_latency` — about 100–1,000 entries/second.
+A durable `msync` / `fsync` on NVMe or cloud block storage costs `0.2ms`–`5ms`. If every concurrent `proposeAndCommit` fiber acquires the consensus lock and calls `LogStore.append(Seq(entry))` individually, write throughput hits a hard ceiling of `1 / msync_latency` (`200`–`5,000` ops/sec) regardless of CPU cores or network bandwidth.
 
 ### The Optimization
 
-Instead of appending and fsyncing each entry individually, the leader **buffers** incoming commands and flushes them as a single batch:
+Enabling `BatchConfig` activates the group-commit accumulator inside `RaftNode[F]` (and `RawNode.proposeBatch` in Sans-I/O mode), coalescing concurrent proposals into a single contiguous `LogStore.append(entries)` slice (`1` `MmapSegment.forceRange` `msync` in `MmapWalEngine`) and a single replication broadcast:
 
 ```scala
 val config = RaftConfig(
   localId = nodeId,
   batching = BatchConfig(
     enabled = true,
-    maxSize = 100,      // flush after 100 entries
-    maxWait = 10.millis  // or after 10ms, whichever comes first
+    maxSize = 100,      // flush immediately once 100 proposals accumulate
+    maxWait = 5.millis  // or flush partial batches after at most 5ms
   )
 )
 ```
 
-When batching is enabled, the library produces `BatchAppend` effects instead of individual `AppendLogs`:
-
-```scala
-// Without batching: one effect per entry
-List(AppendLogs(Seq(entry1)), AppendLogs(Seq(entry2)), AppendLogs(Seq(entry3)))
-
-// With batching: one effect for the batch
-List(BatchAppend(Seq(entry1, entry2, entry3), batchId = "batch-42"))
-```
-
-The runtime's effect interpreter calls `fsync()` once for the entire batch — amortizing the cost across all entries.
+Callers can also submit explicit batches directly via `raftNode.proposeBatch(cmds)` / `raftNode.proposeBatchAndCommit(cmds)` or `rawNode.proposeBatch(cmds)`.
 
 ### Safety Analysis
 
 | Property | Preserved? | Why |
-|----------|-----------|-----|
-| Election Safety | ✅ Yes | Batching doesn't affect vote counting |
-| Leader Append-Only | ✅ Yes | Batch entries are still only appended |
-| Log Matching | ✅ Yes | Batch entries maintain `(index, term)` uniqueness |
-| Leader Completeness | ✅ Yes | Batched entries are replicated before commit |
-| State Machine Safety | ✅ Yes | Entries are committed only after majority replication |
+| :--- | :--- | :--- |
+| Election Safety | ✅ Yes | Batching does not alter term or vote rules |
+| Leader Append-Only | ✅ Yes | Entries are appended contiguously (`baseIdx + 1 .. baseIdx + K`) |
+| Log Matching | ✅ Yes | Contiguous `(index, term)` pairs preserve inductive prefix matching |
+| Leader Completeness | ✅ Yes | Entire batch is persisted before commit advancement |
+| State Machine Safety | ✅ Yes | Each entry commits and applies in strict log index order |
 
-**Batching is fully safe.** It changes *when* entries are fsynced, not *whether* they are fsynced. Every entry in the batch is durable before the leader considers it replicated. The only tradeoff is **latency** — entries may wait up to `maxWait` before being flushed, adding a small delay to individual writes.
+**Group-commit batching is unconditionally safe.** Every entry in the batch is durably flushed to disk before acknowledgment; only the *amortization factor* per `msync` changes.
 
 > [!TIP]
-> **Tuning guide**: Set `maxWait` based on your latency SLA. For interactive workloads (web requests), 5–10ms is reasonable. For data pipelines, 50–100ms with larger batch sizes maximizes throughput.
-
-### Throughput Impact
-
-```
-Without batching:
-  1 entry × 1 fsync = 1ms → 1,000 entries/second
-
-With batching (maxSize=100, maxWait=10ms):
-  100 entries × 1 fsync = 1ms → 100,000 entries/second
-
-  ~100× throughput improvement for sequential writes
-```
+> **Tuning `maxWait` and `maxSize`**: Set `maxWait = 0.millis` (`Duration.Zero`) if you want **zero artificial latency** while still automatically coalescing concurrent fibers that arrive while an earlier batch is flushing to disk. Set `maxWait = 2.millis`–`10.millis` when client arrivals are bursty and maximizing IOPS efficiency is paramount.
 
 ---
 
-## Optimization 2: Pipelining — Overlapping Round-Trips
+## Optimization 2: Sliding-Window Pipelining (`PipelineConfig` & `Inflights`)
 
 ### The Problem
 
-Standard Raft replication is **stop-and-wait**: the leader sends `AppendEntries` to a follower, then waits for the `AppendEntriesResponse` before sending the next batch. If the network RTT is 2ms, each follower can process at most 500 rounds per second — regardless of the entries per round.
+Under stop-and-wait replication (`PipelineConfig(enabled = false)`), at most 1 `AppendEntriesRequest` chunk is in flight per follower at a time. Over a `10ms` cross-AZ or `50ms` cross-region link, each follower completes at most `20`–`100` batches per second even when the network pipe is nearly idle.
 
 ### The Optimization
 
-Pipelining allows the leader to send multiple `AppendEntries` requests to a follower **without waiting** for previous responses, similar to TCP windowing:
+Enabling `PipelineConfig` configures per-follower `Inflights(maxInflight)` sliding windows in `RawNode` and `RaftNode[F]`:
 
 ```scala
 val config = RaftConfig(
   localId = nodeId,
+  maxEntriesPerRequest = 100,
   pipelining = PipelineConfig(
     enabled = true,
-    maxInflight = 10  // up to 10 unacknowledged requests per follower
+    maxInflight = 10 // up to 10 unacknowledged AppendEntries chunks per follower
   )
 )
 ```
 
-The library produces `PipelinedSend` and `TrackInflight` effects:
-
-```scala
-// Pipelined replication: send next batch immediately
-List(
-  PipelinedSend(NodeId("follower1"), appendReq1, sequenceNum = 1),
-  TrackInflight(NodeId("follower1"), sequenceNum = 1, lastIndex = 50),
-  PipelinedSend(NodeId("follower1"), appendReq2, sequenceNum = 2),
-  TrackInflight(NodeId("follower1"), sequenceNum = 2, lastIndex = 100)
-)
-```
-
-### Safety Analysis
-
-| Property | Preserved? | Why |
-|----------|-----------|-----|
-| Election Safety | ✅ Yes | Unaffected by replication strategy |
-| Leader Append-Only | ✅ Yes | Leader never modifies its own log |
-| Log Matching | ⚠️ Requires care | Out-of-order responses need correct `nextIndex` tracking |
-| Leader Completeness | ✅ Yes | Election restriction still applies |
-| State Machine Safety | ✅ Yes | Commit rule unchanged |
-
-**Pipelining is safe if the runtime handles out-of-order responses correctly.** The `sequenceNum` field orders pipelined requests so the runtime can process responses in the correct order and handle failures (decrementing `nextIndex` for the right request). The key invariant:
-
-> *A follower's `matchIndex` must only advance monotonically, even if responses arrive out of order.*
-
-### Throughput Impact
-
-```
-Without pipelining (RTT = 2ms):
-  1 round / 2ms = 500 rounds/second per follower
-
-With pipelining (maxInflight = 10, RTT = 2ms):
-  10 rounds × 100 entries / 2ms = 500,000 entries/second per follower
-
-  ~1000× throughput improvement for high-RTT networks
-```
+Once a follower transitions from `ProgressState.Probe` to `ProgressState.Replicate`, the leader dispatches up to `maxInflight` consecutive `AppendEntriesRequest` slices back-to-back via `RaftTransport.sendBatch`, optimistically advancing the follower's pipeline cursor (`Progress.optimisticUpdate`) and freeing slots via `inflights.freeTo(matchIndex)` as ACKs return:
 
 ```mermaid
 sequenceDiagram
-    participant L as Leader
+    participant L as Leader (ProgressState.Replicate)
     participant F as Follower
 
     rect rgb(255, 235, 235)
-        Note over L,F: Without Pipelining (stop-and-wait)
-        L->>F: AppendEntries [1-10]
-        F-->>L: Success (match=10)
-        L->>F: AppendEntries [11-20]
-        F-->>L: Success (match=20)
-        L->>F: AppendEntries [21-30]
-        F-->>L: Success (match=30)
+        Note over L,F: Stop-and-Wait (pipelining.enabled = false, Inflights = 1)
+        L->>F: AppendEntries [2..11]
+        F-->>L: AppendEntriesResponse (matchIndex = 11)
+        L->>F: AppendEntries [12..21]
+        F-->>L: AppendEntriesResponse (matchIndex = 21)
     end
 
     rect rgb(235, 255, 235)
-        Note over L,F: With Pipelining (maxInflight=3)
-        L->>F: AppendEntries [1-10] seq=1
-        L->>F: AppendEntries [11-20] seq=2
-        L->>F: AppendEntries [21-30] seq=3
-        F-->>L: Success (match=10) seq=1
-        F-->>L: Success (match=20) seq=2
-        L->>F: AppendEntries [31-40] seq=4
-        F-->>L: Success (match=30) seq=3
+        Note over L,F: Pipelined Window (pipelining.enabled = true, maxInflight = 3)
+        L->>F: AppendEntries [2..11] (inflights = [11])
+        L->>F: AppendEntries [12..21] (inflights = [11, 21])
+        L->>F: AppendEntries [22..31] (inflights = [11, 21, 31] - FULL)
+        F-->>L: AppendEntriesResponse (matchIndex = 11 -> freeTo(11))
+        L->>F: AppendEntries [32..41] (inflights = [21, 31, 41])
+        F-->>L: AppendEntriesResponse (matchIndex = 21 -> freeTo(21))
+        F-->>L: AppendEntriesResponse (matchIndex = 31 -> freeTo(31))
     end
-```
-
----
-
-## Optimization 3: Parallel Replication — Concurrent Follower Sends
-
-### The Problem
-
-By default, the leader sends `AppendEntries` to followers **sequentially**. In a 5-node cluster, if each send takes 2ms, it takes 8ms to replicate to all four followers — even though the sends are independent.
-
-### The Optimization
-
-Parallel replication sends to all followers concurrently:
-
-```scala
-val config = RaftConfig(
-  localId = nodeId,
-  parallelReplicationEnabled = true
-)
-```
-
-The library produces `ParallelReplicate` effects instead of individual `SendMessage` effects:
-
-```scala
-// Sequential: 4 individual sends
-List(
-  SendMessage(NodeId("f1"), appendReq),
-  SendMessage(NodeId("f2"), appendReq),
-  SendMessage(NodeId("f3"), appendReq),
-  SendMessage(NodeId("f4"), appendReq)
-)
-
-// Parallel: single concurrent send to all
-List(ParallelReplicate(Set(NodeId("f1"), NodeId("f2"), NodeId("f3"), NodeId("f4")), appendReq))
 ```
 
 ### Safety Analysis
 
 | Property | Preserved? | Why |
-|----------|-----------|-----|
-| All five properties | ✅ Yes | Message delivery order between leader and individual followers is maintained; only concurrent dispatch across followers changes |
-
-**Parallel replication is unconditionally safe.** Raft's safety properties depend on the relationship between the leader and each *individual* follower, not on the order in which different followers receive messages. The runtime must still process each follower's response correctly (updating `matchIndex` and `nextIndex`), but sending to them concurrently introduces no new hazards.
-
-### Throughput Impact
-
-```
-5-node cluster, 2ms per send:
-
-Sequential: 4 × 2ms = 8ms → first majority at 4ms (best case)
-Parallel:   max(2ms, 2ms, 2ms, 2ms) = 2ms → first majority at 2ms
-
-  ~2× latency improvement for quorum writes
-```
-
-The improvement scales with cluster size and network RTT. For WAN deployments with 50ms RTT, the difference is dramatic.
+| :--- | :--- | :--- |
+| Election Safety | ✅ Yes | Unaffected by replication windowing |
+| Leader Append-Only | ✅ Yes | Leader log remains strictly append-only |
+| Log Matching | ✅ Yes | Every pipelined chunk carries its exact `(prevLogIndex, prevLogTerm)` |
+| Out-of-Order / Dropped Packets | ✅ Handled | Monotonic `maybeUpdate` ignores stale ACKs (`< matched`); rejections & stalled heartbeats reset `Inflights` -> `Probe` |
+| ReadIndex Isolation | ✅ Preserved | `RaftNode` keeps conservative `Leader.nextIndex` (`matched + 1`) separate from optimistic pipeline cursors so `ReadIndex` heartbeats never reference unacknowledged optimistic indices |
 
 ---
 
-## Optimization 4: ReadIndex — Linearizable Reads Without Log Writes
+## Optimization 3: Parallel Peer Dispatch (`parallelReplicationEnabled`)
 
 ### The Problem
 
-The simplest way to guarantee linearizable reads is to run every read through the log as if it were a write. This guarantees ordering but means reads are as slow as writes — requiring disk persistence and majority replication.
+Dispatching `AppendEntriesRequest` sequentially to followers means a slow or congested TCP channel to one follower delays packet transmission to healthy followers.
 
 ### The Optimization
 
-The ReadIndex protocol (Raft paper §8) allows linearizable reads without writing to the log:
-
-```
-1. Client sends read(key) to leader
-2. Leader records its current commitIndex as "readIndex"
-3. Leader sends heartbeats to confirm it's still the leader
-4. Majority of followers respond to heartbeats
-5. Leader waits until its state machine has applied entries through readIndex
-6. Leader serves the read from its local state machine
-```
-
-The library's effects for ReadIndex:
-
-```scala
-// Step 2-3: Leader initiates read confirmation
-Effect.ConfirmLeadership(requestId = "read-42", pendingReadIndex = 150)
-
-// Step 4: After majority confirms
-Effect.ReadIndexReady(requestId = "read-42", readIndex = 150)
-
-// If not the leader:
-Effect.ReadIndexRejected(requestId = "read-42", leaderHint = Some(NodeId("node-3")))
-```
-
-### Safety Analysis
-
-| Property | Impact |
-|----------|--------|
-| Linearizability | ✅ Preserved — the heartbeat round confirms leadership |
-| Read freshness | ✅ Guaranteed — reads see all committed writes before `readIndex` |
-| Availability | ⚠️ Reads require a majority heartbeat round (one RTT) |
-
-**ReadIndex is safe but requires one network round-trip per read.** The heartbeat round prevents a deposed leader from serving stale reads (the stale read problem from Chapter 3). This is a significant improvement over log-based reads (no disk I/O, no replication) but still requires network communication.
-
----
-
-## Optimization 5: Lease-Based Reads — Trading Clock Assumptions for Speed
-
-### The Problem
-
-ReadIndex requires one network RTT per read. For read-heavy workloads, this overhead dominates.
-
-### The Optimization
-
-Leader lease allows the leader to serve reads **immediately** from local state, without a heartbeat confirmation, as long as its lease hasn't expired:
+With `parallelReplicationEnabled = true` (the default), `RaftNode[F]` groups outbound sends by target `NodeId` and dispatches **across distinct peers in parallel** (`parTraverse_`) while keeping **sends to each individual peer strictly sequential** (`traverse_` / `sendBatch`):
 
 ```scala
 val config = RaftConfig(
   localId = nodeId,
-  leaderLeaseDuration = 100.millis  // lease valid for 100ms after heartbeat quorum
+  parallelReplicationEnabled = true // default
 )
 ```
 
-The protocol:
+### Safety Analysis
 
-```
-1. Leader sends heartbeats to followers
-2. At time T, a majority of followers respond
-3. Leader sets lease_expiry = T + leaderLeaseDuration - maxClockDrift
-4. While now() < lease_expiry: serve reads locally (zero RTT)
-5. When lease expires: fall back to ReadIndex
-```
+| Property | Preserved? | Why |
+| :--- | :--- | :--- |
+| All 5 Raft Safety Properties | ✅ Yes | Consensus depends on per-peer log prefixes and quorum intersections, never on cross-peer arrival order; strict per-peer FIFO prevents artificial `prevLogIndex` inversions |
 
-The library produces `ExtendLease` and `LeaseReadReady` effects:
+---
+
+## Optimization 4: `ReadIndex` — Linearizable Reads Without Log Writes (§6.4)
+
+### The Problem
+
+Routing every read through `proposeAndCommit` incurs WAL `msync` and log growth for read-only queries.
+
+### The Optimization
+
+`RaftNode.readIndex` (and `RawNode.readIndex`) implements Ongaro §6.4:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F2 as Follower n2
+    participant F3 as Follower n3
+
+    C->>L: node.readIndex
+    Note over L: Verify current-term entry committed (§5.4.2) & record readIndex = commitIndex
+    par Quorum Heartbeat Round
+        L->>F2: AppendEntries(entries = empty)
+        L->>F3: AppendEntries(entries = empty)
+    end
+    F2-->>L: AppendEntriesResponse(success = true)
+    Note over L: Quorum {L, n2} confirmed! Wait until lastApplied >= readIndex
+    L-->>C: Right(readIndex) -> read local StateMachine
+```
 
 ```scala
-// After heartbeat quorum
-Effect.ExtendLease(until = System.currentTimeMillis() + 100)
-
-// While lease is active, reads are served immediately
-Effect.LeaseReadReady(requestId = "read-42")
+for
+  idx   <- leaderNode.readIndex
+  value <- kvStateMachine.get("account:42")
+yield (idx, value)
 ```
 
 ### Safety Analysis
 
 | Property | Impact |
-|----------|--------|
-| Linearizability | ⚠️ **Depends on clock accuracy** |
-| Read freshness | ⚠️ **May serve slightly stale data if clocks drift** |
-| Availability | ✅ Excellent — zero-RTT reads |
+| :--- | :--- |
+| Linearizability | ✅ **Strictly preserved** — heartbeat quorum proves no higher-term leader committed newer writes before `readIndex`, and Ongaro §5.4.2 check prevents stale reads right after election |
+| Cost | 1 network RTT (zero disk `msync`, zero log growth) |
+
+---
+
+## Optimization 5: Lease-Based Reads (`leaseRead`) — Trading Clock Drift Bounds for Zero-RTT Reads
+
+### The Problem
+
+Even 1 network RTT per read can bottleneck geo-distributed or read-heavy workloads.
+
+### The Optimization
+
+When `leaseReadEnabled = true` and `checkQuorumEnabled = true`, the leader extends a monotonic lease (`Clock[F].monotonic + leaderLeaseDuration`, or logical ticks in `RawNode`) whenever a voting quorum acknowledges `AppendEntriesResponse`:
+
+```scala
+val config = RaftConfig(
+  localId = nodeId,
+  checkQuorumEnabled = true,
+  leaseReadEnabled = true,
+  leaderLeaseDuration = 100.millis // must stay strictly below electionTimeoutMin - maxClockDrift
+)
+
+// Serve in 0 RTTs when lease is valid; gracefully fall back to 1-RTT readIndex on None!
+val linearizableRead: IO[Option[String]] =
+  leaderNode.leaseRead.flatMap {
+    case Some(_) => kvStateMachine.get("account:42")
+    case None    => leaderNode.readIndex *> kvStateMachine.get("account:42")
+  }
+```
+
+### Safety Analysis
 
 > [!WARNING]
-> **Lease-based reads are the only optimization in this chapter that can break linearizability.** If the leader's clock runs fast relative to followers' clocks, it may believe its lease is still valid after a new leader has been elected. During this window, the old leader serves stale reads while the new leader accepts writes.
+> **Lease-based reads are the ONLY optimization in this chapter that depends on bounded physical clock drift.** If the old leader's monotonic clock runs slower than followers' monotonic clocks by more than `electionTimeoutMin - leaderLeaseDuration`, a partitioned old leader could believe its lease is still active briefly after followers elect a new leader.
 
-The safety depends on a bounded clock drift assumption:
-
-```
-Safe if: maxClockDrift < leaderLeaseDuration - electionTimeoutMin
-
-Example: leaderLeaseDuration = 100ms, maxClockDrift = 10ms
-→ Lease is safe as long as clocks don't drift more than 10ms
-→ On modern NTP-synchronized servers, typical drift is < 1ms ✓
-```
-
-### When to Use Lease Reads
-
-| Scenario | Recommendation |
-|----------|---------------|
-| Cloud environment with NTP | ✅ Safe — typical drift < 1ms |
-| Bare metal with PTP (µs precision) | ✅ Very safe — drift negligible |
-| Cross-datacenter without clock sync | ❌ Avoid — drift can be seconds |
-| Financial systems requiring strict linearizability | ❌ Use ReadIndex instead |
-| Analytics / dashboards tolerating ms-level staleness | ✅ Lease reads ideal |
+Keep `leaderLeaseDuration` well below `electionTimeoutMin` (e.g., `100ms` lease with `300ms` `electionTimeoutMin`) and use `readIndex` whenever strict clock-free linearizability is required.
 
 ---
 
-## Optimization 6: Pre-Vote — Preventing Disruption Without Weakening Liveness
-
-### The Problem
-
-When a node is partitioned from the cluster, it repeatedly starts elections, incrementing its term each time. When it rejoins, its inflated term forces all other nodes to step down, triggering an unnecessary leadership change.
-
-### The Optimization
-
-Pre-Vote (Raft thesis §9.6) adds a preliminary phase before the real election:
+## Optimization 6: Pre-Vote & CheckQuorum — Preventing Partition Disruption (§9.6 & §6.2)
 
 ```scala
 val config = RaftConfig(
   localId = nodeId,
-  preVoteEnabled = true  // enabled by default
+  preVoteEnabled = true,     // enabled by default (§9.6)
+  checkQuorumEnabled = true  // enabled by default (§6.2)
 )
 ```
 
-Before incrementing its term and starting a real election, a node first asks a majority: "Would you vote for me?" If it can't get pre-votes from a majority, it doesn't start the real election — and its term never inflates.
-
-### Safety Analysis
-
-| Property | Impact |
-|----------|--------|
-| Election Safety | ✅ Preserved — real elections still use normal vote rules |
-| Liveness | ⚠️ Slightly weaker — a node needs two rounds to become leader |
-| Disruption resistance | ✅ Major improvement — partitioned nodes can't inflate terms |
-
-**Pre-Vote is safe and recommended for all deployments.** The only cost is one additional round-trip before elections, which is negligible compared to the election timeout. It's enabled by default in the library.
+- **Pre-Vote (`preVoteEnabled`)**: Partitioned followers ask voters `"Would you vote for me in term T+1?"` (`isPreVote = true`) *before* incrementing `currentTerm` or persisting `HardState`. Rejoining nodes never disrupt a healthy leader with inflated terms.
+- **CheckQuorum (`checkQuorumEnabled`)**: Every `electionTimeoutMax` window, a leader verifies a voting quorum responded recently (`quorumRecentlyActive`); if isolated in a minority partition, it steps down to `Follower` automatically and fails pending leader waiters with `RaftError.NotLeader`.
 
 ---
 
 ## Optimization 7: Binary Protobuf Wire Framing, Channel Hygiene & Bounded Backpressure
 
-### The Problem
-
-A consensus engine's network adapter (`raft-transport-grpc`) faces three recurring systems bottlenecks:
-
-1. **Text + Base64 serialization amplification**: Encoding binary `Log.data` and `InstallSnapshotRequest.data` chunks inside JSON (`JsonCodec`) inflates wire payloads by ~33% (Base64) plus field-name overhead and UTF-8 parsing CPU on every RPC.
-2. **Unbounded inbound queues under packet storms**: If a partitioned follower reconnects or a burst of `AppendEntries` frames arrives faster than local WAL `msync` can drain them, an unbounded inbound queue (`Queue.unbounded`) buffers arbitrary byte arrays in heap until the JVM crashes with `OutOfMemoryError`.
-3. **Socket leaks across Joint Consensus rotations**: When nodes are removed via `ClusterConfig` membership changes and `updatePeers` updates the routing map, leaving old Netty `ManagedChannel`s open leaks file descriptors and keep-alive background threads.
-
-### The Architecture (`ProtobufMessageCodec` + `GrpcTransport`)
-
-`raft-transport-grpc` pairs `WireEnvelope` over Netty HTTP/2 with `ProtobufMessageCodec` (`RaftWirePayload` `oneof` message covering all 17 `RaftMessage` cases, including §5.3 `conflict_index` / `conflict_term` hints and §3.10 `is_transfer` flags):
+`raft-transport-grpc` pairs `WireEnvelope` over Netty HTTP/2 with `ProtobufMessageCodec` (`RaftWirePayload` `oneof` covering all 17 `RaftMessage` cases, including §5.3 `conflict_index` / `conflict_term` hints and §3.10 `is_transfer` flags):
 
 ```mermaid
 flowchart LR
     subgraph Sender["Leader / Sender Node"]
-        RM["RaftMessage (Log / Snapshot bytes)"]
+        RM["RaftMessage / sendBatch"]
         PBC["ProtobufMessageCodec (Zero Base64)"]
         RETRY["Bounded Retry (UNAVAILABLE Backoff)"]
         CH["Netty ManagedChannel Pool (Evicts Removed Peers)"]
@@ -411,106 +275,76 @@ flowchart LR
 
     RM --> PBC --> RETRY --> CH
     CH -->|"WireEnvelope (HTTP/2)"| SRV
-    SRV -->|"Backpressure on saturation"| BQ --> DEC --> LOOP
+    SRV -->|"Non-blocking tryOffer"| BQ --> DEC --> LOOP
 ```
-
-### Safety & Resource Guarantees
-
-| Mechanism | Throughput / Resource Impact | Consensus Safety Impact |
-| :--- | :--- | :--- |
-| **`ProtobufMessageCodec`** | Zero Base64 expansion; raw `ByteString` copy for WAL entries and snapshot chunks | ✅ Lossless round-trip across all 17 `RaftMessage` variants |
-| **Bounded Queue (`maxInboundQueueSize`)** | Bounds heap memory; applies TCP/HTTP2 window backpressure when full | ✅ Preserves safety (delayed messages are indistinguishable from slow links in asynchronous Raft) |
-| **Channel Eviction in `updatePeers`** | Immediately shuts down `ManagedChannel`s for removed peer addresses | ✅ Prevents socket exhaustion during repeated membership changes |
-| **Bounded Transient Retry (`maxRetries`)** | Absorbs brief `UNAVAILABLE` / `DEADLINE_EXCEEDED` blips during peer boot | ✅ Bounded by `maxRetryBackoff`; falls back cleanly to Raft heartbeat retransmission |
 
 ---
 
 ## Putting It All Together: Configuration Profiles
 
-Here are three configuration profiles for different deployment scenarios:
-
-### Conservative (Development / Testing)
+### Conservative (Local Testing / Minimal Determinism)
 
 ```scala
 val conservative = RaftConfig(
   localId = nodeId,
   preVoteEnabled = true,
   leaderStickinessEnabled = true,
+  checkQuorumEnabled = true,
   batching = BatchConfig(enabled = false),
   pipelining = PipelineConfig(enabled = false),
   parallelReplicationEnabled = false,
-  leaderLeaseDuration = 0.millis  // disabled — use ReadIndex
+  leaseReadEnabled = false
 )
-// Safety: maximum. Performance: baseline.
 ```
 
-### Balanced (Production — Most Workloads)
+### Balanced Production (Recommended Default for Strict Linearizability)
 
 ```scala
 val balanced = RaftConfig(
   localId = nodeId,
   preVoteEnabled = true,
   leaderStickinessEnabled = true,
-  batching = BatchConfig(enabled = true, maxSize = 100, maxWait = 5.millis),
-  pipelining = PipelineConfig(enabled = true, maxInflight = 5),
+  checkQuorumEnabled = true,
+  maxEntriesPerRequest = 128,
+  batching = BatchConfig(enabled = true, maxSize = 64, maxWait = 5.millis),
+  pipelining = PipelineConfig(enabled = true, maxInflight = 6),
   parallelReplicationEnabled = true,
-  leaderLeaseDuration = 0.millis  // ReadIndex for reads
+  leaseReadEnabled = false // Use 1-RTT readIndex for clock-free linearizability
 )
-// Safety: full linearizability. Performance: high throughput writes, one-RTT reads.
 ```
 
-### Aggressive (High-Throughput — Read-Heavy)
+### High-Throughput WAN / Read-Heavy (NTP/PTP Synchronized Hosts)
 
 ```scala
-val aggressive = RaftConfig(
+val highThroughput = RaftConfig(
   localId = nodeId,
-  preVoteEnabled = true,
-  leaderStickinessEnabled = true,
-  batching = BatchConfig(enabled = true, maxSize = 500, maxWait = 20.millis),
-  pipelining = PipelineConfig(enabled = true, maxInflight = 20),
+  electionTimeoutMin = 300.millis,
+  electionTimeoutMax = 600.millis,
+  heartbeatInterval = 50.millis,
+  maxEntriesPerRequest = 256,
+  batching = BatchConfig(enabled = true, maxSize = 256, maxWait = 10.millis),
+  pipelining = PipelineConfig(enabled = true, maxInflight = 16),
   parallelReplicationEnabled = true,
-  leaderLeaseDuration = 100.millis  // lease reads for speed
+  checkQuorumEnabled = true,
+  leaseReadEnabled = true,
+  leaderLeaseDuration = 100.millis
 )
-// Safety: linearizability depends on clock sync.
-// Performance: maximum throughput, zero-RTT reads.
 ```
 
 ---
 
 ## Summary: The Safety Spectrum
 
-| Optimization | Throughput Gain | Safety Impact | Default |
-|-------------|----------------|---------------|---------|
-| **Batching** | ~100× | ✅ None — fully safe | Off |
-| **Pipelining** | ~1000× (high RTT) | ⚠️ Requires correct `sequenceNum` handling in runtime | Off |
-| **Parallel Replication** | ~2× latency | ✅ None — fully safe | On |
-| **ReadIndex** | ~10× (reads) | ✅ None — one-RTT confirmation | N/A |
-| **Lease Reads** | ~100× (reads) | ⚠️ Depends on bounded clock drift | 100ms |
-| **Pre-Vote** | N/A | ✅ Prevents disruption, minor liveness cost | On |
-| **Binary Protobuf + Bounded Queue** | ~33% smaller wire frames + bounded heap | ✅ None — pure transport & backpressure | `ProtobufMessageCodec` + `4096` |
-
-> [!IMPORTANT]
-> The most dangerous column in this table is "Safety Impact." Only two optimizations introduce risk: **pipelining** (manageable with correct `Inflights` tracking) and **lease reads** (requires bounded clock drift). Everything else is a pure win.
-
-```mermaid
-flowchart TD
-    subgraph SafeWins["Zero Consensus Risk (Enable First)"]
-        B["Batching (Amortize msync)"]
-        PR["Parallel Replication (Concurrent Peer Sends)"]
-        PB["ProtobufMessageCodec + Bounded Queue"]
-        PV["Pre-Vote + CheckQuorum"]
-        RI["ReadIndex (1-RTT Quorum Read)"]
-    end
-
-    subgraph Careful["Protocol State / Clock Assumptions"]
-        PIPE["Pipelining (Requires Monotonic matchIndex & Inflights)"]
-        LR["Lease Reads (Requires maxClockDrift < Lease Margin)"]
-    end
-
-    SafeWins --> PIPE
-    PIPE --> LR
-```
+| Optimization | Bottleneck Solved | Safety Impact | Default |
+| :--- | :--- | :--- | :--- |
+| **Group-Commit Batching (`BatchConfig`)** | WAL `msync` & RPC framing | ✅ None — unconditionally safe | Off |
+| **Pipelining (`PipelineConfig` / `Inflights`)** | Multi-RTT WAN latency | ✅ Safe via monotonic `maybeUpdate` & `Probe` fallback | Off |
+| **Parallel Dispatch (`parallelReplicationEnabled`)** | Slow-peer head-of-line delay | ✅ Safe (concurrent across peers, FIFO per peer) | On |
+| **`ReadIndex`** | Log writes on reads | ✅ None — 1-RTT quorum confirmation | Always available |
+| **`LeaseRead` (`leaseReadEnabled`)** | 1-RTT read latency | ⚠️ Requires bounded clock drift (`< electionTimeoutMin - lease`) | Off |
+| **Pre-Vote + CheckQuorum** | Partition term inflation & stale leaders | ✅ Strengthens cluster availability | On |
+| **`ProtobufMessageCodec` + Bounded Queue** | Wire bloat & heap exhaustion | ✅ Pure transport & backpressure | Default in `GrpcTransport` |
 
 ---
 
-*Next: [Chapter 11 — Failure Modes: A Practitioner's Field Guide](11-failure-modes.md) catalogs the most common Raft failure scenarios — leader crashes, network partitions, split votes, term inflation, torn storage writes, and more — with concrete diagnostic steps and prevention mechanisms.*
+*Next: [Chapter 11 — Failure Modes: A Practitioner's Field Guide](11-failure-modes.md) catalogs common Raft failure scenarios — leader crashes, asymmetric partitions, split votes, term inflation, and torn WAL frames — with concrete diagnostic steps and recovery guarantees.*
