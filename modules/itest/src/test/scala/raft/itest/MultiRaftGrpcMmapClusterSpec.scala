@@ -133,19 +133,53 @@ class MultiRaftGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       coord <- MultiRaftNode.resource[IO](id, mg)
     yield PhysicalHost(id, addr, rawGrpc, mg, coord)
 
-  private def awaitCondition(
-      cond: IO[Boolean],
+  private def readIndexShardWithRetry(
+      hosts: Map[NodeId, PhysicalHost],
+      gid: GroupId,
+      attempts: Int = 20
+  ): IO[Long] =
+    awaitShardLeader(hosts, gid).flatMap { leaderHost =>
+      leaderHost.coordinator
+        .readIndexFromGroup(gid)
+        .timeout(4.seconds)
+        .handleErrorWith {
+          case (_: RaftError | _: java.util.concurrent.TimeoutException)
+              if attempts > 1 =>
+            IO.sleep(35.millis) *>
+              readIndexShardWithRetry(hosts, gid, attempts - 1)
+          case err => IO.raiseError(err)
+        }
+    }
+
+  private def awaitRebalanced(
+      hostList: List[PhysicalHost],
+      hosts: Map[NodeId, PhysicalHost],
+      preferred: Map[GroupId, NodeId],
       retries: Int = 450
   ): IO[Unit] =
-    cond.flatMap {
-      case true  => IO.unit
-      case false =>
-        if retries <= 0 then
-          IO.raiseError(
-            new RuntimeException("Multi-Raft gRPC cluster condition timed out")
-          )
-        else IO.sleep(20.millis) *> awaitCondition(cond, retries - 1)
-    }
+    val trigger =
+      if retries % 15 == 0 then
+        hostList.traverse_(h => h.coordinator.rebalanceLeadership(preferred))
+      else IO.unit
+    trigger *>
+      preferred.toList
+        .forallM { case (gid, target) =>
+          hosts(target).coordinator.getGroupState(gid).map {
+            case Some(_: Leader) => true
+            case _               => false
+          }
+        }
+        .flatMap {
+          case true  => IO.unit
+          case false =>
+            if retries <= 0 then
+              IO.raiseError(
+                new RuntimeException("Multi-Raft gRPC rebalance timed out")
+              )
+            else
+              IO.sleep(25.millis) *>
+                awaitRebalanced(hostList, hosts, preferred, retries - 1)
+        }
 
   private def awaitShardLeader(
       hosts: Map[NodeId, PhysicalHost],
@@ -190,6 +224,20 @@ class MultiRaftGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
         }
     }
 
+  private def awaitCondition(
+      cond: IO[Boolean],
+      retries: Int = 450
+  ): IO[Unit] =
+    cond.flatMap {
+      case true  => IO.unit
+      case false =>
+        if retries <= 0 then
+          IO.raiseError(
+            new RuntimeException("Multi-Raft gRPC cluster condition timed out")
+          )
+        else IO.sleep(20.millis) *> awaitCondition(cond, retries - 1)
+    }
+
   "Full-stack Multi-Raft (3 gRPC hosts x 6 MmapWalEngine shards)" should "multiplex all shards over 1 TCP port per host, coalesce heartbeats, rebalance shard leaders, and commit isolated writes" in {
     val baseDir = Files.createTempDirectory("raft-itest-multiraft-grpc-")
     val clusterCfg = ClusterConfig(nodeIds.toSet)
@@ -225,9 +273,9 @@ class MultiRaftGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
               timerSvc <- DefaultTimerService[IO]
               rc = RaftConfig(
                 localId = nid,
-                electionTimeoutMin = 300.millis,
-                electionTimeoutMax = 600.millis,
-                heartbeatInterval = 45.millis,
+                electionTimeoutMin = 450.millis,
+                electionTimeoutMax = 900.millis,
+                heartbeatInterval = 50.millis,
                 batching = BatchConfig(
                   enabled = true,
                   maxSize = 16,
@@ -254,9 +302,18 @@ class MultiRaftGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
 
       _ <- Resource.eval {
         for
-          // 1) Initial barrier commit on all 6 shards so Ongaro §4.1 / leadership transfer is ready
+          // 1) Initial barrier commit on all 6 shards & ensure followers caught up before rebalancing
           _ <- shards.parTraverse_ { gid =>
             writeShardWithRetry(hosts, gid, utf8(s"${gid.value}-boot=1"))
+          }
+          _ <- shards.traverse_ { gid =>
+            awaitCondition(
+              nodeIds.forallM { nid =>
+                enginesAndSms((gid, nid)).currentMap.map(
+                  _.get(s"${gid.value}-boot").contains("1")
+                )
+              }
+            )
           }
 
           // 2) Rebalance leadership: 2 shard leaders on each physical server (n1, n2, n3)
@@ -268,18 +325,7 @@ class MultiRaftGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
             GroupId("shard-4") -> n3,
             GroupId("shard-5") -> n3
           )
-          _ <- hostList.traverse_(h =>
-            h.coordinator.rebalanceLeadership(preferred)
-          )
-          _ <- awaitCondition {
-            shards.forallM { gid =>
-              val target = preferred(gid)
-              hosts(target).coordinator.getGroupState(gid).map {
-                case Some(_: Leader) => true
-                case _               => false
-              }
-            }
-          }
+          _ <- awaitRebalanced(hostList, hosts, preferred)
 
           // 3) Hammer all 6 shards concurrently (10 group-committed writes per shard = 60 durable writes across 3 leaders!)
           _ <- shards.parTraverse_ { gid =>
@@ -304,11 +350,7 @@ class MultiRaftGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
                 }
               }
             ) *>
-              awaitShardLeader(hosts, gid).flatMap { lh =>
-                lh.coordinator
-                  .readIndexFromGroup(gid)
-                  .map(_ should be >= 11L)
-              }
+              readIndexShardWithRetry(hosts, gid).map(_ should be >= 11L)
           }
 
           // 5) Confirm each physical server kept at most 2 outbound Netty channels (not 6 * 2 = 12!) and coalesced heartbeats!

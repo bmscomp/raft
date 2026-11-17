@@ -212,7 +212,10 @@ private final class MultiRaftNodeImpl[F[_]: Async](
                   st <- node.getState
                   cfg <- node.getClusterConfig
                   transferred <- st match
-                    case _: Leader if cfg.isVoter(preferredNode) =>
+                    case l: Leader
+                        if l.transferTarget.isEmpty && cfg.isVoter(
+                          preferredNode
+                        ) =>
                       node
                         .transferLeadership(preferredNode)
                         .as(1)

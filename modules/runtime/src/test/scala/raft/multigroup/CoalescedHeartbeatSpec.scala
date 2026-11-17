@@ -70,17 +70,46 @@ class CoalescedHeartbeatSpec extends AnyFlatSpec with Matchers:
                 awaitShardLeader(coordinators, groupId, retries - 1)
       }
 
-  private def awaitCondition(
-      cond: IO[Boolean],
+  private def withLeaderRetry[A](
+      coordinators: Map[NodeId, MultiRaftNode[IO]],
+      groupId: GroupId,
+      attempts: Int = 25
+  )(op: MultiRaftNode[IO] => IO[A]): IO[A] =
+    awaitShardLeader(coordinators, groupId).flatMap { case (_, leaderCoord) =>
+      op(leaderCoord).handleErrorWith {
+        case _: RaftError if attempts > 1 =>
+          IO.sleep(25.millis) *>
+            withLeaderRetry(coordinators, groupId, attempts - 1)(op)
+        case err => IO.raiseError(err)
+      }
+    }
+
+  private def awaitRebalanced(
+      coordinators: Map[NodeId, MultiRaftNode[IO]],
+      preferred: Map[GroupId, NodeId],
       retries: Int = 400
   ): IO[Unit] =
-    cond.flatMap {
-      case true  => IO.unit
-      case false =>
-        if retries <= 0 then
-          IO.raiseError(new RuntimeException("Condition timed out"))
-        else IO.sleep(15.millis) *> awaitCondition(cond, retries - 1)
-    }
+    val trigger =
+      if retries % 15 == 0 then
+        nodeIds.traverse_(id => coordinators(id).rebalanceLeadership(preferred))
+      else IO.unit
+    trigger *>
+      preferred.toList
+        .forallM { case (gid, target) =>
+          coordinators(target).getGroupState(gid).map {
+            case Some(_: Leader) => true
+            case _               => false
+          }
+        }
+        .flatMap {
+          case true  => IO.unit
+          case false =>
+            if retries <= 0 then
+              IO.raiseError(new RuntimeException("Rebalance timed out"))
+            else
+              IO.sleep(20.millis) *>
+                awaitRebalanced(coordinators, preferred, retries - 1)
+        }
 
   "CoalescedHeartbeatConfig" should "validate bounds and deduplicate / supersede per-group heartbeats" in {
     an[IllegalArgumentException] should be thrownBy CoalescedHeartbeatConfig(
@@ -251,9 +280,9 @@ class CoalescedHeartbeatSpec extends AnyFlatSpec with Matchers:
                     _ <- smsRef.update(_.updated((gid, nid), sm))
                     rc = RaftConfig(
                       localId = nid,
-                      electionTimeoutMin = 300.millis,
-                      electionTimeoutMax = 600.millis,
-                      heartbeatInterval = 35.millis,
+                      electionTimeoutMin = 450.millis,
+                      electionTimeoutMax = 900.millis,
+                      heartbeatInterval = 40.millis,
                       leaseReadEnabled = true,
                       leaderLeaseDuration = 200.millis
                     )
@@ -276,21 +305,22 @@ class CoalescedHeartbeatSpec extends AnyFlatSpec with Matchers:
               // Wait for all 6 shards to elect leaders and commit initial writes + batch writes
               _ <- shards.parTraverse_ { gid =>
                 for
-                  pair <- awaitShardLeader(coordinators, gid)
-                  (_, leaderCoord) = pair
-                  _ <- leaderCoord.proposeAndCommitToGroup(
-                    gid,
-                    utf8(s"${gid.value}-k0=v0")
+                  _ <- withLeaderRetry(coordinators, gid)(
+                    _.proposeAndCommitToGroup(gid, utf8(s"${gid.value}-k0=v0"))
                   )
-                  batchIds <- leaderCoord.proposeBatchAndCommitToGroup(
-                    gid,
-                    Seq(
-                      utf8(s"${gid.value}-k1=v1"),
-                      utf8(s"${gid.value}-k2=v2")
+                  batchIds <- withLeaderRetry(coordinators, gid)(
+                    _.proposeBatchAndCommitToGroup(
+                      gid,
+                      Seq(
+                        utf8(s"${gid.value}-k1=v1"),
+                        utf8(s"${gid.value}-k2=v2")
+                      )
                     )
                   )
                   _ = batchIds should have size 2
-                  rIdx <- leaderCoord.readIndexFromGroup(gid)
+                  rIdx <- withLeaderRetry(coordinators, gid)(
+                    _.readIndexFromGroup(gid)
+                  )
                   _ = rIdx should be >= batchIds.last.index
                 yield ()
               }
@@ -304,18 +334,7 @@ class CoalescedHeartbeatSpec extends AnyFlatSpec with Matchers:
                 GroupId("shard-4") -> n3,
                 GroupId("shard-5") -> n3
               )
-              _ <- nodeIds.traverse_(id =>
-                coordinators(id).rebalanceLeadership(preferred)
-              )
-              _ <- awaitCondition {
-                shards.forallM { gid =>
-                  val target = preferred(gid)
-                  coordinators(target).getGroupState(gid).map {
-                    case Some(_: Leader) => true
-                    case _               => false
-                  }
-                }
-              }
+              _ <- awaitRebalanced(coordinators, preferred)
 
               // Let a few heartbeat windows elapse and verify coalescing compressed wire batches!
               _ <- IO.sleep(90.millis)
