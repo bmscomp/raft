@@ -1,19 +1,18 @@
 package raft.multigroup
 
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
 import raft.state.{GroupId, NodeId}
 import raft.message.{SimpleMessageCodec, CodecError}
 
-/** Codec that wraps a standard [[SimpleMessageCodec]] to handle
+/** Codec that wraps a standard `String`-based [[SimpleMessageCodec]] to handle
   * [[GroupEnvelope]] serialization (including optional unicast target routing).
   *
   * Wire format:
   *   - Broadcast (`to = None`): `groupId|GRPENV|fromNodeId|GRPENV|innerMessage`
   *   - Unicast (`to = Some(dest)`):
   *     `groupId|GRPENV|fromNodeId|GRPDST|destNodeId|GRPENV|innerMessage`
-  *
-  * @param inner
-  *   the standard message codec for encoding/decoding
-  *   [[raft.message.RaftMessage]]
   */
 class GroupAwareCodec(inner: SimpleMessageCodec[String]):
 
@@ -45,3 +44,174 @@ class GroupAwareCodec(inner: SimpleMessageCodec[String]):
             s"Invalid GroupEnvelope format: missing $Delimiter delimiter"
           )
         )
+
+object GroupAwareCodec:
+  /** Create a length-prefixed binary [[BinaryGroupAwareCodec]] wrapping any
+    * `Array[Byte]` [[SimpleMessageCodec]] (zero text escaping or Base64 bloat).
+    */
+  def binary(inner: SimpleMessageCodec[Array[Byte]]): BinaryGroupAwareCodec =
+    new BinaryGroupAwareCodec(inner)
+
+/** Length-prefixed binary `Array[Byte]` codec for single and batched
+  * [[GroupEnvelope]] frames in `raft-runtime` (transport-agnostic; for native
+  * Protobuf `MultiRaftWireFrame` over gRPC see `ProtobufMultiGroupCodec` in
+  * `raft-transport-grpc`).
+  */
+final class BinaryGroupAwareCodec(inner: SimpleMessageCodec[Array[Byte]]):
+  private val MagicSingle: Byte = 0x4d // 'M'
+  private val MagicBatch: Byte = 0x42 // 'B'
+
+  def encode(envelope: GroupEnvelope): Array[Byte] =
+    val groupBytes = envelope.groupId.value.getBytes(StandardCharsets.UTF_8)
+    val fromBytes = envelope.from.value.getBytes(StandardCharsets.UTF_8)
+    val toBytes =
+      envelope.to
+        .map(_.value.getBytes(StandardCharsets.UTF_8))
+        .getOrElse(Array.emptyByteArray)
+    val payloadBytes = inner.encode(envelope.message)
+
+    val total =
+      1 + 4 + groupBytes.length + 4 + fromBytes.length + 4 + toBytes.length + 4 + payloadBytes.length
+    val buf = ByteBuffer.allocate(total)
+    val _ = buf
+      .put(MagicSingle)
+      .putInt(groupBytes.length)
+      .put(groupBytes)
+      .putInt(fromBytes.length)
+      .put(fromBytes)
+      .putInt(if envelope.to.isDefined then toBytes.length else -1)
+    if envelope.to.isDefined then
+      val _ = buf.put(toBytes)
+    val _ = buf.putInt(payloadBytes.length).put(payloadBytes)
+    buf.array()
+
+  def encodeBatch(envelopes: Seq[GroupEnvelope]): Array[Byte] =
+    if envelopes.size == 1 then encode(envelopes.head)
+    else
+      val encodedFrames = envelopes.map(encode)
+      val total = 1 + 4 + encodedFrames.map(4 + _.length).sum
+      val buf = ByteBuffer.allocate(total)
+      val _ = buf.put(MagicBatch).putInt(encodedFrames.size)
+      encodedFrames.foreach { frame =>
+        val _ = buf.putInt(frame.length).put(frame)
+      }
+      buf.array()
+
+  def decode(raw: Array[Byte]): Either[CodecError, GroupEnvelope] =
+    decodeBatch(raw).flatMap {
+      case Vector(single) => Right(single)
+      case other          =>
+        Left(
+          CodecError.ParseError(
+            s"Expected single GroupEnvelope, decoded batch of ${other.size}"
+          )
+        )
+    }
+
+  def decodeBatch(raw: Array[Byte]): Either[CodecError, Vector[GroupEnvelope]] =
+    if raw.isEmpty then
+      Left(CodecError.ParseError("Empty binary GroupEnvelope"))
+    else
+      try
+        val buf = ByteBuffer.wrap(raw)
+        buf.get() match
+          case MagicSingle =>
+            decodeSingleBody(buf).map(Vector(_))
+          case MagicBatch =>
+            if buf.remaining() < 4 then
+              Left(
+                CodecError.ParseError(
+                  "Truncated BinaryGroupAwareCodec batch header"
+                )
+              )
+            else
+              val count = buf.getInt()
+              if count < 0 || count > 65536 then
+                Left(CodecError.ParseError(s"Invalid batch count: $count"))
+              else
+                val builder = Vector.newBuilder[GroupEnvelope]
+                var idx = 0
+                var err: Option[CodecError] = None
+                while idx < count && err.isEmpty do
+                  if buf.remaining() < 4 then
+                    err = Some(CodecError.ParseError("Truncated frame length"))
+                  else
+                    val frameLen = buf.getInt()
+                    if frameLen < 1 || frameLen > buf.remaining() then
+                      err = Some(
+                        CodecError.ParseError(
+                          s"Invalid frame length: $frameLen"
+                        )
+                      )
+                    else
+                      val slice = new Array[Byte](frameLen)
+                      val _ = buf.get(slice)
+                      val sub = ByteBuffer.wrap(slice)
+                      if sub.get() != MagicSingle then
+                        err = Some(
+                          CodecError.ParseError("Malformed nested frame magic")
+                        )
+                      else
+                        decodeSingleBody(sub) match
+                          case Right(env) => builder += env
+                          case Left(ce)   => err = Some(ce)
+                  idx += 1
+                err.toLeft(builder.result())
+          case other =>
+            Left(
+              CodecError.ParseError(
+                f"Unknown BinaryGroupAwareCodec magic byte: 0x$other%02x"
+              )
+            )
+      catch
+        case e: Exception =>
+          Left(
+            CodecError.ParseError(
+              s"Malformed BinaryGroupAwareCodec frame: ${e.getMessage}",
+              Some(e)
+            )
+          )
+
+  private def decodeSingleBody(
+      buf: ByteBuffer
+  ): Either[CodecError, GroupEnvelope] =
+    def readUtf8(): Either[CodecError, String] =
+      if buf.remaining() < 4 then
+        Left(CodecError.ParseError("Truncated length field"))
+      else
+        val len = buf.getInt()
+        if len < 0 || len > buf.remaining() then
+          Left(CodecError.ParseError(s"Invalid string length: $len"))
+        else
+          val arr = new Array[Byte](len)
+          val _ = buf.get(arr)
+          Right(new String(arr, StandardCharsets.UTF_8))
+
+    for
+      groupStr <- readUtf8()
+      fromStr <- readUtf8()
+      toOpt <-
+        if buf.remaining() < 4 then
+          Left(CodecError.ParseError("Truncated recipient length"))
+        else
+          val toLen = buf.getInt()
+          if toLen == -1 then Right(None)
+          else if toLen < 0 || toLen > buf.remaining() then
+            Left(CodecError.ParseError(s"Invalid recipient length: $toLen"))
+          else
+            val arr = new Array[Byte](toLen)
+            val _ = buf.get(arr)
+            Right(Some(NodeId(new String(arr, StandardCharsets.UTF_8))))
+      payloadBytes <-
+        if buf.remaining() < 4 then
+          Left(CodecError.ParseError("Truncated payload length"))
+        else
+          val pLen = buf.getInt()
+          if pLen < 0 || pLen > buf.remaining() then
+            Left(CodecError.ParseError(s"Invalid payload length: $pLen"))
+          else
+            val arr = new Array[Byte](pLen)
+            val _ = buf.get(arr)
+            Right(arr)
+      msg <- inner.decode(payloadBytes)
+    yield GroupEnvelope(GroupId(groupStr), NodeId(fromStr), msg, toOpt)

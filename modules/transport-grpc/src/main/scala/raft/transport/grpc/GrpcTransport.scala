@@ -28,6 +28,11 @@ import io.grpc.stub.StreamObserver
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.noop.NoOpLogger
 
+import raft.multigroup.{
+  CoalescedHeartbeatConfig,
+  GroupEnvelope,
+  MultiGroupTransport
+}
 import raft.spi.{RaftTransport, Transport, TransportConfig, TransportFactory}
 import raft.state.NodeId
 import raft.transport.grpc.proto.*
@@ -297,6 +302,56 @@ object GrpcTransport:
     resource(grpcConfig, transportConfig, logger).map { raw =>
       (raw, Transport.withCodec(raw, ProtobufMessageCodec))
     }
+
+  /** Creates a live Netty-backed `(GrpcTransport[F], MultiGroupTransport[F])`
+    * pair multiplexing arbitrary Raft groups over a single HTTP/2 channel per
+    * peer host using binary [[ProtobufMultiGroupCodec]] (`MultiRaftWireFrame`
+    * `Single`, `Batch`, and `CoalescedHeartbeat` frames).
+    */
+  def multiGroupResource[F[_]: Async](
+      grpcConfig: GrpcConfig,
+      transportConfig: TransportConfig,
+      coalescing: CoalescedHeartbeatConfig = CoalescedHeartbeatConfig(),
+      maxGroupQueueSize: Int = 1024,
+      loggerOpt: Option[Logger[F]] = None
+  ): Resource[F, (GrpcTransport[F], MultiGroupTransport[F])] =
+    val logger = loggerOpt.getOrElse(NoOpLogger[F])
+    for
+      raw <- resource(grpcConfig, transportConfig, logger)
+      sendBatch: (Vector[GroupEnvelope] => F[Unit]) = envs =>
+        if envs.isEmpty then Async[F].unit
+        else
+          val (unicast, bcast) = envs.partition(_.to.isDefined)
+          val byPeer = unicast.groupBy(_.to.get).toList
+          val sendUnicast = byPeer.parTraverse_ { case (dest, slice) =>
+            raw.send(dest, ProtobufMultiGroupCodec.encodeBatch(slice))
+          }
+          val sendBcast =
+            if bcast.isEmpty then Async[F].unit
+            else
+              bcast.traverse_(env =>
+                raw.broadcast(ProtobufMultiGroupCodec.encode(env))
+              )
+          sendUnicast *> sendBcast
+      mg <- MultiGroupTransport.resource[F](
+        localId = transportConfig.localId,
+        sendBatchEnvelopes = sendBatch,
+        maxQueueSize = maxGroupQueueSize,
+        coalescing = coalescing
+      )
+      _ <- raw.receive
+        .evalMap { case (_, bytes) =>
+          ProtobufMultiGroupCodec.decode(bytes) match
+            case Right(envs) => mg.dispatchBatch(envs)
+            case Left(err)   =>
+              logger.warn(
+                s"Dropping malformed Multi-Raft frame on ${transportConfig.localId.value}: ${err.message}"
+              )
+        }
+        .compile
+        .drain
+        .background
+    yield (raw, mg)
 
   private def startServer(
       grpcConfig: GrpcConfig,
