@@ -32,25 +32,21 @@ The state machine becomes the **event processor** — it receives committed even
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Event Log Cluster (Raft)                     │
-│                                                                 │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐                   │
-│  │  Node 1  │◄──►│  Node 2  │◄──►│  Node 3  │                   │
-│  │ (Leader) │    │(Follower)│    │(Follower)│                   │
-│  │          │    │          │    │          │                   │
-│  │ Log:     │    │ Log:     │    │ Log:     │                   │
-│  │ [E1,E2,  │    │ [E1,E2,  │    │ [E1,E2,  │                   │
-│  │  E3,E4]  │    │  E3,E4]  │    │  E3,E4]  │                   │
-│  └──────────┘    └──────────┘    └──────────┘                   │
-│       │                │                │                       │
-└───────┼────────────────┼────────────────┼───────────────────────┘
-        │                │                │
-   ┌────┴────┐    ┌──────┴──────┐   ┌─────┴─────┐
-   │Producer │    │ Consumer A  │   │Consumer B  │
-   │(writes) │    │(offset: 3)  │   │(offset: 1) │
-   └─────────┘    └─────────────┘   └────────────┘
+```mermaid
+flowchart TB
+    PROD["Event Producer (proposeAndCommit)"] --> N1
+
+    subgraph Cluster["Durable Event Log Cluster (Raft + FFM WAL + gRPC Protobuf)"]
+        N1["Node 1 (Leader) — MmapWalEngine + SnapshotStore"]
+        N2["Node 2 (Follower) — MmapWalEngine + SnapshotStore"]
+        N3["Node 3 (Follower) — MmapWalEngine + SnapshotStore"]
+        N1 <-->|"ProtobufMessageCodec"| N2
+        N2 <-->|"ProtobufMessageCodec"| N3
+        N1 <-->|"ProtobufMessageCodec"| N3
+    end
+
+    N1 --> CA["Consumer A (offset: 3)"]
+    N2 --> CB["Consumer B (offset: 1)"]
 ```
 
 ## Event Encoding
@@ -292,6 +288,64 @@ def groupForStream(streamName: String): GroupId =
 ```
 
 Each group is an independent, ordered event stream. Cross-stream ordering requires a separate coordination mechanism (vector clocks, causal ordering).
+
+### Production Durability: Wiring `MmapWalEngine` + `StorageBackedSnapshotStore` + `GrpcTransport`
+
+For long-lived event streams exceeding millions of events, wire all three storage SPIs (`LogStore`, `StableStore`, and `SnapshotStore`) to a single `MmapWalEngine` directory and pair `GrpcTransport.raftResource` (`ProtobufMessageCodec`) for zero-Base64 binary replication:
+
+```scala
+import java.nio.file.Path
+import cats.effect.{IO, Resource}
+import raft.RaftNode
+import raft.impl.DefaultTimerService
+import raft.spi.TransportConfig
+import raft.state.{ClusterConfig, CompactionConfig, CompactionPolicy, NodeId, RaftConfig}
+import raft.storage.{
+  StorageBackedLogStore,
+  StorageBackedSnapshotStore,
+  StorageBackedStableStore
+}
+import raft.storage.mmap.MmapWalEngine
+import raft.transport.grpc.{GrpcConfig, GrpcTransport}
+
+def durableEventNode(
+    localId: NodeId,
+    dataDir: Path,
+    grpcPort: Int,
+    peers: Map[NodeId, String],
+    stateMachine: EventSourcedStateMachine
+): Resource[IO, RaftNode[IO]] =
+  for
+    walEngine <- MmapWalEngine.resource[IO](dataDir)
+    logStore = StorageBackedLogStore(walEngine)
+    stableStore = StorageBackedStableStore(walEngine)
+    snapshotStore = StorageBackedSnapshotStore(walEngine)
+    (_, raftTransport) <- GrpcTransport.raftResource[IO](
+      GrpcConfig(host = "127.0.0.1", port = grpcPort),
+      TransportConfig(localId, s"127.0.0.1:$grpcPort", peers)
+    )
+    timerService <- DefaultTimerService[IO]
+    config = RaftConfig.default(localId).copy(
+      compaction = CompactionConfig(policy = CompactionPolicy.Threshold(10_000))
+    )
+    cluster = ClusterConfig((peers.keySet + localId).map(_ -> raft.state.NodeRole.Voter).toMap)
+    node <- RaftNode.resource[IO, String](
+      config = config,
+      cluster = cluster,
+      transport = raftTransport,
+      logStore = logStore,
+      stableStore = stableStore,
+      stateMachine = stateMachine,
+      timerService = timerService,
+      snapshotStore = Some(snapshotStore)
+    )
+  yield node
+```
+
+Under the hood, `MmapWalEngine` guarantees:
+- **Checksummed `hard_state.bin`**: CRC32-verified `(term, votedFor)` with atomic single-`msync` writes.
+- **20-digit snapshot naming (`snapshot-%020d.bin`)**: Numeric `lastIncludedIndex` ordering so event logs smoothly cross `1,000,000+` compacted events without lexicographic sorting bugs.
+- **Self-healing `"WIDX"` index checkpoints**: Atomic `index.ckpt.tmp -> index.ckpt` swaps that fall back automatically to `.wal` segment replay if interrupted by power loss.
 
 ---
 

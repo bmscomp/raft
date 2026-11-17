@@ -211,3 +211,97 @@ class GrpcTransportSpec extends AnyFlatSpec with Matchers:
 
     test.unsafeRunSync()
   }
+
+  "GrpcTransport.raftResource" should "deliver binary Protobuf messages and evict channels on updatePeers" in {
+    val ephemeral = GrpcConfig(host = "127.0.0.1", port = 0)
+    val resources = for
+      pair1 <- GrpcTransport.raftResource[IO](
+        ephemeral,
+        TransportConfig(n1, "127.0.0.1:0", Map.empty),
+        logger
+      )
+      pair2 <- GrpcTransport.raftResource[IO](
+        ephemeral,
+        TransportConfig(n2, "127.0.0.1:0", Map.empty),
+        logger
+      )
+      pair3 <- GrpcTransport.raftResource[IO](
+        ephemeral,
+        TransportConfig(n3, "127.0.0.1:0", Map.empty),
+        logger
+      )
+    yield (pair1, pair2, pair3)
+
+    val test = resources.use { case ((raw1, raft1), (raw2, raft2), (raw3, _)) =>
+      for
+        addr2 <- raw2.localAddress
+        addr3 <- raw3.localAddress
+        _ <- raw1.updatePeers(Map(n2 -> addr2, n3 -> addr3))
+
+        msg = AppendEntriesResponse(
+          term = 9L,
+          success = false,
+          matchIndex = 0L,
+          conflictIndex = Some(14L),
+          conflictTerm = Some(3L)
+        )
+        _ <- raft1.send(n2, msg)
+        _ <- raft1.send(n3, msg)
+
+        got <- raft2.receive.head.compile.lastOrError.timeout(5.seconds)
+        _ = got shouldBe (n1 -> msg)
+        _ = raw1.activeChannelAddresses should contain allOf (addr2, addr3)
+
+        // Remove n3 from peer map -> channel to addr3 must be evicted and shut down
+        _ <- raw1.updatePeers(Map(n2 -> addr2))
+        _ = raw1.activeChannelAddresses shouldBe Set(addr2)
+      yield ()
+    }
+
+    test.unsafeRunSync()
+  }
+
+  it should "retry transient UNAVAILABLE sends and succeed once peer starts" in {
+    // Pick a free TCP port, release it, start sending with retryBackoff, and start server mid-flight
+    val probeSocket = new java.net.ServerSocket(0)
+    val reservedPort = probeSocket.getLocalPort
+    probeSocket.close()
+
+    val senderCfg = GrpcConfig(
+      host = "127.0.0.1",
+      port = 0,
+      maxRetries = 8,
+      retryBackoff = 50.millis,
+      maxRetryBackoff = 150.millis
+    )
+    val receiverCfg = GrpcConfig(host = "127.0.0.1", port = reservedPort)
+
+    val test = GrpcTransport
+      .raftResource[IO](
+        senderCfg,
+        TransportConfig(
+          n1,
+          "127.0.0.1:0",
+          Map(n2 -> s"127.0.0.1:$reservedPort")
+        ),
+        logger
+      )
+      .use { case (_, senderRaft) =>
+        for
+          sendFiber <- senderRaft.send(n2, TimeoutNowRequest(4L, n1)).start
+          _ <- IO.sleep(80.millis)
+          received <- GrpcTransport
+            .raftResource[IO](
+              receiverCfg,
+              TransportConfig(n2, s"127.0.0.1:$reservedPort", Map.empty),
+              logger
+            )
+            .use { case (_, receiverRaft) =>
+              sendFiber.joinWithNever *>
+                receiverRaft.receive.head.compile.lastOrError.timeout(5.seconds)
+            }
+        yield received shouldBe (n1 -> TimeoutNowRequest(4L, n1))
+      }
+
+    test.unsafeRunSync()
+  }

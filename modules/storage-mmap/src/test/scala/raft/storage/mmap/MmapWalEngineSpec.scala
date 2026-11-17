@@ -1,6 +1,7 @@
 package raft.storage.mmap
 
 import cats.effect.IO
+import cats.syntax.all.*
 import java.nio.file.{Files, Path}
 import scala.jdk.CollectionConverters.*
 
@@ -387,7 +388,7 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         _ <- IO(deleteRecursive(tmpDir))
       yield
         binFiles.size shouldBe 1
-        binFiles.head.getFileName.toString shouldBe "snapshot-000200.bin"
+        binFiles.head.getFileName.toString shouldBe "snapshot-00000000000000000200.bin"
         loaded shouldBe defined
         loaded.get.lastIncludedIndex shouldBe 200L
         loaded.get.lastIncludedTerm shouldBe 5L
@@ -531,6 +532,131 @@ class MmapWalEngineSpec extends StorageEngineSpec:
         e1 shouldBe None
         e15.map(e => new String(e.data, "UTF-8")) shouldBe Some("entry-15")
         e30.map(e => new String(e.data, "UTF-8")) shouldBe Some("entry-30")
+      test
+    }
+
+    "should sort snapshot indices numerically across the 1,000,000 boundary and read legacy 6-digit files" in {
+      val test = for
+        tmpDir <- IO(Files.createTempDirectory("raft-wal-snap-million-"))
+        engine <- MmapWalEngine.open[IO](tmpDir)
+        s999k = raft.state.Snapshot[IO](
+          lastIncludedIndex = 999_999L,
+          lastIncludedTerm = 8L,
+          data = fs2.Stream.emits("snap-999999".getBytes("UTF-8")).covary[IO]
+        )
+        _ <- engine.saveSnapshot(s999k)
+
+        // Also place a legacy 6-digit filename at 999999 alongside a 1,000,005 snapshot
+        snapDir = tmpDir.resolve("snapshots")
+        legacyPath = snapDir.resolve("snapshot-999999.bin")
+        modernPath =
+          snapDir.resolve(s"${MmapWalEngine.formatSnapshotStem(999_999L)}.bin")
+        _ <- IO(Files.copy(modernPath, legacyPath))
+
+        s1m = raft.state.Snapshot[IO](
+          lastIncludedIndex = 1_000_005L,
+          lastIncludedTerm = 9L,
+          data = fs2.Stream.emits("snap-1000005".getBytes("UTF-8")).covary[IO]
+        )
+        // Re-copy legacy file after saveSnapshot cleanup to test mixed-directory recovery
+        _ <- engine.saveSnapshot(s1m)
+        raw999 <- IO {
+          val buf = java.nio.ByteBuffer.allocate(20 + 11)
+          buf.putLong(999_999L)
+          buf.putLong(8L)
+          buf.putInt(0)
+          buf.put("snap-999999".getBytes("UTF-8"))
+          buf.array()
+        }
+        _ <- IO(Files.write(legacyPath, raw999))
+
+        loaded <- engine.loadSnapshot
+        loadedBytes <- loaded.get.data.compile.to(Array)
+        listed <- engine.listSnapshots
+        _ <- engine.deleteSnapshot(999_999L)
+        listedAfterDelete <- engine.listSnapshots
+        _ <- engine.close
+        _ <- IO(deleteRecursive(tmpDir))
+      yield
+        loaded.get.lastIncludedIndex shouldBe 1_000_005L
+        new String(loadedBytes, "UTF-8") shouldBe "snap-1000005"
+        listed.map(_.lastIncludedIndex) shouldBe Vector(999_999L, 1_000_005L)
+        listedAfterDelete.map(_.lastIncludedIndex) shouldBe Vector(1_000_005L)
+      test
+    }
+
+    "should fall back to full WAL segment replay when index.ckpt is corrupted" in {
+      val test = for
+        tmpDir <- IO(Files.createTempDirectory("raft-wal-corrupt-ckpt-"))
+        engine1 <- MmapWalEngine.open[IO](tmpDir)
+        entries = (1L to 1005L).map(i =>
+          raft.state.Log.command(i, 3L, s"cmd-$i".getBytes("UTF-8"))
+        )
+        _ <- engine1.appendEntries(entries)
+        _ <- engine1.close
+
+        ckptPath = tmpDir.resolve("index.ckpt")
+        ckptExists <- IO(Files.exists(ckptPath))
+        // Corrupt index.ckpt on disk to simulate a torn checkpoint write
+        _ <- IO(
+          Files.write(ckptPath, Array[Byte](0x57, 0x49, 0x44, 0x58, 1, 9))
+        )
+
+        engine2 <- MmapWalEngine.open[IO](tmpDir)
+        lastIdx <- engine2.lastLogIndex
+        first <- engine2.readEntry(raft.state.LogIndex.unsafeFrom(1))
+        tail <- engine2.readEntry(raft.state.LogIndex.unsafeFrom(1005))
+        _ <- engine2.close
+        _ <- IO(deleteRecursive(tmpDir))
+      yield
+        ckptExists shouldBe true
+        lastIdx shouldBe raft.state.LogIndex.unsafeFrom(1005)
+        first.map(e => new String(e.data, "UTF-8")) shouldBe Some("cmd-1")
+        tail.map(e => new String(e.data, "UTF-8")) shouldBe Some("cmd-1005")
+      test
+    }
+
+    "should serialize concurrent fiber appends, reads, and snapshots safely under Mutex" in {
+      val test = for
+        tmpDir <- IO(Files.createTempDirectory("raft-wal-mutex-"))
+        engine <- MmapWalEngine.open[IO](tmpDir, segmentSize = 4096L)
+        batches = (0 until 10).toList.map { b =>
+          val start = b * 20L + 1L
+          (start until (start + 20L)).map(i =>
+            raft.state.Log.command(i, 1L, s"v-$i".getBytes("UTF-8"))
+          )
+        }
+        // Append sequentially by batch index while concurrent readers & snapshotters run
+        readerFiber <- fs2.Stream
+          .repeatEval(
+            engine.readRange(
+              raft.state.LogIndex.unsafeFrom(1),
+              raft.state.LogIndex.unsafeFrom(50)
+            )
+          )
+          .take(25)
+          .compile
+          .drain
+          .start
+        snapFiber <- (1 to 5).toList.traverse_ { k =>
+          engine.saveSnapshot(
+            raft.state.Snapshot[IO](
+              lastIncludedIndex = k * 10L,
+              lastIncludedTerm = 1L,
+              data = fs2.Stream.emits(s"s-$k".getBytes("UTF-8")).covary[IO]
+            )
+          )
+        }.start
+        _ <- batches.traverse_(b => engine.appendEntries(b))
+        _ <- readerFiber.joinWithNever
+        _ <- snapFiber.joinWithNever
+        lastIdx <- engine.lastLogIndex
+        snap <- engine.loadSnapshot
+        _ <- engine.close
+        _ <- IO(deleteRecursive(tmpDir))
+      yield
+        lastIdx shouldBe raft.state.LogIndex.unsafeFrom(200)
+        snap.map(_.lastIncludedIndex) shouldBe Some(50L)
       test
     }
   }

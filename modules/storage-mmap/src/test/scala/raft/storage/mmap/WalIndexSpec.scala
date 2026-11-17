@@ -141,5 +141,42 @@ class WalIndexSpec extends AnyFreeSpec with Matchers:
         restored.lastIndex shouldBe 1000L
         restored.get(500L).get.fileOffset shouldBe 500L * 40
       }
+
+      "should detect CRC32 bit-flip in WIDX checkpoint" in {
+        val idx = new WalIndex
+        (1L to 20L).foreach(i => idx.put(i, 1, i * 32))
+        val bytes = idx.serialize
+        bytes(18) = (bytes(18) ^ 0x04).toByte
+
+        WalIndex.deserializeChecked(bytes).isLeft shouldBe true
+        intercept[raft.state.RaftError.StorageCorruption] {
+          WalIndex.deserialize(bytes)
+        }
+      }
+
+      "should detect truncated WIDX checkpoint" in {
+        val idx = new WalIndex
+        (1L to 10L).foreach(i => idx.put(i, 1, i * 32))
+        val truncated = idx.serialize.take(30)
+
+        WalIndex.deserializeChecked(truncated).isLeft shouldBe true
+      }
+
+      "should compute accurate lastIndex on sparse truncateFrom and discardBefore" in {
+        val idx = new WalIndex
+        idx.put(2L, 1, 20L)
+        idx.put(5L, 1, 50L)
+        idx.put(12L, 2, 120L)
+
+        idx.truncateFrom(10L)
+        idx.lastIndex shouldBe 5L
+        idx.size shouldBe 2
+
+        idx.discardBefore(3L)
+        idx.lastIndex shouldBe 5L
+        idx.size shouldBe 1
+        idx.get(2L) shouldBe None
+        idx.get(5L) shouldBe Some(idx.Location(1, 50L))
+      }
     }
   }
