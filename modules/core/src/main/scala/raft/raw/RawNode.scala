@@ -238,13 +238,13 @@ final class RawNode(
           val nextCfg =
             if newMembers == tracker.config.members then tracker.config
             else tracker.config.beginJointConsensus(newMembers)
+          applyClusterConfig(nextCfg)
           val idx = appendLeaderEntry(
             LogType.Configuration,
             ClusterConfig.encode(nextCfg),
             l.term
           )
-          applyClusterConfig(nextCfg)
-          bcastAppend()
+          bcastAppend(forceSendEmpty = true)
           Right(idx)
       case f: Follower =>
         Left(RaftError.NotLeader(f.leaderId))
@@ -389,13 +389,13 @@ final class RawNode(
           if role == NodeRole.Learner && roleState.isInstanceOf[Leader] then
             val nextCfg =
               tracker.config.addMember(req.newServer, NodeRole.Learner)
+            applyClusterConfig(nextCfg)
             val _ = appendLeaderEntry(
               LogType.Configuration,
               ClusterConfig.encode(nextCfg),
               currentTerm
             )
-            applyClusterConfig(nextCfg)
-            bcastAppend()
+            bcastAppend(forceSendEmpty = true)
             true
           else proposeConfChange(targetMap).isRight
         sendOrigin(
@@ -1147,13 +1147,13 @@ final class RawNode(
             if committedCfg.isInJointConsensus && tracker.config.isInJointConsensus
             then
               val finalCfg = tracker.config.completeJointConsensus
+              applyClusterConfig(finalCfg)
               val _ = appendLeaderEntry(
                 LogType.Configuration,
                 ClusterConfig.encode(finalCfg),
                 leader.term
               )
-              applyClusterConfig(finalCfg)
-              bcastAppend()
+              bcastAppend(forceSendEmpty = true)
             else if !committedCfg.isVoter(config.localId) then
               stepDownToFollower(leader.term, votedFor = None, leader = None)
           }

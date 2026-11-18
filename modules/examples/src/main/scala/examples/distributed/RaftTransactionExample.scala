@@ -173,22 +173,38 @@ object RaftTransactionExample extends IOApp.Simple:
     def getAll: F[Map[String, String]] = state.get
     def getLog: F[List[TxnResult]] = txnLog.get
     def snapshot: F[Stream[F, Byte]] =
-      state.get.map { s =>
+      for
+        s <- state.get
+        v <- version.get
+      yield
+        val header = s"VER\t$v"
+        val rows = s.toSeq.sortBy(_._1).map((k, vl) => s"KV\t$k\t$vl")
         Stream
-          .emits(s.map((k, v) => s"$k=$v").mkString("\n").getBytes)
+          .emits(
+            (header +: rows)
+              .mkString("\n")
+              .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+          )
           .covary[F]
-      }
+
     def restore(data: Stream[F, Byte]): F[Unit] =
       data.compile.to(Array).flatMap { bytes =>
-        state.set(
-          new String(bytes)
-            .split("\n")
-            .flatMap(_.split("=", 2) match {
-              case Array(k, v) => Some(k -> v)
-              case _           => None
-            })
-            .toMap
-        )
+        val str = new String(bytes, java.nio.charset.StandardCharsets.UTF_8)
+        if str.isEmpty then state.set(Map.empty) *> version.set(0L)
+        else
+          val lines = str.split("\n").toList
+          val restoredVer = lines
+            .collectFirst {
+              case l if l.startsWith("VER\t") => l.drop(4).toLongOption
+            }
+            .flatten
+            .getOrElse(0L)
+          val kvs = lines.flatMap { line =>
+            line.split("\t", 3) match
+              case Array("KV", k, vl) => Some(k -> vl)
+              case _                  => None
+          }.toMap
+          state.set(kvs) *> version.set(restoredVer)
       }
 
   object TransactionalStore:
@@ -226,23 +242,28 @@ object RaftTransactionExample extends IOApp.Simple:
   class RaftTransactionNode[F[_]: Async](
       val nodeId: NodeId,
       config: RaftConfig,
+      cluster: ClusterConfig,
       val stateRef: Ref[F, NodeState],
       logRef: Ref[F, Vector[Log]],
       commitIndexRef: Ref[F, Long],
       stateMachine: TransactionalStore[F],
-      messageQueue: Queue[F, (NodeId, RaftMessage)],
-      clusterSize: Int
+      mailboxes: Map[NodeId, Queue[F, (NodeId, RaftMessage)]]
   ):
+    private val clusterSize = cluster.voters.size
 
-    /** Submit a transaction (leader only). Returns commit result. */
-    def submitTransaction(txn: Transaction): F[Either[String, TxnResult]] =
+    /** Submit a transaction (leader only) and broadcast AppendEntries to
+      * followers.
+      */
+    def submitTransaction(txn: Transaction): F[Either[String, Long]] =
       for
         state <- stateRef.get
         result <- state match
           case l: Leader =>
             for
               logs <- logRef.get
-              newIndex = if logs.isEmpty then 1L else logs.last.index + 1
+              prevIdx = logs.lastOption.map(_.index).getOrElse(0L)
+              prevTerm = logs.lastOption.map(_.term).getOrElse(0L)
+              newIndex = prevIdx + 1L
               entry = Log.command(newIndex, l.term, Transaction.encode(txn))
               _ <- logRef.update(_ :+ entry)
               _ <- Async[F].delay(
@@ -251,17 +272,16 @@ object RaftTransactionExample extends IOApp.Simple:
                 )
               )
 
-              // Simulate replication by broadcasting AppendEntries
               appendReq = AppendEntriesRequest(
                 term = l.term,
                 leaderId = nodeId,
-                prevLogIndex = newIndex - 1,
-                prevLogTerm = logs.lastOption.map(_.term).getOrElse(0L),
+                prevLogIndex = prevIdx,
+                prevLogTerm = prevTerm,
                 entries = Seq(entry),
                 leaderCommit = l.commitIndex
               )
               _ <- broadcastToFollowers(appendReq)
-            yield Right(TxnResult.Committed(txn.id, newIndex))
+            yield Right(newIndex)
           case _ =>
             Async[F].pure(Left("Not leader - redirect to leader"))
       yield result
@@ -285,7 +305,8 @@ object RaftTransactionExample extends IOApp.Simple:
           lastTerm,
           clusterSize,
           getTermAt,
-          sender = Some(from)
+          sender = Some(from),
+          clusterOpt = Some(cluster)
         )
 
         _ <- stateRef.set(transition.state)
@@ -296,14 +317,10 @@ object RaftTransactionExample extends IOApp.Simple:
     private def executeEffect(effect: raft.effect.Effect): F[Unit] =
       effect match
         case SendMessage(to, msg) =>
-          messageQueue.offer((to, msg))
+          mailboxes.get(to).traverse_(_.offer((nodeId, msg)))
 
         case Broadcast(msg) =>
-          Async[F].delay(
-            println(
-              s"   📡 [${nodeId.value}] Broadcasting ${msg.getClass.getSimpleName}"
-            )
-          )
+          broadcastToFollowers(msg)
 
         case AppendLogs(entries) =>
           logRef.update(_ ++ entries) *>
@@ -313,12 +330,16 @@ object RaftTransactionExample extends IOApp.Simple:
               )
             )
 
+        case TruncateLog(fromIndex) =>
+          logRef.update(_.filter(_.index < fromIndex))
+
         case CommitEntries(upToIndex) =>
           for
             logs <- logRef.get
             currentCommit <- commitIndexRef.get
+            targetCommit = math.max(currentCommit, upToIndex.value)
             toApply = logs.filter(l =>
-              l.index > currentCommit && l.index <= upToIndex.value
+              l.index > currentCommit && l.index <= targetCommit
             )
             _ <- toApply.traverse_ { entry =>
               stateMachine.apply(entry) *>
@@ -328,7 +349,7 @@ object RaftTransactionExample extends IOApp.Simple:
                   )
                 )
             }
-            _ <- commitIndexRef.set(upToIndex.value)
+            _ <- commitIndexRef.set(targetCommit)
           yield ()
 
         case BecomeLeader =>
@@ -337,11 +358,9 @@ object RaftTransactionExample extends IOApp.Simple:
         case _ => Async[F].unit
 
     private def broadcastToFollowers(msg: RaftMessage): F[Unit] =
-      Async[F].delay(
-        println(
-          s"   📡 [${nodeId.value}] Replicating ${msg.getClass.getSimpleName} to followers..."
-        )
-      )
+      mailboxes.toList.traverse_ { case (peerId, q) =>
+        if peerId != nodeId then q.offer((nodeId, msg)) else Async[F].unit
+      }
 
     def getState: F[NodeState] = stateRef.get
     def getLog: F[Vector[Log]] = logRef.get
@@ -350,24 +369,24 @@ object RaftTransactionExample extends IOApp.Simple:
   object RaftTransactionNode:
     def apply[F[_]: Async](
         nodeId: NodeId,
-        clusterSize: Int,
-        stateMachine: TransactionalStore[F]
+        cluster: ClusterConfig,
+        stateMachine: TransactionalStore[F],
+        mailboxes: Map[NodeId, Queue[F, (NodeId, RaftMessage)]]
     ): F[RaftTransactionNode[F]] =
       for
         state <- Ref.of[F, NodeState](Follower(0, None, None))
         log <- Ref.of[F, Vector[Log]](Vector.empty)
         commit <- Ref.of[F, Long](0L)
-        queue <- Queue.unbounded[F, (NodeId, RaftMessage)]
         config = RaftConfig(nodeId, 150.millis, 300.millis, 50.millis)
       yield new RaftTransactionNode[F](
         nodeId,
         config,
+        cluster,
         state,
         log,
         commit,
         stateMachine,
-        queue,
-        clusterSize
+        mailboxes
       )
 
   def run: IO[Unit] =
@@ -381,61 +400,69 @@ object RaftTransactionExample extends IOApp.Simple:
       _ <- IO.println("  • RaftMessage (AppendEntries, RequestVote)")
       _ <- IO.println("  • Effect system for side effects")
       _ <- IO.println("  • StateMachine SPI for transaction execution\n")
-      _ <- runDemo
+      _ <- runDemoStates.void
     yield ()
 
-  private def runDemo: IO[Unit] =
+  private def pumpBus(
+      nodes: List[RaftTransactionNode[IO]],
+      mailboxes: Map[NodeId, Queue[IO, (NodeId, RaftMessage)]]
+  ): IO[Unit] =
+    val nodeMap = nodes.map(n => n.nodeId -> n).toMap
+    def loop: IO[Unit] =
+      nodes
+        .traverse { n =>
+          mailboxes(n.nodeId).tryTake.flatMap {
+            case Some((from, msg)) =>
+              nodeMap(n.nodeId).processMessage(from, msg).as(true)
+            case None => IO.pure(false)
+          }
+        }
+        .flatMap { progressed =>
+          if progressed.exists(identity) then loop else IO.unit
+        }
+    loop
+
+  def runDemoStates: IO[List[Map[String, String]]] =
     for
       // Create state machines for each node
       fsm1 <- TransactionalStore[IO]
       fsm2 <- TransactionalStore[IO]
       fsm3 <- TransactionalStore[IO]
 
+      ids = List(NodeId("node-1"), NodeId("node-2"), NodeId("node-3"))
+      cluster = ClusterConfig(ids.toSet)
+      mailboxes <- ids
+        .traverse(id => Queue.unbounded[IO, (NodeId, RaftMessage)].map(id -> _))
+        .map(_.toMap)
+
       // Create RAFT nodes with transaction support
-      node1 <- RaftTransactionNode[IO](NodeId("node-1"), 3, fsm1)
-      node2 <- RaftTransactionNode[IO](NodeId("node-2"), 3, fsm2)
-      node3 <- RaftTransactionNode[IO](NodeId("node-3"), 3, fsm3)
+      node1 <- RaftTransactionNode[IO](ids(0), cluster, fsm1, mailboxes)
+      node2 <- RaftTransactionNode[IO](ids(1), cluster, fsm2, mailboxes)
+      node3 <- RaftTransactionNode[IO](ids(2), cluster, fsm3, mailboxes)
+      allNodes = List(node1, node2, node3)
 
       _ <- IO.println("Step 1: Elect a leader using RaftLogic")
       _ <- IO.println("─" * 50)
 
-      // Trigger election on node-1
-      _ <- node1.processMessage(NodeId("node-1"), ElectionTimeout)
+      // Trigger election on node-1 and pump Pre-Vote + Vote rounds across the 3 nodes
+      _ <- node1.processMessage(ids(0), ElectionTimeout)
       state1 <- node1.getState
       _ <- IO.println(s"   node-1 state after timeout: $state1")
 
-      // Nodes 2 and 3 receive vote request and respond
-      voteReq = RequestVoteRequest(
-        term = 1,
-        candidateId = NodeId("node-1"),
-        lastLogIndex = 0,
-        lastLogTerm = 0
-      )
-
-      _ <- node2.processMessage(NodeId("node-1"), voteReq)
-      _ <- node3.processMessage(NodeId("node-1"), voteReq)
-
-      state2 <- node2.getState
-      state3 <- node3.getState
-      _ <- IO.println(s"   node-2 state: $state2")
-      _ <- IO.println(s"   node-3 state: $state3")
-
-      // Simulate node-1 receiving votes and becoming leader
-      voteResp = RequestVoteResponse(term = 1, voteGranted = true)
-      _ <- node1.processMessage(NodeId("node-2"), voteResp)
-      _ <- node1.processMessage(NodeId("node-3"), voteResp)
+      _ <- pumpBus(allNodes, mailboxes)
 
       leaderState <- node1.getState
-      _ <- IO.println(s"   node-1 after votes: $leaderState\n")
+      state2 <- node2.getState
+      state3 <- node3.getState
+      _ <- IO.println(s"   node-1 after votes: $leaderState")
+      _ <- IO.println(s"   node-2 state:       $state2")
+      _ <- IO.println(s"   node-3 state:       $state3\n")
 
       // ─────────────────────────────────────────────────────────────────────
-      _ <- IO.println("Step 2: Submit transactions through the leader")
+      _ <- IO.println("Step 2: Submit & replicate transactions through leader")
       _ <- IO.println("─" * 50)
 
-      // Make node-1 the leader for transaction submission
-      _ <- node1.stateRef.set(Leader(term = 1, Map.empty, Map.empty, 0L))
-
-      // Transaction 1: Bank transfer
+      // Transaction 1: Create accounts
       txn1 = Transaction(
         id = TxnId.generate,
         operations = List(
@@ -449,24 +476,32 @@ object RaftTransactionExample extends IOApp.Simple:
         s"\n   Submitting: Create accounts (txn ${txn1.id.value})"
       )
       result1 <- node1.submitTransaction(txn1)
-      _ <- IO.println(s"   Result: $result1")
+      _ <- pumpBus(allNodes, mailboxes)
+      _ <- IO.println(s"   Submitted index: $result1")
 
-      // Transaction 2: Transfer
+      // Transaction 2: Conditional CAS Transfer
       txn2 = Transaction(
         id = TxnId.generate,
         operations = List(
-          TxnOperation.Put("account:alice", "800"),
-          TxnOperation.Put("account:bob", "700"),
+          TxnOperation.CompareAndSet("account:alice", Some("1000"), "800"),
+          TxnOperation.CompareAndSet("account:bob", Some("500"), "700"),
           TxnOperation.Put("audit:transfer", "alice->bob:200")
         )
       )
 
       _ <- IO.println(s"\n   Submitting: Transfer 200 (txn ${txn2.id.value})")
       result2 <- node1.submitTransaction(txn2)
-      _ <- IO.println(s"   Result: $result2")
+      _ <- pumpBus(allNodes, mailboxes)
+      _ <- IO.println(s"   Submitted index: $result2")
+
+      // Broadcast commit-carrying heartbeat so followers commit & apply up to commitIndex
+      _ <- node1.processMessage(ids(0), HeartbeatTimeout)
+      _ <- pumpBus(allNodes, mailboxes)
 
       // ─────────────────────────────────────────────────────────────────────
-      _ <- IO.println("\nStep 3: Verify RAFT log replication")
+      _ <- IO.println(
+        "\nStep 3: Verify RAFT log replication across all 3 nodes"
+      )
       _ <- IO.println("─" * 50)
 
       log1 <- node1.getLog
@@ -481,15 +516,14 @@ object RaftTransactionExample extends IOApp.Simple:
       }
 
       // ─────────────────────────────────────────────────────────────────────
-      _ <- IO.println("\nStep 4: Apply committed entries to state machine")
+      _ <- IO.println("\nStep 4: Verify converged state machine on all 3 nodes")
       _ <- IO.println("─" * 50)
 
-      // Manually trigger commit (in production, this happens via majority ack)
-      _ <- log1.traverse_(entry => fsm1.apply(entry))
-
-      finalState <- fsm1.getAll
-      _ <- IO.println(s"   State machine has ${finalState.size} keys:")
-      _ <- finalState.toList.sorted.traverse_ { case (k, v) =>
+      finalState1 <- fsm1.getAll
+      finalState2 <- fsm2.getAll
+      finalState3 <- fsm3.getAll
+      _ <- IO.println(s"   State machine has ${finalState1.size} keys:")
+      _ <- finalState1.toList.sorted.traverse_ { case (k, v) =>
         IO.println(s"      $k = $v")
       }
 
@@ -525,4 +559,4 @@ object RaftTransactionExample extends IOApp.Simple:
       _ <- IO.println(
         "\n✅ RAFT-based distributed transaction example complete!"
       )
-    yield ()
+    yield List(finalState1, finalState2, finalState3)

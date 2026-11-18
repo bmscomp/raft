@@ -84,14 +84,14 @@ object PreVoteExample extends IOApp.Simple:
       follower = Follower(term = 5, votedFor = None, leaderId = None)
       _ <- IO.println(s"   Initial state: Follower(term=5)")
 
-      // Election timeout with pre-vote enabled
+      // Election timeout with pre-vote enabled in a 5-node cluster (majority = 3 = self + 2 peers)
       trans1 = RaftLogic.onMessage(
         follower,
         ElectionTimeout,
         configWithPreVote,
         10,
         5,
-        3
+        5
       )
       _ <- IO.println(s"   After ElectionTimeout: ${trans1.state}")
       _ <- IO.println(s"   State type: PreCandidate (NOT Candidate!)")
@@ -106,8 +106,10 @@ object PreVoteExample extends IOApp.Simple:
       )
       _ <- IO.println(s"   isPreVote: ${preVoteReq.get.isPreVote}")
 
-      // Simulate receiving pre-vote responses
-      _ <- IO.println("\n▶ Step 2: Receiving Pre-Vote Responses")
+      // Simulate receiving pre-vote responses in a 5-node cluster
+      _ <- IO.println(
+        "\n▶ Step 2: Receiving Pre-Vote Responses (5-Node Cluster)"
+      )
       _ <- IO.println("─" * 50)
 
       preVoteResp = RequestVoteResponse(
@@ -123,9 +125,10 @@ object PreVoteExample extends IOApp.Simple:
         configWithPreVote,
         10,
         5,
-        3
+        5,
+        sender = Some(node2)
       )
-      _ <- IO.println(s"   After 1st pre-vote: ${trans2.state}")
+      _ <- IO.println(s"   After 1st peer pre-vote (2/5): ${trans2.state}")
 
       trans3 = RaftLogic.onMessage(
         trans2.state,
@@ -133,9 +136,12 @@ object PreVoteExample extends IOApp.Simple:
         configWithPreVote,
         10,
         5,
-        3
+        5,
+        sender = Some(node3)
       )
-      _ <- IO.println(s"   After 2nd pre-vote (majority): ${trans3.state}")
+      _ <- IO.println(
+        s"   After 2nd peer pre-vote (3/5 majority): ${trans3.state}"
+      )
       _ <- IO.println(s"   NOW becomes Candidate with incremented term")
     yield ()
 

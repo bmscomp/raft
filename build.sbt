@@ -145,6 +145,7 @@ lazy val examples = project
     name := "raft-examples",
     publish / skip := true,
     coverageEnabled := false,
+    Test / parallelExecution := false,
     Compile / run / fork := true,
     scalacOptions ++= commonScalacOptions,
     libraryDependencies ++= Seq(

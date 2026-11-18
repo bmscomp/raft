@@ -97,20 +97,30 @@ class KVStateMachine[F[_]: Sync](
   def snapshot: F[Stream[F, Byte]] =
     store.get.map { m =>
       Stream
-        .emits(m.map { case (k, v) => s"$k=$v" }.mkString("\n").getBytes)
+        .emits(
+          m.toSeq
+            .sortBy(_._1)
+            .map { case (k, v) => s"$k=$v" }
+            .mkString("\n")
+            .getBytes(StandardCharsets.UTF_8)
+        )
         .covary[F]
     }
 
   def restore(data: Stream[F, Byte]): F[Unit] =
     data.compile.to(Array).flatMap { bytes =>
-      val entries = new String(bytes)
-        .split("\n")
-        .flatMap { line =>
-          line.split("=") match
-            case Array(k, v) => Some(k -> v)
-            case _           => None
-        }
-        .toMap
+      val str = new String(bytes, StandardCharsets.UTF_8)
+      val entries =
+        if str.isEmpty then Map.empty[String, String]
+        else
+          str
+            .split("\n")
+            .flatMap { line =>
+              line.split("=", 2) match
+                case Array(k, v) => Some(k -> v)
+                case _           => None
+            }
+            .toMap
       store.set(entries)
     }
 
@@ -129,7 +139,9 @@ import scala.concurrent.duration.*
 
 object KVStoreExample extends IOApp.Simple:
 
-  def run: IO[Unit] =
+  def run: IO[Unit] = runScenario.void
+
+  def runScenario: IO[Map[String, Option[String]]] =
     for
       _ <- IO.println("═" * 60)
       _ <- IO.println("  Distributed Key-Value Store with RAFT Library")
@@ -141,11 +153,14 @@ object KVStoreExample extends IOApp.Simple:
 
       // Create RAFT node state
       nodeId = NodeId("kv-node-1")
+      peer2 = NodeId("kv-node-2")
+      peer3 = NodeId("kv-node-3")
+      cluster = ClusterConfig(Set(nodeId, peer2, peer3))
       config = RaftConfig(nodeId, 150.millis, 300.millis, 50.millis)
       stateRef <- Ref.of[IO, NodeState](Follower(0, None, None))
       logRef <- Ref.of[IO, Vector[Log]](Vector.empty)
 
-      // Step 1: Simulate leader election using RaftLogic
+      // Step 1: Simulate two-phase Pre-Vote -> Real Vote leader election using RaftLogic
       _ <- IO.println("Step 1: Leader Election via RaftLogic")
       _ <- IO.println("─" * 40)
 
@@ -157,33 +172,52 @@ object KVStoreExample extends IOApp.Simple:
         0,
         0,
         3,
-        _ => None
+        _ => None,
+        clusterOpt = Some(cluster)
       )
-      _ <- stateRef.set(transition1.state)
       _ <- IO.println(s"   After ElectionTimeout: ${transition1.state}")
       _ <- IO.println(
         s"   Effects: ${transition1.effects.map(_.getClass.getSimpleName)}"
       )
 
-      // Simulate receiving votes
-      voteResp = RequestVoteResponse(term = 1, voteGranted = true)
-      state2 <- stateRef.get
-      trans2 = RaftLogic.onMessage(state2, voteResp, config, 0, 0, 3, _ => None)
-      _ <- stateRef.set(trans2.state)
-      trans3 = RaftLogic.onMessage(
-        trans2.state,
-        voteResp,
+      // Phase 1b: Pre-Vote grant promotes PreCandidate(0) -> Candidate(1)
+      preVoteGrant = RequestVoteResponse(
+        term = 1,
+        voteGranted = true,
+        isPreVote = true
+      )
+      candidateTrans = RaftLogic.onMessage(
+        transition1.state,
+        preVoteGrant,
         config,
         0,
         0,
         3,
-        _ => None
+        _ => None,
+        sender = Some(peer2),
+        clusterOpt = Some(cluster)
       )
-      _ <- stateRef.set(trans3.state)
-      _ <- IO.println(s"   After votes: ${trans3.state}")
+      _ <- IO.println(s"   After Pre-Vote quorum: ${candidateTrans.state}")
 
-      // Make it leader for demo
-      _ <- stateRef.set(Leader(term = 1, Map.empty, Map.empty, 0L))
+      // Phase 2: Real vote grant promotes Candidate(1) -> Leader(1)
+      voteGrant = RequestVoteResponse(
+        term = 1,
+        voteGranted = true,
+        isPreVote = false
+      )
+      leaderTrans = RaftLogic.onMessage(
+        candidateTrans.state,
+        voteGrant,
+        config,
+        0,
+        0,
+        3,
+        _ => None,
+        sender = Some(peer2),
+        clusterOpt = Some(cluster)
+      )
+      _ <- stateRef.set(leaderTrans.state)
+      _ <- IO.println(s"   After Vote quorum:     ${leaderTrans.state}")
 
       // Step 2: Apply commands through RAFT log
       _ <- IO.println("\nStep 2: Appending Commands to RAFT Log")
@@ -238,6 +272,7 @@ object KVStoreExample extends IOApp.Simple:
       _ <- IO.println(s"   user:2 = ${user2After.getOrElse("(deleted)")}")
 
       // Summary
+      cfgTimeout <- fsm.get("config:timeout")
       _ <- IO.println("\n" + "═" * 60)
       _ <- IO.println("  RAFT Library Components Used:")
       _ <- IO.println("  • RaftLogic.onMessage - consensus transitions")
@@ -246,4 +281,8 @@ object KVStoreExample extends IOApp.Simple:
       _ <- IO.println("  • Log - replicated log entries")
       _ <- IO.println("  • StateMachine[F, KVResult] - application state")
       _ <- IO.println("═" * 60)
-    yield ()
+    yield Map(
+      "user:1" -> user1,
+      "user:2" -> user2After,
+      "config:timeout" -> cfgTimeout
+    )

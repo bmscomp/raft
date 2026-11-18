@@ -160,3 +160,32 @@ class MultiRaftNodeSpec extends AnyFunSuite with Matchers:
     stateB shouldBe a[Follower]
     // They are distinct instances
     stateA should not be theSameInstanceAs(stateB)
+
+  test("should query group cluster config and reject unknown group confChange"):
+    val node1 = NodeId("node1")
+    val voters = Set(node1, NodeId("node2"), NodeId("node3"))
+
+    val (cfgPresent, cfgMissing) = (for
+      transport <- MultiGroupTransport[IO](node1, _ => IO.unit)
+      multi <- MultiRaftNode[IO](node1, transport)
+      cfg <- mkGroupConfig(node1, voters)
+      _ <- multi.createGroup(GroupId("shard-0"), cfg)
+      present <- multi.getGroupClusterConfig(GroupId("shard-0"))
+      missing <- multi.getGroupClusterConfig(GroupId("ghost"))
+      _ <- multi.shutdown
+    yield (present, missing)).unsafeRunSync()
+
+    cfgPresent.map(_.voters) shouldBe Some(voters)
+    cfgMissing shouldBe None
+
+    val err = intercept[GroupNotFoundException] {
+      (for
+        transport <- MultiGroupTransport[IO](node1, _ => IO.unit)
+        multi <- MultiRaftNode[IO](node1, transport)
+        _ <- multi.proposeConfChangeToGroup(
+          GroupId("ghost"),
+          ClusterConfig(voters)
+        )
+      yield ()).unsafeRunSync()
+    }
+    err.groupId shouldBe GroupId("ghost")

@@ -155,24 +155,30 @@ class LockStateMachine[F[_]: Sync](
     locks.get.map { m =>
       Stream
         .emits(
-          m.map { case (k, v) => s"$k:${v.owner}:${v.expiresAt}" }
+          m.toSeq
+            .sortBy(_._1)
+            .map { case (k, v) => s"$k:${v.owner}:${v.expiresAt}" }
             .mkString("\n")
-            .getBytes
+            .getBytes(StandardCharsets.UTF_8)
         )
         .covary[F]
     }
 
   def restore(data: Stream[F, Byte]): F[Unit] =
     data.compile.to(Array).flatMap { bytes =>
-      val entries = new String(bytes)
-        .split("\n")
-        .flatMap { line =>
-          line.split(":") match
-            case Array(lockId, owner, expiresAt) =>
-              Some(lockId -> LockInfo(owner, expiresAt.toLong))
-            case _ => None
-        }
-        .toMap
+      val str = new String(bytes, StandardCharsets.UTF_8)
+      val entries =
+        if str.isEmpty then Map.empty[String, LockInfo]
+        else
+          str
+            .split("\n")
+            .flatMap { line =>
+              line.split(":", 3) match
+                case Array(lockId, owner, expiresAt) =>
+                  Some(lockId -> LockInfo(owner, expiresAt.toLong))
+                case _ => None
+            }
+            .toMap
       locks.set(entries)
     }
 
@@ -203,7 +209,9 @@ import raft.logic.*
 
 object DistributedLockExample extends IOApp.Simple:
 
-  def run: IO[Unit] =
+  def run: IO[Unit] = runScenario.void
+
+  def runScenario: IO[(NodeState, Option[String])] =
     for
       _ <- IO.println("═" * 60)
       _ <- IO.println("  Distributed Lock Service with RAFT Library")
@@ -214,12 +222,15 @@ object DistributedLockExample extends IOApp.Simple:
 
       // Create RAFT node state
       nodeId = NodeId("lock-node-1")
+      peer2 = NodeId("lock-node-2")
+      peer3 = NodeId("lock-node-3")
+      cluster = ClusterConfig(Set(nodeId, peer2, peer3))
       config = RaftConfig(nodeId, 150.millis, 300.millis, 50.millis)
       stateRef <- Ref.of[IO, NodeState](Follower(0, None, None))
       logRef <- Ref.of[IO, Vector[Log]](Vector.empty)
       logIndexRef <- Ref.of[IO, Long](0L)
 
-      // Step 1: Leader election via RaftLogic
+      // Step 1: Two-phase Pre-Vote -> Real Vote leader election via RaftLogic
       _ <- IO.println("Step 1: Leader Election via RaftLogic")
       _ <- IO.println("─" * 40)
 
@@ -231,23 +242,42 @@ object DistributedLockExample extends IOApp.Simple:
         0,
         0,
         3,
-        _ => None
+        _ => None,
+        clusterOpt = Some(cluster)
       )
-      _ <- stateRef.set(trans1.state)
       _ <- IO.println(s"   After ElectionTimeout: ${trans1.state}")
 
-      // Simulate votes and become leader
-      voteResp = RequestVoteResponse(term = 1, voteGranted = true)
-      state2 <- stateRef.get
-      trans2 = RaftLogic.onMessage(state2, voteResp, config, 0, 0, 3, _ => None)
-      trans3 = RaftLogic.onMessage(
-        trans2.state,
-        voteResp,
+      preVoteGrant = RequestVoteResponse(
+        term = 1,
+        voteGranted = true,
+        isPreVote = true
+      )
+      candTrans = RaftLogic.onMessage(
+        trans1.state,
+        preVoteGrant,
         config,
         0,
         0,
         3,
-        _ => None
+        _ => None,
+        sender = Some(peer2),
+        clusterOpt = Some(cluster)
+      )
+      voteGrant = RequestVoteResponse(
+        term = 1,
+        voteGranted = true,
+        isPreVote = false
+      )
+      trans3 = RaftLogic.onMessage(
+        candTrans.state,
+        voteGrant,
+        config,
+        0,
+        0,
+        3,
+        _ => None,
+        sender = Some(peer2),
+        clusterOpt = Some(cluster)
       )
       _ <- stateRef.set(trans3.state)
       _ <- IO.println(s"   After votes: ${trans3.state}")
@@ -309,6 +339,7 @@ object DistributedLockExample extends IOApp.Simple:
       _ <- IO.println(s"   Lock owner: ${owner2.getOrElse("none")}")
 
       // Summary
+      finalState <- stateRef.get
       log <- logRef.get
       _ <- IO.println("\n" + "═" * 60)
       _ <- IO.println(s"  RAFT Log: ${log.size} entries")
@@ -319,4 +350,4 @@ object DistributedLockExample extends IOApp.Simple:
       _ <- IO.println("  • Log - replicated lock commands")
       _ <- IO.println("  • StateMachine[F, LockResult] - lock state")
       _ <- IO.println("═" * 60)
-    yield ()
+    yield (finalState, owner2)

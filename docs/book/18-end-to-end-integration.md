@@ -184,12 +184,22 @@ When a node crashes (`SIGKILL` or power loss) and restarts against an existing `
 
 ## Multi-Tier Integration Testing Architecture
 
-The repository verifies runtime and cross-module behavior at two complementary integration tiers:
+The repository verifies runtime, cross-module SPI factories, and application examples across three complementary end-to-end tiers:
+
+```mermaid
+flowchart TB
+    T1["Tier 1: Runtime Cluster Suites (modules/runtime) - InMemTransport + TestControl Virtual Time"]
+    T2["Tier 2: Cross-Module Full-Stack Suites (modules/itest) - GrpcTransport + MmapWalEngine + StorageEngineFactory + TransportRegistry + Jepsen WGL"]
+    T3["Tier 3: Production Application E2E Suites (modules/examples) - AdvancedShardedLedgerE2ESpec (2PC + Sessions + Crash Recovery) & ExamplesVerificationSpec (All 18 Examples)"]
+
+    T1 --> T2 --> T3
+```
 
 | Tier | Module | Transport & Storage | What It Proves |
 |------|--------|---------------------|----------------|
-| **Runtime Cluster Suites** | `raft-runtime` (`modules/runtime/src/test/scala/raft/integration/`) | Partitionable `InMemTransport` + `InMemLogStore` / `InMemSnapshotStore` + `TestControl` | Virtual-time deterministic elections, 50-fiber concurrent `proposeAndCommit`, `CheckQuorum` minority step-down, `readIndex` / `leaseRead` safety, `transferLeadership`, `3 -> 5` Joint Consensus, leader self-removal, multi-chunk `SnapshotTransfer`, and `MultiRaftNode` 4-shard multiplexing |
-| **Full-Stack E2E Suite** | `raft-itest` (`modules/itest/src/test/scala/raft/itest/`) | Live Netty HTTP/2 `GrpcTransport` (`127.0.0.1:0`) + FFM `MmapWalEngine` (`4 KB` segments) | Ephemeral gRPC peer discovery & `updatePeers`, multi-segment `.wal` rotation, on-disk snapshot compaction, chunked gRPC `InstallSnapshot` to a joining 4th node, hard leader kill + disk crash recovery on the same port, and concurrent WGL linearizability (`KVModel`) |
+| **Runtime Cluster Suites** | `raft-runtime` (`modules/runtime/src/test/scala/raft/integration/`) | Partitionable `InMemTransport` + `InMemLogStore` / `InMemSnapshotStore` + `TestControl` | Virtual-time deterministic elections, 50-fiber concurrent `proposeAndCommit`, `CheckQuorum` minority step-down, `readIndex` / `leaseRead` safety, `transferLeadership`, `3 -> 5` Joint Consensus, leader self-removal, multi-chunk `SnapshotTransfer`, group-commit batching, `Inflights` pipelining, and `MultiRaftNode` coalesced heartbeats |
+| **Full-Stack Cross-Module Suites** | `raft-itest` (`FullStackGrpcMmapClusterSpec`, `MultiRaftGrpcMmapClusterSpec`, `FullLibraryEndToEndSpec`) | Live Netty HTTP/2 `GrpcTransport` + `GrpcTransportFactory` (`TransportRegistry`) + FFM `MmapWalEngine.factory` (`StorageEngineFactory`) | SPI factory wiring, Learner staging + chunked `InstallSnapshot`, `3 -> 5 -> 3` live Joint Consensus & channel eviction, `proposeConfChangeToGroup` per-shard migration, hard host crash + disk recovery, `RaftMetrics` telemetry, and concurrent WGL linearizability (`Write`, `Read`, `CAS`) |
+| **Application & Flagship Example Suites** | `raft-examples` (`AdvancedShardedLedgerE2ESpec`, `ExamplesVerificationSpec`) | 3-host `MultiRaftNode` + `GrpcTransport.multiGroupResource` + 12 `MmapWalEngine` stores | Cross-shard atomic 2PC conservation of money, `(clientId, seqNum)` idempotency across WAL snapshot compaction & leader transfer, mid-2PC coordinator crash recovery (`Preparing` rollback & `Committed` roll-forward), and continuous verification of all 18 runnable examples |
 
 ### Deterministic Virtual-Time Cluster Tests with `TestControl`
 

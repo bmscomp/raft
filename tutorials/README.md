@@ -39,6 +39,7 @@
 | 13 | [Monitoring & Observability](13-observability.md) | Running a Raft cluster in production | Metrics, dashboards, alert rules, debugging playbooks |
 | 14 | [Multi-Datacenter Deployment](14-multi-datacenter.md) | Disaster recovery across data centers | Witness nodes, latency-aware reads, DC failover |
 | 15 | [High-Throughput Batching & Pipelining](15-batching-and-pipelining.md) | Scaling write throughput across NVMe WAL and WAN links | Group-commit `BatchConfig`, `proposeBatchAndCommit`, `Inflights` pipelining |
+| 16 | [Multi-Shard Transactional Ledger (2PC)](16-cross-shard-2pc-ledger.md) | Atomic cross-shard transfers over Multi-Raft + gRPC + FFM WAL | Raft-backed `tx-coord` 2PC, escrow holds, `(clientId, seqNum)` idempotency, crash recovery |
 
 ## How These Differ from the Book
 

@@ -122,6 +122,7 @@ Whether you're learning about distributed consensus for the first time or design
 Run an example to see the library in action:
 
 ```bash
+sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"
 sbt "examples/runMain examples.rawnode.RawNodeHostLoopExample"
 sbt "examples/runMain examples.simulation.DeterministicSimulationExample"
 sbt "examples/runMain examples.kvstore.KVStoreExample"
@@ -130,7 +131,7 @@ sbt "examples/runMain examples.distributed.DistributedTransactionExample"
 sbt "examples/runMain examples.distributed.MultiGroupExample"
 ```
 
-Run the fast unit, property, and deterministic simulation test suites (530 tests across 6 modules, completes in seconds):
+Run the fast unit, property, deterministic simulation, full-stack cross-module integration, and example verification suites (625+ tests across all modules):
 
 ```bash
 sbt test
