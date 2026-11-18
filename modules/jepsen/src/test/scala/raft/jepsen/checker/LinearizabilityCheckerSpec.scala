@@ -32,6 +32,15 @@ class LinearizabilityCheckerSpec extends AnyFlatSpec with Matchers:
   ): Operation =
     Operation(idx, process, OpType.Ok, fn, key, None, value, ts())
 
+  private def info(
+      idx: Long,
+      process: Int,
+      fn: OpFunction,
+      key: String,
+      msg: String
+  ): Operation =
+    Operation(idx, process, OpType.Info, fn, key, None, Some(msg), ts())
+
   "LinearizabilityChecker" should "accept an empty history" in {
     val result = LinearizabilityChecker.check(History.empty, RegisterModel)
     result.linearizable shouldBe true
@@ -296,4 +305,54 @@ class LinearizabilityCheckerSpec extends AnyFlatSpec with Matchers:
     )
     val result = LinearizabilityChecker.check(h, RegisterModel)
     result.linearizable shouldBe true
+  }
+
+  it should "accept a read and CAS observing a value written by an indeterminate (Info) write" in {
+    nextTs = 0
+    val h = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "key-0", Some("c0_init")),
+        ok(1, 0, OpFunction.Write, "key-0", Some("ok")),
+        // Client 2 submits Write("c2_757"), which commits in Raft while client times out -> Info
+        invoke(2, 2, OpFunction.Write, "key-0", Some("c2_757")),
+        info(2, 2, OpFunction.Write, "key-0", "timeout"),
+        // Client 3 subsequently observes "c2_757" and CASes it to "c3_766"
+        invoke(3, 3, OpFunction.CAS, "key-0", Some(("c2_757", "c3_766"))),
+        ok(3, 3, OpFunction.CAS, "key-0", Some("ok")),
+        invoke(4, 1, OpFunction.Read, "key-0"),
+        ok(4, 1, OpFunction.Read, "key-0", Some(Some("c3_766")))
+      )
+    )
+    val result = LinearizabilityChecker.check(h, KVModel)
+    result.linearizable shouldBe true
+  }
+
+  it should "accept a history where an indeterminate (Info) write never took effect" in {
+    nextTs = 0
+    val h = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "key-0", Some("v1")),
+        ok(1, 0, OpFunction.Write, "key-0", Some("ok")),
+        invoke(2, 2, OpFunction.Write, "key-0", Some("dropped")),
+        info(2, 2, OpFunction.Write, "key-0", "timeout"),
+        invoke(3, 1, OpFunction.Read, "key-0"),
+        ok(3, 1, OpFunction.Read, "key-0", Some(Some("v1")))
+      )
+    )
+    val result = LinearizabilityChecker.check(h, KVModel)
+    result.linearizable shouldBe true
+  }
+
+  it should "reject a read that completes BEFORE an indeterminate (Info) write was even invoked" in {
+    nextTs = 0
+    val h = History(
+      Vector(
+        invoke(1, 1, OpFunction.Read, "key-0"),
+        ok(1, 1, OpFunction.Read, "key-0", Some(Some("future-val"))),
+        invoke(2, 2, OpFunction.Write, "key-0", Some("future-val")),
+        info(2, 2, OpFunction.Write, "key-0", "timeout")
+      )
+    )
+    val result = LinearizabilityChecker.check(h, KVModel)
+    result.linearizable shouldBe false
   }

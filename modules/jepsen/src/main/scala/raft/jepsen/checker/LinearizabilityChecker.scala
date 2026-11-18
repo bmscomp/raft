@@ -58,8 +58,8 @@ object LinearizabilityChecker:
       timeoutMs: Long = DefaultTimeoutMs
   ): CheckResult =
     val startTime = System.currentTimeMillis()
-    // Strip indeterminate (Info) ops first, then remove incomplete pairs
-    val cleaned = history.withoutInfo.trimIncomplete
+    // Retain indeterminate (Info) mutations as open-ended invocations while stripping Info reads
+    val cleaned = history.prepareForChecking
     val keys = cleaned.keys
 
     var totalExplored = 0L
@@ -110,7 +110,8 @@ object LinearizabilityChecker:
   ): CheckResult =
     val startTime = System.currentTimeMillis()
     val pairs = history.pairs
-    if pairs.isEmpty then
+    val definiteCount = pairs.count(_._2.isDefined)
+    if definiteCount == 0 then
       return CheckResult(true, Some(Vector.empty), None, CheckStats(0, 1, 0, 0))
 
     val deadline = startTime + timeoutMs
@@ -128,31 +129,33 @@ object LinearizabilityChecker:
       Entry(inv, comp, inv.timestamp, comp.map(_.timestamp))
     }.toArray
 
-    // DFS: try to linearize all entries in some valid order
+    // DFS: try to linearize all definite entries (using indeterminate Info mutations only if/when needed)
     def dfs(
         remaining: Array[Entry],
         modelState: model.State,
         linearized: Vector[Operation]
     ): Option[Vector[Operation]] =
       if System.currentTimeMillis() > deadline then return None
-      if remaining.isEmpty then return Some(linearized)
+      if remaining.isEmpty || remaining.forall(_.comp.isEmpty) then
+        return Some(linearized)
 
       explored += 1
 
-      // An entry can be linearized next if no un-linearized entry
+      // An entry can be linearized next if no un-linearized definite entry
       // has a completion time strictly before this entry's invocation time
       // (real-time precedence constraint)
-      val candidates = remaining.indices.filter { i =>
+      val rawCandidates = remaining.indices.filter { i =>
         val candidate = remaining(i)
         remaining.indices.forall { j =>
           if i == j then true
           else
             val other = remaining(j)
-            // 'other' does NOT have real-time precedence over 'candidate'
-            // i.e., it's NOT the case that other completed before candidate was invoked
             other.compTime.forall(_ >= candidate.invTime)
         }
       }
+      val (definiteCands, infoCands) =
+        rawCandidates.partition(i => remaining(i).comp.isDefined)
+      val candidates = definiteCands ++ infoCands
 
       candidates.iterator
         .map { idx =>
@@ -164,11 +167,13 @@ object LinearizabilityChecker:
             entry.inv.inputValue
           )
 
-          // Check if the observed output matches the model's expected output
-          val observedOutput = entry.comp.flatMap(_.outputValue)
-          val outputMatches = model.matches(expectedOutput, observedOutput)
+          // Indeterminate (Info) entries have no observed completion output and only need to be taken when they mutate state
+          val worthwhile = entry.comp.isDefined || newState != modelState
+          val outputMatches = entry.comp match
+            case None       => true
+            case Some(comp) => model.matches(expectedOutput, comp.outputValue)
 
-          if outputMatches then
+          if worthwhile && outputMatches then
             val newRemaining = remaining.indices
               .filter(_ != idx)
               .map(remaining)
