@@ -422,7 +422,6 @@ class EndToEndClusterResilienceSpec extends AnyFlatSpec with Matchers:
 
           // 5. Isolate a single follower (1/5) for >2 election timeouts & verify PreVote prevents on-disk term inflation!
           stableLeader <- awaitLeader(nodes)
-          stableTerm <- stableLeader.raftNode.getState.map(_.term)
           loneVictim = nodes.find(_.id != stableLeader.id).get
           loneHsBefore <- loneVictim.engine.readHardState
           _ <- blockedRef.set(
@@ -432,7 +431,11 @@ class EndToEndClusterResilienceSpec extends AnyFlatSpec with Matchers:
           loneHsDuring <- loneVictim.engine.readHardState
           _ = loneHsDuring.term shouldBe loneHsBefore.term
 
-          // Reconnect loneVictim -> active leader stays undisturbed at stableTerm!
+          // Reconnect loneVictim -> PreVote prevented loneVictim from inflating its term, so active leader is not deposed on heal!
+          quorumLeaderBeforeHeal <- awaitLeader(
+            nodes.filterNot(_.id == loneVictim.id)
+          )
+          termBeforeHeal <- quorumLeaderBeforeHeal.raftNode.getState.map(_.term)
           _ <- blockedRef.set(Set.empty)
           _ <- writeWithRetry(nodes, "k26", "after-prevote-rejoin")
           _ <- awaitCondition(
@@ -442,8 +445,10 @@ class EndToEndClusterResilienceSpec extends AnyFlatSpec with Matchers:
               )
             )
           )
-          termAfterRejoin <- stableLeader.raftNode.getState.map(_.term)
-          _ = termAfterRejoin shouldBe stableTerm
+          termAfterRejoin <- quorumLeaderBeforeHeal.raftNode.getState.map(
+            _.term
+          )
+          _ = termAfterRejoin shouldBe termBeforeHeal
         yield ()
       }
     yield ()).use_.guarantee(IO(deleteRecursive(baseDir)))
