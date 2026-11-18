@@ -325,6 +325,38 @@ class FullLibraryEndToEndSpec extends AnyFlatSpec with Matchers:
             else IO.sleep(20.millis) *> awaitLeader(peers, retries - 1)
       }
 
+  private def putBatchWithRetry(
+      peers: Iterable[ManagedPeer],
+      commands: Seq[Array[Byte]],
+      attempts: Int = 20
+  ): IO[Vector[LogId]] =
+    awaitLeader(peers).flatMap { ldr =>
+      ldr.raftNode
+        .proposeBatchAndCommit(commands)
+        .timeout(4.seconds)
+        .handleErrorWith {
+          case _ if attempts > 1 =>
+            IO.sleep(35.millis) *>
+              putBatchWithRetry(peers, commands, attempts - 1)
+          case err => IO.raiseError(err)
+        }
+    }
+
+  private def readIndexWithRetry(
+      peers: Iterable[ManagedPeer],
+      attempts: Int = 25
+  ): IO[(ManagedPeer, Long)] =
+    awaitLeader(peers).flatMap { ldr =>
+      ldr.raftNode.readIndex
+        .timeout(4.seconds)
+        .map(idx => (ldr, idx))
+        .handleErrorWith {
+          case _ if attempts > 1 =>
+            IO.sleep(35.millis) *> readIndexWithRetry(peers, attempts - 1)
+          case err => IO.raiseError(err)
+        }
+    }
+
   private def putWithRetry(
       peers: Iterable[ManagedPeer],
       key: String,
@@ -397,8 +429,8 @@ class FullLibraryEndToEndSpec extends AnyFlatSpec with Matchers:
           _ <- p3.traverse_(_.raftNode.start)
 
           // Commit a group-committed batch + sequential puts to trigger snapshot compaction (>10 entries)
-          ldr0 <- awaitLeader(p3)
-          batchIds <- ldr0.raftNode.proposeBatchAndCommit(
+          batchIds <- putBatchWithRetry(
+            p3,
             (1 to 8).map(i => utf8(s"PUT\tk$i\tv$i"))
           )
           _ = batchIds should have size 8
@@ -477,9 +509,10 @@ class FullLibraryEndToEndSpec extends AnyFlatSpec with Matchers:
             delay = 25.millis
           )
 
-          // Verify zero-RTT LeaseRead & quorum ReadIndex on leader n4
-          leaseIdxOpt <- n4Alloc._1.raftNode.leaseRead
-          readIdx <- n4Alloc._1.raftNode.readIndex
+          // Verify quorum ReadIndex (retrying while newly elected leader commits its term NoOp) & zero-RTT LeaseRead
+          readPair <- readIndexWithRetry(p5)
+          (confirmedLdr, readIdx) = readPair
+          leaseIdxOpt <- confirmedLdr.raftNode.leaseRead
           _ = readIdx should be >= 15L
           _ = leaseIdxOpt.foreach(_ should be <= readIdx)
 
