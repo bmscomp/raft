@@ -65,8 +65,10 @@ object StorageBackedSnapshotStore:
       case other =>
         new StorageBackedSnapshotStore[F](other, None, None)
 
-  /** Create a [[SnapshotStore]] backed by any generic [[StorageEngine]]. */
+  /** Create a [[SnapshotStore]] backed by any generic [[StorageEngine]] without
+    * `MmapWalEngine`-specific directory shortcuts.
+    */
   def fromEngine[F[_]: Async](
       engine: StorageEngine[F]
   ): StorageBackedSnapshotStore[F] =
-    apply(engine)
+    new StorageBackedSnapshotStore[F](engine, None, None)

@@ -18,9 +18,17 @@ import scala.concurrent.duration.*
   * @param useTls
   *   whether to enable TLS encryption for peer communication
   * @param tlsCertPath
-  *   path to the TLS certificate file (required when `useTls` is true)
+  *   path to the TLS certificate file (required on servers when `useTls` is
+  *   true, and on clients when `tlsClientAuth` is true)
   * @param tlsKeyPath
-  *   path to the TLS private key file (required when `useTls` is true)
+  *   path to the PKCS#8 PEM private key file (required on servers when `useTls`
+  *   is true, and on clients when `tlsClientAuth` is true)
+  * @param tlsTrustCertPath
+  *   optional PEM CA bundle path used to verify peer certificates (enables
+  *   private cluster CAs; defaults to JVM system trust store when `None`)
+  * @param tlsClientAuth
+  *   when `true` (with `useTls = true`), enforces mutual TLS (`mTLS`
+  *   `ClientAuth.REQUIRE`) so untrusted peers are rejected at handshake
   * @param maxRetries
   *   maximum number of transient RPC retry attempts before giving up
   * @param retryBackoff
@@ -39,6 +47,8 @@ final case class GrpcConfig(
     useTls: Boolean = false,
     tlsCertPath: Option[String] = None,
     tlsKeyPath: Option[String] = None,
+    tlsTrustCertPath: Option[String] = None,
+    tlsClientAuth: Boolean = false,
     maxRetries: Int = 5,
     retryBackoff: FiniteDuration = 25.millis,
     maxRetryBackoff: FiniteDuration = 200.millis,

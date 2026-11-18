@@ -6,7 +6,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Path, StandardOpenOption}
 import java.util.Arrays
 
-import raft.state.{NodeId, RaftError, Term}
+import raft.state.{NodeId, RaftError}
 import raft.storage.HardState
 
 /** Memory-mapped hard state file for persisting `currentTerm` and `votedFor`.
@@ -21,11 +21,11 @@ import raft.storage.HardState
   * '''Binary layout''':
   * {{{
   *   Offset  Size   Field
-  *   0       8      currentTerm (big-endian Long, >= 0)
-  *   8       4      votedForLen (UTF-8 byte length in [0..256], 0 = no vote)
+  *   0       8      currentTerm (8-byte aligned Long, >= 0)
+  *   8       4      votedForLen (4-byte aligned Int in [0..256], 0 = no vote)
   *   12      256    votedFor (UTF-8, zero-padded)
-  *   268     4      crc32 (over bytes 0..267)
-  *   272     8      reserved (zero)
+  *   268     4      crc32 (4-byte aligned Int over bytes [0..268) ++ [272..280))
+  *   272     8      commitIndex (8-byte aligned Long, >= 0)
   * }}}
   */
 class MmapHardState private (
@@ -41,6 +41,7 @@ class MmapHardState private (
     */
   def read: HardState =
     val dataBytes = new Array[Byte](PayloadBytes)
+    val commitBytes = new Array[Byte](8)
     MemorySegment.copy(
       mapped,
       ValueLayout.JAVA_BYTE,
@@ -49,13 +50,23 @@ class MmapHardState private (
       0,
       PayloadBytes
     )
+    MemorySegment.copy(
+      mapped,
+      ValueLayout.JAVA_BYTE,
+      CommitOffset,
+      commitBytes,
+      0,
+      8
+    )
     val storedCrc = mapped.get(ValueLayout.JAVA_INT, CrcOffset)
 
     // Fresh all-zero region before first write
-    if storedCrc == 0 && isAllZero(dataBytes) then HardState.Empty
+    if storedCrc == 0 && isAllZero(dataBytes) && isAllZero(commitBytes) then
+      HardState.Empty
     else
       val crc = new java.util.zip.CRC32()
       crc.update(dataBytes)
+      crc.update(commitBytes)
       val computedCrc = crc.getValue.toInt
       if computedCrc != storedCrc then
         throw RaftError.StorageCorruption(
@@ -80,7 +91,13 @@ class MmapHardState private (
           val utf8 = Arrays.copyOfRange(dataBytes, 12, 12 + votedForLen)
           Some(NodeId(new String(utf8, StandardCharsets.UTF_8)))
 
-      HardState(Term.unsafeFrom(term), votedFor)
+      val commitIdx = mapped.get(ValueLayout.JAVA_LONG, CommitOffset)
+      if commitIdx < 0L then
+        throw RaftError.StorageCorruption(
+          s"MmapHardState negative commitIndex: $commitIdx"
+        )
+
+      HardState(term, votedFor, commitIdx)
 
   /** Atomically write `state`, zero-fill stale bytes, update CRC32, and `msync`
     * to durable storage.
@@ -100,6 +117,11 @@ class MmapHardState private (
     if votedBytes.nonEmpty then
       System.arraycopy(votedBytes, 0, zeroPad, 0, votedBytes.length)
 
+    require(
+      state.commitIndex >= 0L,
+      s"commitIndex must be >= 0, got ${state.commitIndex}"
+    )
+
     mapped.set(ValueLayout.JAVA_LONG, 0, state.currentTerm.value)
     mapped.set(ValueLayout.JAVA_INT, 8, votedBytes.length)
     MemorySegment.copy(
@@ -110,8 +132,10 @@ class MmapHardState private (
       12,
       MaxVotedForBytes
     )
+    mapped.set(ValueLayout.JAVA_LONG, CommitOffset, state.commitIndex)
 
     val dataBytes = new Array[Byte](PayloadBytes)
+    val commitBytes = new Array[Byte](8)
     MemorySegment.copy(
       mapped,
       ValueLayout.JAVA_BYTE,
@@ -120,10 +144,18 @@ class MmapHardState private (
       0,
       PayloadBytes
     )
+    MemorySegment.copy(
+      mapped,
+      ValueLayout.JAVA_BYTE,
+      CommitOffset,
+      commitBytes,
+      0,
+      8
+    )
     val crc = new java.util.zip.CRC32()
     crc.update(dataBytes)
+    crc.update(commitBytes)
     mapped.set(ValueLayout.JAVA_INT, CrcOffset, crc.getValue.toInt)
-    mapped.set(ValueLayout.JAVA_LONG, 272, 0L)
 
     mapped.force()
 
@@ -136,6 +168,7 @@ object MmapHardState:
   private val PayloadBytes: Int = 268
   private val MaxVotedForBytes: Int = 256
   private val CrcOffset: Long = 268L
+  private val CommitOffset: Long = 272L
 
   private def isAllZero(arr: Array[Byte]): Boolean =
     var i = 0

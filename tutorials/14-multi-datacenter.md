@@ -19,74 +19,72 @@ Spreading Raft across datacenters provides **disaster recovery** but introduces 
 
 ### Topology 1: Three DCs, one voter each (simplest)
 
-```
-┌──DC-West────┐   ┌──DC-Central──┐   ┌──DC-East────┐
-│             │   │              │   │             │
-│  Node A     │◄─►│  Node B      │◄─►│  Node C     │
-│  (Voter)    │   │  (Voter)     │   │  (Voter)    │
-│             │   │              │   │             │
-└─────────────┘   └──────────────┘   └─────────────┘
+```mermaid
+flowchart LR
+    subgraph DCW["DC-West"]
+        A["Node A (Voter)"]
+    end
+    subgraph DCC["DC-Central"]
+        B["Node B (Voter)"]
+    end
+    subgraph DCE["DC-East"]
+        C["Node C (Voter)"]
+    end
 
-Quorum: 2 of 3 → survives loss of any 1 DC
-Write latency: max(RTT to DC-Central, RTT to DC-East) ≈ 50-150ms
+    A <--> B
+    B <--> C
+    A <--> C
 ```
+
+> **Quorum**: 2 of 3 (survives loss of any 1 DC). **Write latency**: `max(RTT to DC-Central, RTT to DC-East)` (~50-150ms).
 
 **Trade-off**: Simple, but every write pays cross-DC latency. Best for low-write workloads where disaster recovery is critical.
 
 ### Topology 2: Primary DC with witnesses (recommended)
 
-```
-┌──DC-Primary (us-east)──────────────────────┐
-│                                            │
-│  Node A (Voter/Leader)                     │
-│  Node B (Voter)                            │
-│  Node C (Voter)                            │
-│                                            │
-└────────────────────────────────────────────┘
-        │                   │
-        ▼                   ▼
-┌──DC-Secondary──┐   ┌──DC-Tertiary──┐
-│                │   │               │
-│  Node D        │   │  Node E       │
-│  (Witness)     │   │  (Witness)    │
-│                │   │               │
-└────────────────┘   └───────────────┘
+```mermaid
+flowchart TD
+    subgraph DCP["DC-Primary (us-east)"]
+        PA["Node A (Voter / Leader)"]
+        PB["Node B (Voter)"]
+        PC["Node C (Voter)"]
+    end
+    subgraph DCS["DC-Secondary"]
+        SD["Node D (Witness)"]
+    end
+    subgraph DCT["DC-Tertiary"]
+        TE["Node E (Witness)"]
+    end
 
-Quorum: 3 of 5 → survives loss of primary DC
-Write latency: intra-DC ≈ 1-5ms (witnesses don't slow commits)
+    DCP --> DCS
+    DCP --> DCT
 ```
+
+> **Quorum**: 3 of 5 (survives loss of primary DC). **Write latency**: intra-DC (~1-5ms; witnesses don't slow commits).
 
 **Witness nodes** vote in elections and participate in commit decisions but don't store the full log. They're lightweight quorum participants that enable cross-DC fault tolerance without cross-DC write latency.
 
 ### Topology 3: Two DCs with arbiter (common in practice)
 
-```
-┌──DC-Primary──────────────┐
-│                          │
-│  Node A (Voter/Leader)   │
-│  Node B (Voter)          │
-│                          │
-└──────────────────────────┘
-        │
-        ▼
-┌──DC-Secondary────────────┐
-│                          │
-│  Node C (Voter)          │
-│  Node D (Voter)          │
-│                          │
-└──────────────────────────┘
-        │
-        ▼
-┌──Cloud Arbiter───────────┐
-│                          │
-│  Node E (Witness)        │
-│  (tiebreaker only)       │
-│                          │
-└──────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph DC1["DC-Primary"]
+        N1A["Node A (Voter / Leader)"]
+        N1B["Node B (Voter)"]
+    end
+    subgraph DC2["DC-Secondary"]
+        N2C["Node C (Voter)"]
+        N2D["Node D (Voter)"]
+    end
+    subgraph ARB["Cloud Arbiter"]
+        N3E["Node E (Witness / Tiebreaker)"]
+    end
 
-Quorum: 3 of 5 → survives loss of either DC
-Write latency: cross-DC RTT (must reach Node C or D + E for quorum)
+    DC1 --> DC2
+    DC2 --> ARB
 ```
+
+> **Quorum**: 3 of 5 (survives loss of either DC). **Write latency**: cross-DC RTT (must reach Node C or D + E for quorum).
 
 ## Configuration
 
@@ -327,6 +325,38 @@ Regularly test DC failover in staging:
 4. Heal the partition, verify primary DC nodes rejoin cleanly
 5. Optionally transfer leadership back to primary DC
 
+### Securing Cross-DC Links with Mutual TLS (`mTLS`)
+
+When Raft RPCs traverse WAN backbones or public cloud interconnects, always enable **Mutual TLS (`mTLS`)** on `GrpcConfig` so every peer both encrypts HTTP/2 frames and verifies client X.509 certificates signed by your cluster Root CA (`ClientAuth.REQUIRE`):
+
+```mermaid
+flowchart LR
+    subgraph DC1["DC-Primary (us-east)"]
+        N1["Node A (node-a.crt + ca.crt)"]
+    end
+    subgraph DC2["DC-Secondary (eu-west)"]
+        N2["Node C (node-c.crt + ca.crt)"]
+    end
+    Rogue["Untrusted Host (rogue.crt)"]
+
+    N1 <-->|"mTLS HTTP/2 (Verified X.509 SAN + ClientAuth.REQUIRE)"| N2
+    Rogue -.->|"TLS Handshake Rejected"| N1
+```
+
+```scala
+import raft.transport.grpc.GrpcConfig
+
+val crossDcMtlsGrpc = GrpcConfig(
+  host = "0.0.0.0",
+  port = 9443,
+  useTls = true,
+  tlsCertPath = Some("/etc/raft/tls/node.crt"),
+  tlsKeyPath = Some("/etc/raft/tls/node-pkcs8.key"),
+  tlsTrustCertPath = Some("/etc/raft/tls/cluster-ca.crt"),
+  tlsClientAuth = true
+)
+```
+
 ### Monitoring (additions for multi-DC)
 
 | Metric | Alert | Meaning |
@@ -338,4 +368,4 @@ Regularly test DC failover in staging:
 
 ---
 
-*This completes the extended tutorial series. For API reference, see [Appendix A](../docs/book/appendix-a-quick-reference.md). For the complete book, see the [Table of Contents](../docs/book/README.md).*
+*Next: [Tutorial 16 — Cross-Shard Atomic 2PC Bank Ledger](16-cross-shard-2pc-ledger.md). For API reference, see [Appendix A](../docs/book/appendix-a-quick-reference.md). For the complete book, see the [Table of Contents](../docs/book/README.md).*

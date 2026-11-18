@@ -32,7 +32,7 @@ flowchart TD
 | `modules/storage-mmap` | `raft-storage-mmap` | **JDK 22+/25** | `raft-runtime` (JDK `java.lang.foreign` FFM API) | Off-heap memory-mapped segmented WAL + CRC32 crash recovery |
 | `modules/transport-grpc` | `raft-transport-grpc` | **JDK 22+/25** | `grpc-netty-shaded`, `scalapb-runtime-grpc` | Persistent HTTP/2 peer channels with Protobuf framing |
 | `modules/jepsen` | *(internal)* | JDK 25 | `raft-runtime`, `scalatest` | Wing & Gong linearizability checker + partition/crash nemesis suite |
-| `modules/examples` | *(internal)* | JDK 25 | All modules + `logback-classic` | 17 runnable end-to-end examples |
+| `modules/examples` | *(internal)* | JDK 25 | All modules + `logback-classic` | 18 runnable end-to-end examples |
 
 ---
 
@@ -106,27 +106,60 @@ Key runtime invariants handled automatically by `RaftNode[F]`:
 ```scala
 import java.nio.file.Paths
 import cats.effect.IO
-import raft.storage.{StorageBackedLogStore, StorageBackedStableStore}
+import raft.storage.{
+  EngineBackedRaftStorage,
+  StorageBackedLogStore,
+  StorageBackedSnapshotStore,
+  StorageBackedStableStore
+}
 import raft.storage.mmap.MmapWalEngine
 
 val storageResource =
   MmapWalEngine.resource[IO](Paths.get("/var/lib/raft/group-0")).map { engine =>
-    val logStore    = new StorageBackedLogStore[IO](engine)
-    val stableStore = new StorageBackedStableStore[IO](engine)
-    (logStore, stableStore)
+    val logStore    = StorageBackedLogStore(engine)
+    val stableStore = StorageBackedStableStore(engine)
+    val snapStore   = StorageBackedSnapshotStore(engine)
+    (logStore, stableStore, snapStore)
+  }
+```
+
+### Bridging Sans-I/O `RawNode` Directly to `MmapWalEngine` (`EngineBackedRaftStorage`)
+
+If you want to run your own custom Sans-I/O event loop around `raft.raw.RawNode` while still delegating durable WAL segments, `hard_state.bin` (`term`, `votedFor`, and 8-byte-aligned `commitIndex`), and snapshots to `MmapWalEngine`, use `EngineBackedRaftStorage`:
+
+```mermaid
+flowchart LR
+    RN["RawNode (Sans-I/O Protocol Driver)"]
+    EB["EngineBackedRaftStorage[F] (persistReady / persistLightReady / compactTo)"]
+    MM["MmapWalEngine[F] (hard_state.bin + .wal + snapshots/)"]
+
+    RN -->|"Ready / LightReady"| EB
+    EB -->|"Effectful F[Unit] Flushes"| MM
+    EB -.->|"Synchronous RaftStorage Reads"| RN
+```
+
+```scala
+import cats.effect.IO
+import raft.raw.RawNode
+import raft.state.{ClusterConfig, NodeId, RaftConfig}
+import raft.storage.EngineBackedRaftStorage
+import raft.storage.mmap.MmapWalEngine
+
+def openRawPeer(engine: MmapWalEngine[IO], voters: ClusterConfig): IO[RawNode] =
+  EngineBackedRaftStorage.open[IO](engine, voters).map { storage =>
+    new RawNode(RaftConfig(localId = NodeId("raw-1")), storage)
   }
 ```
 
 ---
 
-## Blueprint 4: Netty HTTP/2 Transport (`raft-transport-grpc`)
+## Blueprint 4: Netty HTTP/2 & Mutual TLS Transport (`raft-transport-grpc`)
 
-`GrpcTransport.resource[F]` binds a Netty HTTP/2 gRPC server (`RaftServiceGrpc.SendEnvelope`) and maintains a lazy pool of persistent `ManagedChannel` connections to peers:
+`GrpcTransport.raftResource[F]` binds a Netty HTTP/2 gRPC server using the binary `ProtobufMessageCodec` (`WireEnvelope`) and maintains a lazy pool of persistent `ManagedChannel` connections to peers. For zero-trust production networks, enable **Mutual TLS (`mTLS`)** (`useTls = true`, `tlsClientAuth = true`) backed by JDK's built-in `SslProvider.JDK` (`ClientAuth.REQUIRE`):
 
 ```scala
 import cats.effect.IO
-import raft.codec.JsonCodec
-import raft.spi.{Transport, TransportConfig}
+import raft.spi.TransportConfig
 import raft.state.NodeId
 import raft.transport.grpc.{GrpcConfig, GrpcTransport}
 
@@ -136,13 +169,19 @@ val peers = Map(
   NodeId("node-3") -> "10.0.1.13:9090"
 )
 
-val raftTransportResource =
-  GrpcTransport
-    .resource[IO](
-      GrpcConfig(host = "0.0.0.0", port = 9090),
-      TransportConfig(local, "0.0.0.0:9090", peers)
-    )
-    .map(raw => Transport.withCodec(raw, JsonCodec.byteCodec))
+val mtlsTransportResource =
+  GrpcTransport.raftResource[IO](
+    GrpcConfig(
+      host = "0.0.0.0",
+      port = 9090,
+      useTls = true,
+      tlsCertPath = Some("/etc/raft/pki/node-1.crt"),
+      tlsKeyPath = Some("/etc/raft/pki/node-1.key"),       // PKCS#8 PEM
+      tlsTrustCertPath = Some("/etc/raft/pki/ca.crt"),     // Cluster Root CA
+      tlsClientAuth = true                                 // Enforce mTLS ClientAuth.REQUIRE
+    ),
+    TransportConfig(local, "0.0.0.0:9090", peers)
+  )
 ```
 
 Notice two operational details built into `GrpcTransport`:

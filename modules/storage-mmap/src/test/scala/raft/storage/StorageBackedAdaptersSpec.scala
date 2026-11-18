@@ -283,3 +283,49 @@ class StorageBackedAdaptersSpec
         .guarantee(IO(deleteRecursive(tmpDir)))
     }
   }
+
+  "EngineBackedRaftStorage" - {
+    "should persist Ready/LightReady, compact snapshots, and recover cleanly from MmapWalEngine" in {
+      val tmpDir = Files.createTempDirectory("raft-engine-raw-storage-")
+      val voters = raft.state.ClusterConfig(
+        Set(NodeId("n1"), NodeId("n2"), NodeId("n3"))
+      )
+      (for
+        eng1 <- MmapWalEngine.open[IO](tmpDir, segmentSize = 2048L)
+        rs1 <- EngineBackedRaftStorage.open[IO](eng1, voters)
+        _ = rs1.initialState shouldBe (HardState.Empty, voters)
+        _ = rs1.firstIndex shouldBe 1L
+        _ = rs1.lastIndex shouldBe 0L
+
+        rd1 = raft.raw.Ready(
+          hardState = Some(HardState(2L, Some(NodeId("n1")), 2L)),
+          entries = Vector(
+            mkLog(1L, 1L, "e1"),
+            mkLog(2L, 2L, "e2"),
+            mkLog(3L, 2L, "e3")
+          )
+        )
+        _ <- rs1.persistReady(rd1)
+        _ <- rs1.persistLightReady(
+          raft.raw.LightReady(commitIndex = Some(3L))
+        )
+        _ = rs1.entries(1L, 4L).map(_.index) shouldBe Vector(1L, 2L, 3L)
+        _ = rs1.term(2L) shouldBe Some(2L)
+        _ <- rs1.compactTo(2L, "snap-at-2".getBytes("UTF-8"))
+        _ = rs1.firstIndex shouldBe 3L
+        _ = rs1.snapshotMetadata.map(_.lastIncludedIndex) shouldBe Some(2L)
+        _ <- eng1.close
+
+        // Re-open MmapWalEngine from disk and verify full state recovery
+        eng2 <- MmapWalEngine.open[IO](tmpDir, segmentSize = 2048L)
+        rs2 <- EngineBackedRaftStorage.open[IO](eng2, voters)
+        _ = rs2.hardState shouldBe HardState(2L, Some(NodeId("n1")), 3L)
+        _ = rs2.snapshotMetadata.map(s =>
+          (s.lastIncludedIndex, new String(s.data, "UTF-8"))
+        ) shouldBe Some((2L, "snap-at-2"))
+        _ = rs2.entries(3L, 4L).map(e => new String(e.data, "UTF-8")) shouldBe
+          Vector("e3")
+        _ <- eng2.close
+      yield succeed).guarantee(IO(deleteRecursive(tmpDir)))
+    }
+  }
