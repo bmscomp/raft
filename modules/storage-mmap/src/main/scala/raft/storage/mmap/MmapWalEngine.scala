@@ -282,21 +282,18 @@ class MmapWalEngine[F[_]: Async] private (
       val splitIndex = index.value
       stateRef.get.flatMap { st =>
         val nextIdxState = st.walIndex.discardBefore(splitIndex)
-        val (keptIds, obsoleteIds) = st.sealedOrder.partition { sid =>
-          st.sealedLeases.get(sid).exists { lease =>
-            val seg = lease.segment
-            val segLast = seg.firstIndex + seg.currentEntryCount - 1L
-            segLast >= splitIndex
-          }
-        }
+        val minKeptSegId =
+          if nextIdxState.isEmpty then Int.MaxValue
+          else nextIdxState.getSegmentId(nextIdxState.firstIndex)
+        val (keptIds, obsoleteIds) =
+          st.sealedOrder.partition(_ >= minKeptSegId)
         val keptMap =
           keptIds.flatMap(id => st.sealedLeases.get(id).map(id -> _)).toMap
 
         val oldActive = st.activeLease
         val oldSeg = oldActive.segment
-        val lastActiveIndex = oldSeg.firstIndex + oldSeg.currentEntryCount - 1L
         val replaceActive =
-          oldSeg.currentEntryCount > 0L && lastActiveIndex < splitIndex
+          oldSeg.currentEntryCount > 0L && nextIdxState.isEmpty
 
         for
           activeReplacement <-
