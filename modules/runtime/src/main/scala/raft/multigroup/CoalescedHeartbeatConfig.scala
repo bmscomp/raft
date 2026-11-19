@@ -2,20 +2,10 @@ package raft.multigroup
 
 import scala.concurrent.duration.*
 
+import raft.state.{ConfigError, Validated}
+
 /** Per-host heartbeat coalescing policy for [[MultiGroupTransport]]
   * (CockroachDB / TiKV Multi-Raft pattern).
-  *
-  * When `enabled = true`, outbound unicast empty `AppendEntriesRequest`
-  * heartbeats (and optionally `AppendEntriesResponse` frames when
-  * `coalesceResponses = true`) across all hosted Raft groups targeting the same
-  * peer physical node are buffered, deduplicated per `(peer, groupId)`, and
-  * flushed together as a single wire batch every `flushInterval` or immediately
-  * upon reaching `maxBatchSize`.
-  *
-  * Data-carrying `AppendEntriesRequest`s (`entries.nonEmpty`), elections,
-  * `InstallSnapshot`, and `TimeoutNow` always bypass the coalescer with zero
-  * added latency — and automatically supersede any stale buffered heartbeat for
-  * the same `(peer, groupId)`.
   */
 final case class CoalescedHeartbeatConfig(
     enabled: Boolean = false,
@@ -32,10 +22,42 @@ final case class CoalescedHeartbeatConfig(
     s"CoalescedHeartbeatConfig.maxBatchSize must be > 0, got $maxBatchSize"
   )
 
+object CoalescedHeartbeatConfig:
+  def validate(
+      enabled: Boolean = false,
+      flushInterval: FiniteDuration = 10.millis,
+      maxBatchSize: Int = 256,
+      coalesceResponses: Boolean = false
+  ): Validated[ConfigError, CoalescedHeartbeatConfig] =
+    Validated.mapN(
+      Validated.check(
+        flushInterval > Duration.Zero,
+        ConfigError.InvalidDuration(
+          "CoalescedHeartbeatConfig.flushInterval",
+          s"must be > 0, got $flushInterval"
+        )
+      ),
+      Validated.check(
+        maxBatchSize > 0,
+        ConfigError.InvalidPositiveInt(
+          "CoalescedHeartbeatConfig.maxBatchSize",
+          maxBatchSize
+        )
+      )
+    )((_, _) =>
+      CoalescedHeartbeatConfig(
+        enabled = enabled,
+        flushInterval = flushInterval,
+        maxBatchSize = maxBatchSize,
+        coalesceResponses = coalesceResponses
+      )
+    )
+
 /** Operational counters reported by [[MultiGroupTransport.coalescerStats]]. */
 final case class CoalescerStats(
     heartbeatsQueued: Long = 0L,
     batchesFlushed: Long = 0L,
     envelopesCoalesced: Long = 0L,
-    envelopesSuperseded: Long = 0L
+    envelopesSuperseded: Long = 0L,
+    droppedUnknownGroupEnvelopes: Long = 0L
 )

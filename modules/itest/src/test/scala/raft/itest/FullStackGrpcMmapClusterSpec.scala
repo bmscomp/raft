@@ -113,7 +113,7 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       port: Int,
       engine: MmapWalEngine[IO],
       grpc: GrpcTransport[IO],
-      raftNode: RaftNode[IO],
+      raftNode: raft.UnitRaftNode[IO],
       stateMachine: FullStackKvStateMachine
   )
 

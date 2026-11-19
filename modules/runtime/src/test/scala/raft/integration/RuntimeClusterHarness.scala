@@ -8,7 +8,7 @@ import cats.effect.std.Random
 import cats.syntax.all.*
 import fs2.{Chunk, Stream}
 
-import raft.RaftNode
+import raft.{RaftNode, UnitRaftNode}
 import raft.impl.{
   DefaultTimerService,
   InMemLogStore,
@@ -99,7 +99,7 @@ object RuntimeClusterHarness:
 
   final case class NodeBundle(
       id: NodeId,
-      node: RaftNode[IO],
+      node: UnitRaftNode[IO],
       transport: InMemTransport[IO],
       logStore: InMemLogStore[IO],
       stableStore: InMemStableStore[IO],
@@ -111,16 +111,16 @@ object RuntimeClusterHarness:
       bundles: Map[NodeId, NodeBundle],
       orderedIds: List[NodeId]
   ):
-    def node(id: NodeId): RaftNode[IO] = bundles(id).node
+    def node(id: NodeId): UnitRaftNode[IO] = bundles(id).node
     def stateMachine(id: NodeId): TestKvStateMachine = bundles(id).stateMachine
     def logStore(id: NodeId): InMemLogStore[IO] = bundles(id).logStore
     def snapshotStore(id: NodeId): InMemSnapshotStore[IO] =
       bundles(id).snapshotStore
 
-    def nodesFor(ids: Iterable[NodeId]): List[(NodeId, RaftNode[IO])] =
+    def nodesFor(ids: Iterable[NodeId]): List[(NodeId, UnitRaftNode[IO])] =
       ids.toList.map(id => id -> bundles(id).node)
 
-    def allNodes: List[(NodeId, RaftNode[IO])] =
+    def allNodes: List[(NodeId, UnitRaftNode[IO])] =
       orderedIds.map(id => id -> bundles(id).node)
 
     /** Bi-directionally isolate `target` from every other node in the mesh. */
@@ -168,7 +168,7 @@ object RuntimeClusterHarness:
         subset: List[NodeId] = orderedIds,
         retries: Int = 400,
         interval: FiniteDuration = 20.millis
-    ): IO[(NodeId, RaftNode[IO])] =
+    ): IO[(NodeId, UnitRaftNode[IO])] =
       subset
         .traverse(id => bundles(id).node.getState.map(st => (id, st)))
         .flatMap { states =>
@@ -192,7 +192,7 @@ object RuntimeClusterHarness:
         minTerm: Long = 0L,
         retries: Int = 250,
         interval: FiniteDuration = 15.millis
-    ): IO[(NodeId, RaftNode[IO])] =
+    ): IO[(NodeId, UnitRaftNode[IO])] =
       subset
         .filterNot(_ == excluded)
         .traverse(id => bundles(id).node.getState.map(st => (id, st)))

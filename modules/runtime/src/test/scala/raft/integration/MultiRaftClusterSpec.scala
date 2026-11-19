@@ -11,7 +11,7 @@ import fs2.Stream
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
-import raft.RaftNode
+import raft.AnyRaftNode
 import raft.codec.JsonCodec
 import raft.impl.{
   DefaultTimerService,
@@ -64,7 +64,7 @@ class MultiRaftClusterSpec extends AnyFlatSpec with Matchers:
       coordinators: Map[NodeId, MultiRaftNode[IO]],
       groupId: GroupId,
       retries: Int = 400
-  ): IO[(NodeId, RaftNode[IO])] =
+  ): IO[(NodeId, AnyRaftNode[IO])] =
     nodeIds
       .traverse { id =>
         coordinators(id).getGroup(groupId).flatMap {

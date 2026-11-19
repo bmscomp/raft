@@ -2,24 +2,19 @@ package raft.multigroup
 
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import scala.annotation.tailrec
 
+import raft.message.{CodecError, SimpleMessageCodec}
 import raft.state.{GroupId, NodeId}
-import raft.message.{SimpleMessageCodec, CodecError}
 
-/** Codec that wraps a standard `String`-based [[SimpleMessageCodec]] to handle
-  * [[GroupEnvelope]] serialization (including optional unicast target routing).
-  *
-  * Wire format:
-  *   - Broadcast (`to = None`): `groupId|GRPENV|fromNodeId|GRPENV|innerMessage`
-  *   - Unicast (`to = Some(dest)`):
-  *     `groupId|GRPENV|fromNodeId|GRPDST|destNodeId|GRPENV|innerMessage`
+/** Codec wrapping a `String`-based [[SimpleMessageCodec]] for [[GroupEnvelope]]
+  * serialization.
   */
 class GroupAwareCodec(inner: SimpleMessageCodec[String]):
 
   private val Delimiter = "|GRPENV|"
   private val DestDelimiter = "|GRPDST|"
 
-  /** Encode a [[GroupEnvelope]] to a wire-format string. */
   def encode(envelope: GroupEnvelope): String =
     val encoded = inner.encode(envelope.message)
     val routeHeader = envelope.to match
@@ -27,7 +22,6 @@ class GroupAwareCodec(inner: SimpleMessageCodec[String]):
       case None       => envelope.from.value
     s"${envelope.groupId.value}$Delimiter$routeHeader$Delimiter$encoded"
 
-  /** Decode a wire-format string into a [[GroupEnvelope]]. */
   def decode(raw: String): Either[CodecError, GroupEnvelope] =
     raw.split(java.util.regex.Pattern.quote(Delimiter), 3) match
       case Array(groupStr, routeStr, msgStr) =>
@@ -46,16 +40,11 @@ class GroupAwareCodec(inner: SimpleMessageCodec[String]):
         )
 
 object GroupAwareCodec:
-  /** Create a length-prefixed binary [[BinaryGroupAwareCodec]] wrapping any
-    * `Array[Byte]` [[SimpleMessageCodec]] (zero text escaping or Base64 bloat).
-    */
   def binary(inner: SimpleMessageCodec[Array[Byte]]): BinaryGroupAwareCodec =
     new BinaryGroupAwareCodec(inner)
 
-/** Length-prefixed binary `Array[Byte]` codec for single and batched
-  * [[GroupEnvelope]] frames in `raft-runtime` (transport-agnostic; for native
-  * Protobuf `MultiRaftWireFrame` over gRPC see `ProtobufMultiGroupCodec` in
-  * `raft-transport-grpc`).
+/** Pure `@tailrec` length-prefixed binary `Array[Byte]` codec for single and
+  * batched [[GroupEnvelope]] frames (`0` `var`s, `0` `while` loops).
   */
 final class BinaryGroupAwareCodec(inner: SimpleMessageCodec[Array[Byte]]):
   private val MagicSingle: Byte = 0x4d // 'M'
@@ -128,35 +117,7 @@ final class BinaryGroupAwareCodec(inner: SimpleMessageCodec[Array[Byte]]):
               val count = buf.getInt()
               if count < 0 || count > 65536 then
                 Left(CodecError.ParseError(s"Invalid batch count: $count"))
-              else
-                val builder = Vector.newBuilder[GroupEnvelope]
-                var idx = 0
-                var err: Option[CodecError] = None
-                while idx < count && err.isEmpty do
-                  if buf.remaining() < 4 then
-                    err = Some(CodecError.ParseError("Truncated frame length"))
-                  else
-                    val frameLen = buf.getInt()
-                    if frameLen < 1 || frameLen > buf.remaining() then
-                      err = Some(
-                        CodecError.ParseError(
-                          s"Invalid frame length: $frameLen"
-                        )
-                      )
-                    else
-                      val slice = new Array[Byte](frameLen)
-                      val _ = buf.get(slice)
-                      val sub = ByteBuffer.wrap(slice)
-                      if sub.get() != MagicSingle then
-                        err = Some(
-                          CodecError.ParseError("Malformed nested frame magic")
-                        )
-                      else
-                        decodeSingleBody(sub) match
-                          case Right(env) => builder += env
-                          case Left(ce)   => err = Some(ce)
-                  idx += 1
-                err.toLeft(builder.result())
+              else decodeFramesLoop(buf, count, Vector.empty)
           case other =>
             Left(
               CodecError.ParseError(
@@ -171,6 +132,30 @@ final class BinaryGroupAwareCodec(inner: SimpleMessageCodec[Array[Byte]]):
               Some(e)
             )
           )
+
+  @tailrec
+  private def decodeFramesLoop(
+      buf: ByteBuffer,
+      remaining: Int,
+      acc: Vector[GroupEnvelope]
+  ): Either[CodecError, Vector[GroupEnvelope]] =
+    if remaining <= 0 then Right(acc)
+    else if buf.remaining() < 4 then
+      Left(CodecError.ParseError("Truncated frame length"))
+    else
+      val frameLen = buf.getInt()
+      if frameLen < 1 || frameLen > buf.remaining() then
+        Left(CodecError.ParseError(s"Invalid frame length: $frameLen"))
+      else
+        val slice = new Array[Byte](frameLen)
+        val _ = buf.get(slice)
+        val sub = ByteBuffer.wrap(slice)
+        if sub.get() != MagicSingle then
+          Left(CodecError.ParseError("Malformed nested frame magic"))
+        else
+          decodeSingleBody(sub) match
+            case Right(env) => decodeFramesLoop(buf, remaining - 1, acc :+ env)
+            case Left(ce)   => Left(ce)
 
   private def decodeSingleBody(
       buf: ByteBuffer

@@ -66,26 +66,25 @@ If your service is already built on Typelevel Cats Effect 3 and FS2, `raft-runti
 
 Typed consensus errors (`RaftError.NotLeader(leaderHint)`, `RaftError.ElectionInProgress`, `RaftError.LeadershipTransferInProgress(target)`, `RaftError.LeaderNotReadyInTerm(term)`, `RaftError.ConfigurationChangeInProgress(pending)`) let your RPC gateway route or retry client requests deterministically without string parsing.
 
-### End-to-End `RaftNode[F]` Coordination Lifecycle
+### End-to-End `RaftNode[F, R]` Coordination Lifecycle
 
-`RaftNode[F]` serializes state transitions under an internal `Mutex[F]` while suspending client fibers **outside** the lock via cancellable `Deferred` promises:
+`RaftNode[F, R]` preserves your `StateMachine[F, R]` output type end-to-end (`proposeAndApply(cmd: Bytes): F[Applied[R]]`), caches recent log terms in a bounded `TermRingBuffer`, batches committed reads via `getRange`, streams incoming snapshots to disk via `FilePendingSnapshot[F]`, supervises background tasks under `Supervisor[F]`, and dispatches all network RPCs **outside** its internal state `Mutex[F]`:
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Node as "RaftNode[F]"
-    participant Logic as "RaftLogic (Pure)"
+    participant Node as "RaftNode[F, R] (Mutex Scope)"
+    participant Out as "Lock-Free Outbound Dispatcher"
     participant Peers as "Follower Quorum"
 
-    Client->>Node: "proposeAndCommit(cmd) / readIndex / proposeConfChange(C_new)"
-    Node->>Logic: "Append or onMessage (with Snapshot-aware termAt)"
-    Logic-->>Node: "Effects (PersistHardState, SendMessage)"
-    Note over Client,Node: "Client fiber awaits Deferred outside Mutex"
-    Node->>Peers: "AppendEntries / Heartbeat / InstallSnapshot"
+    Client->>Node: "proposeAndApply(cmd: Bytes) / readIndex / proposeConfChange"
+    Node->>Node: "Append WAL + update TermRingBuffer (nanoseconds)"
+    Node-->>Out: "Release Mutex & emit OutboundAction batch"
+    Note over Client,Node: "Client fiber awaits Deferred[Applied[R]] outside Mutex"
+    Out->>Peers: "Async sendBatch / broadcast / supervised streaming snapshot"
     Peers-->>Node: "AppendEntriesResponse(success=true)"
-    Node->>Node: "Apply [lastApplied+1 .. commitIndex] to StateMachine"
-    Node->>Node: "If C_old,new committed -> auto-append & replicate C_new"
-    Node-->>Client: "Complete Deferred (LogId / linearizable ReadIndex)"
+    Node->>Node: "Single batched getRange -> StateMachine.apply(log): F[R]"
+    Node-->>Client: "Complete Deferred with Applied(LogId, value: R)"
 ```
 
 Key runtime invariants handled automatically by `RaftNode[F]`:

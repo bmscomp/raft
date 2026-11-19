@@ -150,7 +150,7 @@ class EndToEndClusterResilienceSpec extends AnyFlatSpec with Matchers:
       address: String,
       engine: MmapWalEngine[IO],
       grpc: GrpcTransport[IO],
-      raftNode: RaftNode[IO],
+      raftNode: raft.UnitRaftNode[IO],
       sm: KvMapStateMachine
   )
 

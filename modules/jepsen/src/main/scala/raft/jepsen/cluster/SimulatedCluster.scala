@@ -40,7 +40,7 @@ enum ReadResult:
   */
 class SimulatedCluster[F[_]: Async](
     val nodeIds: List[NodeId],
-    nodesRef: Ref[F, Map[NodeId, RaftNode[F]]],
+    nodesRef: Ref[F, Map[NodeId, RaftNode[F, raft.jepsen.kv.KVResult]]],
     val transports: Map[NodeId, PartitionableTransport[F]],
     stateMachines: Map[NodeId, KVStateMachine[F]],
     stateRef: Ref[F, PartitionState],
@@ -272,11 +272,14 @@ object SimulatedCluster:
             stableStores(id),
             stateMachines(id),
             timerServices(id)
-          ).allocated.map { case (node, _) => id -> node }
+          ).allocated.map { case (node, _) =>
+            id -> (node: RaftNode[F, raft.jepsen.kv.KVResult])
+          }
         }
         .map(_.toMap)
 
-      nodesRef <- Ref.of[F, Map[NodeId, RaftNode[F]]](nodes)
+      nodesRef <- Ref
+        .of[F, Map[NodeId, RaftNode[F, raft.jepsen.kv.KVResult]]](nodes)
       fibersRef <- Ref
         .of[F, Map[NodeId, cats.effect.Fiber[F, Throwable, Unit]]](Map.empty)
     yield new SimulatedCluster[F](

@@ -76,7 +76,9 @@ final case class RaftConfig(
     checkQuorumEnabled: Boolean = true,
     leaseReadEnabled: Boolean = false,
     electionTimeoutTicks: Int = 10,
-    heartbeatIntervalTicks: Int = 1
+    heartbeatIntervalTicks: Int = 1,
+    maxInboundQueueSize: Int = 8192,
+    maxPendingProposals: Int = 8192
 ):
   require(
     electionTimeoutMin > Duration.Zero,
@@ -102,6 +104,14 @@ final case class RaftConfig(
     electionTimeoutTicks > heartbeatIntervalTicks,
     "electionTimeoutTicks must exceed heartbeatIntervalTicks"
   )
+  require(
+    maxInboundQueueSize > 0,
+    s"maxInboundQueueSize must be > 0, got $maxInboundQueueSize"
+  )
+  require(
+    maxPendingProposals > 0,
+    s"maxPendingProposals must be > 0, got $maxPendingProposals"
+  )
 
 object RaftConfig:
   def default(localId: NodeId): RaftConfig = RaftConfig(localId)
@@ -125,7 +135,9 @@ object RaftConfig:
       checkQuorumEnabled: Boolean = true,
       leaseReadEnabled: Boolean = false,
       electionTimeoutTicks: Int = 10,
-      heartbeatIntervalTicks: Int = 1
+      heartbeatIntervalTicks: Int = 1,
+      maxInboundQueueSize: Int = 8192,
+      maxPendingProposals: Int = 8192
   ): Validated[ConfigError, RaftConfig] =
     val checks = Vector(
       NodeId.validate(localId.value).map(_ => ()),
@@ -170,6 +182,20 @@ object RaftConfig:
           "electionTimeoutTicks",
           s"($electionTimeoutTicks) must exceed heartbeatIntervalTicks ($heartbeatIntervalTicks)"
         )
+      ),
+      Validated.check(
+        maxInboundQueueSize > 0,
+        ConfigError.InvalidPositiveInt(
+          "maxInboundQueueSize",
+          maxInboundQueueSize
+        )
+      ),
+      Validated.check(
+        maxPendingProposals > 0,
+        ConfigError.InvalidPositiveInt(
+          "maxPendingProposals",
+          maxPendingProposals
+        )
       )
     )
 
@@ -194,6 +220,8 @@ object RaftConfig:
           checkQuorumEnabled = checkQuorumEnabled,
           leaseReadEnabled = leaseReadEnabled,
           electionTimeoutTicks = electionTimeoutTicks,
-          heartbeatIntervalTicks = heartbeatIntervalTicks
+          heartbeatIntervalTicks = heartbeatIntervalTicks,
+          maxInboundQueueSize = maxInboundQueueSize,
+          maxPendingProposals = maxPendingProposals
         )
       )

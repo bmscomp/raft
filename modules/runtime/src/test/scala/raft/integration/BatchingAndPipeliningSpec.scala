@@ -119,10 +119,10 @@ class BatchingAndPipeliningSpec extends AnyFlatSpec with Matchers:
     def localAddress: IO[String] = underlying.localAddress
     def shutdown: IO[Unit] = underlying.shutdown
 
-  private def awaitLeader(
-      nodes: List[(NodeId, RaftNode[IO])],
+  private def awaitLeader[R](
+      nodes: List[(NodeId, RaftNode[IO, R])],
       retries: Int = 300
-  ): IO[(NodeId, RaftNode[IO])] =
+  ): IO[(NodeId, RaftNode[IO, R])] =
     nodes
       .traverse { case (id, n) => n.getState.map(st => (id, n, st)) }
       .flatMap { states =>
