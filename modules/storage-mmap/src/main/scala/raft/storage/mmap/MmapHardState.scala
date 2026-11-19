@@ -171,12 +171,12 @@ object MmapHardState:
   private val CommitOffset: Long = 272L
 
   private def isAllZero(arr: Array[Byte]): Boolean =
-    var i = 0
-    var allZero = true
-    while i < arr.length && allZero do
-      if arr(i) != 0.toByte then allZero = false
-      i += 1
-    allZero
+    @scala.annotation.tailrec
+    def loop(i: Int): Boolean =
+      if i >= arr.length then true
+      else if arr(i) != 0.toByte then false
+      else loop(i + 1)
+    loop(0)
 
   /** Open or create the hard state file at the given path. */
   def open(path: Path): MmapHardState =
