@@ -90,7 +90,7 @@ class SnapshotLifecycleSpec extends AnyFlatSpec with Matchers:
 
     val trans = RaftLogic.onMessage(follower, chunkReq, config, 50, 8, 3)
 
-    trans.state shouldBe Follower(10, None, Some(n2))
+    trans.state shouldBe Follower(10, None, Some(n2), commitIndex = 0L)
     trans.effects should contain(ResetElectionTimer)
     trans.effects should contain(
       SendMessage(
@@ -115,7 +115,7 @@ class SnapshotLifecycleSpec extends AnyFlatSpec with Matchers:
 
     val trans = RaftLogic.onMessage(follower, finalReq, config, 50, 8, 3)
 
-    trans.state shouldBe Follower(10, None, Some(n2))
+    trans.state shouldBe Follower(10, None, Some(n2), commitIndex = 200L)
     trans.effects should contain(PersistHardState(10, None))
     trans.effects should contain(
       InstallSnapshot(SnapshotMetadata(200, 9, None))

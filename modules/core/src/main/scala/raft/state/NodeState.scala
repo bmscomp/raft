@@ -1,55 +1,71 @@
 package raft.state
 
+import java.nio.charset.StandardCharsets
 import scala.collection.immutable.Set as ImmutableSet
 
 /** Unique, opaque identifier for a RAFT node in the cluster. */
 opaque type NodeId = String
 
 object NodeId:
+  /** Maximum UTF-8 byte length supported by on-disk `hard_state.bin`. */
+  val MaxUtf8Bytes: Int = 256
+
   def apply(id: String): NodeId = id
+
+  /** Pure, stack-trace-free smart constructor validating non-emptiness, absence
+    * of control characters, and the 256-byte UTF-8 persistence bound.
+    */
+  def validate(raw: String): Validated[ConfigError, NodeId] =
+    if raw.isEmpty then Validated.invalid(ConfigError.EmptyNodeId)
+    else
+      val hasControl = raw.exists(c => c < 0x20 || c == 0x7f)
+      val utf8Len = raw.getBytes(StandardCharsets.UTF_8).length
+      Validated
+        .mapN(
+          Validated.check(
+            !hasControl,
+            ConfigError.ControlCharacterInNodeId(raw)
+          ),
+          Validated.check(
+            utf8Len <= MaxUtf8Bytes,
+            ConfigError.OversizedNodeId(utf8Len, MaxUtf8Bytes)
+          )
+        )((_, _) => raw)
+
+  given Ordering[NodeId] = Ordering.String
 
   extension (id: NodeId) def value: String = id
 
-/** Pure, immutable consensus role state machine (§5.1). */
+/** Pure, immutable consensus role state machine (§5.1).
+  *
+  * Every role carries `commitIndex` so a node's committed watermark remains
+  * monotonically non-decreasing across Follower updates, elections, leadership,
+  * and higher-term step-downs.
+  */
 enum NodeState:
   /** Passive follower state (§5.2). */
   case Follower(
       term: Long,
       votedFor: Option[NodeId] = None,
-      leaderId: Option[NodeId] = None
+      leaderId: Option[NodeId] = None,
+      commitIndex: Long = 0L
   )
 
   /** Speculative Pre-Vote state (§9.6) — never increments persistent term. */
   case PreCandidate(
       term: Long,
-      preVotesReceived: ImmutableSet[NodeId] = ImmutableSet.empty
+      preVotesReceived: ImmutableSet[NodeId] = ImmutableSet.empty,
+      commitIndex: Long = 0L
   )
 
   /** Active election candidate state (§5.2). */
   case Candidate(
       term: Long,
-      votesReceived: ImmutableSet[NodeId] = ImmutableSet.empty
+      votesReceived: ImmutableSet[NodeId] = ImmutableSet.empty,
+      commitIndex: Long = 0L
   )
 
-  /** Authoritative cluster leader state (§5.3, §6.4, §3.10).
-    *
-    * @param term
-    *   the term in which this node was elected leader
-    * @param nextIndex
-    *   per-peer map of the next log index to send
-    * @param matchIndex
-    *   per-peer map of the highest log index known to be replicated
-    * @param commitIndex
-    *   the highest log entry index known to be committed
-    * @param transferTarget
-    *   optional target `NodeId` during an active leadership transfer (§3.10)
-    * @param pendingReads
-    *   in-flight `ReadIndex` requests awaiting heartbeat quorum confirmation
-    * @param leaseUntil
-    *   logical tick/timestamp until which leader lease is valid
-    * @param recentlyActive
-    *   peers that responded during the current `CheckQuorum` window
-    */
+  /** Authoritative cluster leader state (§5.3, §6.4, §3.10). */
   case Leader(
       term: Long,
       nextIndex: Map[NodeId, Long] = Map.empty,
@@ -64,13 +80,41 @@ enum NodeState:
 object NodeState:
   extension (state: NodeState)
     def term: Long = state match
-      case Follower(t, _, _)              => t
-      case PreCandidate(t, _)             => t
-      case Candidate(t, _)                => t
-      case Leader(t, _, _, _, _, _, _, _) => t
+      case f: Follower     => f.term
+      case p: PreCandidate => p.term
+      case c: Candidate    => c.term
+      case l: Leader       => l.term
+
+    def typedTerm: Term = Term.unsafeFrom(state.term)
+
+    def commitIndex: Long = state match
+      case f: Follower     => f.commitIndex
+      case p: PreCandidate => p.commitIndex
+      case c: Candidate    => c.commitIndex
+      case l: Leader       => l.commitIndex
+
+    def typedCommitIndex: LogIndex = LogIndex.unsafeFrom(state.commitIndex)
+
+    def isLeader: Boolean = state match
+      case _: Leader => true
+      case _         => false
+
+    def isFollower: Boolean = state match
+      case _: Follower => true
+      case _           => false
+
+    def leaderHint(selfId: NodeId): Option[NodeId] = state match
+      case _: Leader   => Some(selfId)
+      case f: Follower => f.leaderId
+      case _           => None
 
     def stepDown(newTerm: Long): Follower =
-      Follower(newTerm, None, None)
+      Follower(newTerm, None, None, state.commitIndex)
+
+  extension (state: Follower)
+    def withFollowerCommitIndex(index: Long): Follower =
+      if index > state.commitIndex then state.copy(commitIndex = index)
+      else state
 
   extension (state: PreCandidate)
     def withPreVote(voterId: NodeId): PreCandidate =
@@ -109,10 +153,6 @@ object NodeState:
 
     /** Compute the highest commit index replicated on a majority of voters
       * whose entry term equals `state.term` (Raft §5.4.2).
-      *
-      * Includes the leader's own `leaderLastIndex` alongside follower
-      * `matchIndex` entries so a 3-node cluster with 1 failed follower still
-      * advances `commitIndex` once the leader + 1 follower hold the entry.
       */
     def calculateCommitIndex(
         clusterSize: Int,
@@ -136,7 +176,7 @@ object NodeState:
           if followerIndices.size >= clusterSize then followerIndices
           else followerIndices :+ inferredSelf
         val sorted = allIndices.sorted(Ordering[Long].reverse)
-        val majorityPos = (clusterSize / 2)
+        val majorityPos = clusterSize / 2
         val quorumReplicated =
           sorted.lift(majorityPos).getOrElse(state.commitIndex)
         (quorumReplicated to (state.commitIndex + 1L) by -1L)

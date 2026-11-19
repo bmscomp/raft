@@ -33,30 +33,17 @@ case class Transition(state: NodeState, effects: List[Effect])
 
 That's it. The entire Raft protocol is driven by calling this function in a loop. Your runtime looks like:
 
-```
-             ┌──────────┐
-             │  Event   │  (message from peer, timer, client request)
-             └────┬─────┘
-                  │
-                  ▼
-    ┌───────────────────────────┐
-    │  RaftLogic.onMessage(     │
-    │    currentState,          │
-    │    event,                 │
-    │    config,                │
-    │    lastLogIndex,          │
-    │    lastLogTerm,           │
-    │    clusterSize            │
-    │  )                        │
-    └────────────┬──────────────┘
-                 │
-                 ▼
-         ┌──────────────┐
-         │  Transition  │
-         │              │
-         │  .state  ─────────→  update currentState
-         │  .effects ────────→  execute each effect
-         └──────────────┘
+```mermaid
+flowchart TD
+    EV["Inbound Event (Peer RPC, Logical Timer, Admin Request)"]
+    LOGIC["RaftLogic.onMessage(state, event, config, lastLogIndex, lastLogTerm, ...)"]
+    TR["Transition(nextState, effects: List[Effect])"]
+    ST["Atomically Swap NodeState"]
+    EFF["Execute Effects (PersistHardState -> AppendLogs -> SendMessage)"]
+
+    EV --> LOGIC --> TR
+    TR --> ST
+    TR --> EFF
 ```
 
 There's something worth noting about the `getTermAt` parameter: it's a function, not a value. The protocol logic sometimes needs to look up the term of a specific log entry (for example, to fill in the `prevLogTerm` field of an `AppendEntries` request). Rather than passing the entire log, we pass a lookup function. This keeps the interface minimal — the protocol logic only queries the log when it needs to, and only for the specific information it requires.
@@ -67,23 +54,16 @@ There's something worth noting about the `getTermAt` parameter: it's a function,
 
 Every node in a Raft cluster is in exactly one of four states. These are modeled as a sealed trait hierarchy:
 
-```
-                     ElectionTimeout
-         ┌──────────────────────────────┐
-         │                              ▼
-    ┌──────────┐  preVote        ┌──────────────┐
-    │ Follower │────────────────→│ PreCandidate │
-    └──────────┘                 └──────────────┘
-         ▲                              │ majority pre-votes
-         │ higher term                  ▼
-         │                      ┌──────────────┐
-         │                      │  Candidate   │
-         │                      └──────────────┘
-         │ steps down                   │ majority votes
-         │                              ▼
-         │                      ┌──────────────┐
-         └──────────────────────│    Leader    │
-                                └──────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Follower
+    Follower --> PreCandidate: "ElectionTimeout (preVoteEnabled)"
+    Follower --> Candidate: "ElectionTimeout (!preVoteEnabled or TimeoutNow)"
+    PreCandidate --> Candidate: "PreVote Quorum Granted"
+    PreCandidate --> Follower: "Higher Term / Leader AppendEntries"
+    Candidate --> Leader: "Vote Quorum Granted"
+    Candidate --> Follower: "Higher Term / Leader AppendEntries"
+    Leader --> Follower: "Higher Term / CheckQuorum Step-Down"
 ```
 
 Let's look at each state in detail.
@@ -91,10 +71,11 @@ Let's look at each state in detail.
 ### Follower
 
 ```scala
-case class Follower(
+case Follower(
   term: Long,
-  votedFor: Option[NodeId],
-  leaderId: Option[NodeId]
+  votedFor: Option[NodeId] = None,
+  leaderId: Option[NodeId] = None,
+  commitIndex: Long = 0L
 )
 ```
 

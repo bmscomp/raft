@@ -978,7 +978,7 @@ class FullLibraryEndToEndSpec extends AnyFlatSpec with Matchers:
           _ <- allocateMultiHost(
             h4,
             port = 0,
-            List(shardAlpha -> cfgMigratedAlpha),
+            List(shardAlpha -> cfgInitial),
             Map.empty
           ).allocated.flatMap(pair => hostsRef.update(_.updated(h4, pair)))
 

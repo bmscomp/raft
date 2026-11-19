@@ -151,8 +151,8 @@ class RaftNodeClusterSpec extends AnyFlatSpec with Matchers:
           follower = cluster.node(followerId)
           _ <- cluster.awaitCondition(
             follower.getState.map {
-              case Follower(_, _, Some(hint)) => hint == leaderId
-              case _                          => false
+              case f: Follower => f.leaderId.contains(leaderId)
+              case _           => false
             }
           )
           propRes <- follower.proposeAndCommit(utf8("bad=write")).attempt

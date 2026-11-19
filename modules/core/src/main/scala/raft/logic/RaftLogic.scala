@@ -1,43 +1,21 @@
 package raft.logic
 
-import raft.state.*
-import raft.state.NodeState.*
-import raft.message.*
-import raft.message.RaftMessage.*
+import scala.annotation.tailrec
+
 import raft.effect.*
 import raft.effect.Effect.*
+import raft.message.*
+import raft.message.RaftMessage.*
+import raft.state.*
+import raft.state.NodeState.*
 
-/** Pure, deterministic RAFT state transition functions — the Functional Core of
-  * the consensus engine.
-  *
-  * Every transition is 100% referentially transparent: zero mutable state, zero
-  * wall-clock calls, zero exceptions for control flow, and zero I/O imports.
+/** Pure, deterministic RAFT state transition functions — 100% referentially
+  * transparent (`0` mutable `var`s, `0` `while` loops, `0` runtime casts, `0`
+  * exceptions, and `0` I/O imports).
   */
 object RaftLogic:
 
-  /** Primary pure message dispatcher.
-    *
-    * @param state
-    *   current node role and consensus state
-    * @param message
-    *   incoming RPC or logical timeout event
-    * @param config
-    *   local node protocol configuration
-    * @param lastLogIndex
-    *   index of the last entry in the local log (or snapshot index if empty)
-    * @param lastLogTerm
-    *   term of the last entry in the local log
-    * @param clusterSize
-    *   voting cluster size (used when `clusterOpt` is not supplied)
-    * @param getTermAt
-    *   synchronous lookup returning `Some(term)` at a given 1-based log index
-    * @param sender
-    *   optional authenticated sender `NodeId` for response deduplication and
-    *   follower progress tracking
-    * @param clusterOpt
-    *   optional full [[ClusterConfig]] enabling Joint Consensus, Learners, and
-    *   Witnesses
-    */
+  /** Primary pure message dispatcher. */
   def onMessage(
       state: NodeState,
       message: RaftMessage,
@@ -96,7 +74,16 @@ object RaftLogic:
         onInstallSnapshot(state, req, lastLogIndex, getTermAt)
 
       case resp: InstallSnapshotResponse =>
-        onInstallSnapshotResponse(state, resp, sender)
+        onInstallSnapshotResponse(
+          state,
+          resp,
+          config,
+          lastLogIndex,
+          clusterSize,
+          getTermAt,
+          sender,
+          clusterOpt
+        )
 
       case req: ReadIndexRequest =>
         onReadIndex(
@@ -132,10 +119,26 @@ object RaftLogic:
         )
 
       case req: AddServerRequest =>
-        onAddServer(state, req, config, lastLogIndex, sender, clusterOpt)
+        onAddServer(
+          state,
+          req,
+          config,
+          lastLogIndex,
+          getTermAt,
+          sender,
+          clusterOpt
+        )
 
       case req: RemoveServerRequest =>
-        onRemoveServer(state, req, config, lastLogIndex, sender, clusterOpt)
+        onRemoveServer(
+          state,
+          req,
+          config,
+          lastLogIndex,
+          getTermAt,
+          sender,
+          clusterOpt
+        )
 
       case ElectionTimeout =>
         onElectionTimeout(
@@ -148,7 +151,14 @@ object RaftLogic:
         )
 
       case HeartbeatTimeout =>
-        onHeartbeatTimeout(state, config, lastLogIndex, lastLogTerm, getTermAt)
+        onHeartbeatTimeout(
+          state,
+          config,
+          lastLogIndex,
+          lastLogTerm,
+          getTermAt,
+          clusterOpt
+        )
 
       case CheckQuorumTimeout =>
         onCheckQuorum(state, config, clusterSize, clusterOpt)
@@ -156,6 +166,19 @@ object RaftLogic:
       case _: ReadIndexResponse | _: AddServerResponse |
           _: RemoveServerResponse =>
         Transition.pure(state)
+
+  private def stepDownEffectsFromLeader(
+      state: NodeState,
+      reason: String,
+      leaderHint: Option[NodeId]
+  ): List[Effect] =
+    state match
+      case l: Leader =>
+        val rejectedReads = l.pendingReads.keys.toList.sorted.map { id =>
+          ReadIndexRejected(id, reason, leaderHint)
+        }
+        StopLeader :: rejectedReads
+      case _ => Nil
 
   /** Handle a vote response with an explicit voter `NodeId` (deterministic,
     * idempotent deduplication).
@@ -172,9 +195,11 @@ object RaftLogic:
   ): Transition =
     if !resp.isPreVote && resp.term > state.term then
       val stepped = state.stepDown(resp.term)
-      val stopEff = state match
-        case _: Leader => List(StopLeader)
-        case _         => Nil
+      val stopEff = stepDownEffectsFromLeader(
+        state,
+        s"Leader stepped down to higher term ${resp.term}",
+        None
+      )
       Transition(
         stepped,
         stopEff ++ List(
@@ -193,6 +218,7 @@ object RaftLogic:
             if wonPreVote then
               startRealElection(
                 p.term,
+                p.commitIndex,
                 config,
                 lastLogIndex,
                 lastLogTerm,
@@ -211,6 +237,7 @@ object RaftLogic:
             if won then
               promoteToLeader(
                 c.term,
+                c.commitIndex,
                 config,
                 lastLogIndex,
                 lastLogTerm,
@@ -222,9 +249,9 @@ object RaftLogic:
         case _ =>
           Transition.pure(state)
 
-  /** Fallback when legacy caller invokes `onMessage(state, VoteResponse)`
-    * without supplying `sender: Option[NodeId]`: synthesizes a deterministic ID
-    * derived purely from current vote set cardinality (zero mutable state).
+  /** Legacy compatibility helper when caller invokes `onMessage` without
+    * supplying `sender`: synthesizes a deterministic ID from current vote
+    * count.
     */
   private def onAnonymousVoteResponse(
       state: NodeState,
@@ -255,6 +282,7 @@ object RaftLogic:
 
   private def promoteToLeader(
       term: Long,
+      priorCommitIndex: Long,
       config: RaftConfig,
       lastLogIndex: Long,
       lastLogTerm: Long,
@@ -265,6 +293,7 @@ object RaftLogic:
       .getOrElse(Set.empty[NodeId])
     val baseLeader = Leader(
       term = term,
+      commitIndex = priorCommitIndex,
       recentlyActive = Set(config.localId)
     ).initializeIndices(followers, lastLogIndex)
     val heartbeat = AppendEntriesRequest(
@@ -273,7 +302,7 @@ object RaftLogic:
       prevLogIndex = lastLogIndex,
       prevLogTerm = lastLogTerm,
       entries = Seq.empty,
-      leaderCommit = 0L
+      leaderCommit = priorCommitIndex
     )
     Transition.withEffects(
       baseLeader,
@@ -284,6 +313,7 @@ object RaftLogic:
 
   private def startRealElection(
       priorTerm: Long,
+      priorCommitIndex: Long,
       config: RaftConfig,
       lastLogIndex: Long,
       lastLogTerm: Long,
@@ -299,6 +329,7 @@ object RaftLogic:
     if alreadyHasQuorum then
       val leaderTrans = promoteToLeader(
         newTerm,
+        priorCommitIndex,
         config,
         lastLogIndex,
         lastLogTerm,
@@ -309,7 +340,7 @@ object RaftLogic:
         PersistHardState(newTerm, Some(config.localId)) :: leaderTrans.effects
       )
     else
-      val candidate = Candidate(newTerm, selfVotes)
+      val candidate = Candidate(newTerm, selfVotes, priorCommitIndex)
       val voteReq = RequestVoteRequest(
         term = newTerm,
         candidateId = config.localId,
@@ -332,16 +363,19 @@ object RaftLogic:
       lastLogIndex: Long,
       getTermAt: Long => Option[Long]
   ): Transition =
-    if req.term < state.term || (req.term == state.term && state
-        .isInstanceOf[Leader])
-    then
+    if req.term < state.term || (req.term == state.term && state.isLeader) then
       val response = AppendEntriesResponse(state.term, success = false, 0L)
       Transition.withEffect(state, SendMessage(req.leaderId, response))
     else
       val steppedDown = req.term > state.term
-      val stopLeaderEff = state match
-        case _: Leader if steppedDown => List(StopLeader)
-        case _                        => Nil
+      val stopLeaderEff =
+        if steppedDown then
+          stepDownEffectsFromLeader(
+            state,
+            s"Leader stepped down to term ${req.term}",
+            Some(req.leaderId)
+          )
+        else Nil
 
       val votedForAfterStep: Option[NodeId] = state match
         case f: Follower if !steppedDown  => f.votedFor
@@ -353,101 +387,141 @@ object RaftLogic:
       val hardStateEff =
         if steppedDown then List(PersistHardState(req.term, None)) else Nil
 
-      val followerState =
-        Follower(req.term, votedForAfterStep, Some(req.leaderId))
+      val prevCommit = state.commitIndex
+      val baseFollower =
+        Follower(req.term, votedForAfterStep, Some(req.leaderId), prevCommit)
 
-      val prevMatches =
-        if req.prevLogIndex == 0L then true
-        else
-          getTermAt(req.prevLogIndex) match
-            case Some(actualTerm) => actualTerm == req.prevLogTerm
-            case None             => false
-
-      if !prevMatches then
-        val (conflictIdx, conflictTerm) =
-          computeConflictHint(req.prevLogIndex, lastLogIndex, getTermAt)
+      // Guard already-committed prefix (tikv/raft-rs §5.3 safety rule):
+      // never conflict-check or truncate indices <= prevCommit.
+      if req.prevLogIndex < prevCommit &&
+        (req.prevLogIndex + req.entries.size.toLong) <= prevCommit
+      then
         val response = AppendEntriesResponse(
           term = req.term,
-          success = false,
-          matchIndex = 0L,
-          conflictIndex = Some(conflictIdx),
-          conflictTerm = conflictTerm
+          success = true,
+          matchIndex = prevCommit
         )
         Transition(
-          followerState,
+          baseFollower,
           stopLeaderEff ++ hardStateEff ++ List(
             ResetElectionTimer,
             SendMessage(req.leaderId, response)
           )
         )
       else
-        val (truncateEff, entriesToAppend) =
-          resolveConflictingSuffix(req.entries, getTermAt)
-        val newMatchIndex = req.prevLogIndex + req.entries.size
-        val response = AppendEntriesResponse(
-          term = req.term,
-          success = true,
-          matchIndex = newMatchIndex
-        )
-        val appendEff =
-          if entriesToAppend.nonEmpty then List(AppendLogs(entriesToAppend))
-          else Nil
-        val commitEff =
-          if req.leaderCommit > 0L then
-            val commitTo = math.min(req.leaderCommit, newMatchIndex)
-            if commitTo > 0L then
-              List(CommitEntries(LogIndex.unsafeFrom(commitTo)))
+        val (effectivePrevIdx, effectiveEntries, prevMatches) =
+          if req.prevLogIndex < prevCommit then
+            val skip = (prevCommit - req.prevLogIndex).toInt
+            val anchorTerm = req.entries(skip - 1).term
+            val matches = getTermAt(prevCommit).forall(_ == anchorTerm)
+            (prevCommit, req.entries.drop(skip), matches)
+          else
+            val matches =
+              req.prevLogIndex == 0L ||
+                getTermAt(req.prevLogIndex).contains(req.prevLogTerm)
+            (req.prevLogIndex, req.entries, matches)
+
+        if !prevMatches then
+          val (conflictIdx, conflictTerm) =
+            computeConflictHint(
+              effectivePrevIdx,
+              lastLogIndex,
+              prevCommit,
+              getTermAt
+            )
+          val response = AppendEntriesResponse(
+            term = req.term,
+            success = false,
+            matchIndex = 0L,
+            conflictIndex = Some(conflictIdx),
+            conflictTerm = conflictTerm
+          )
+          Transition(
+            baseFollower,
+            stopLeaderEff ++ hardStateEff ++ List(
+              ResetElectionTimer,
+              SendMessage(req.leaderId, response)
+            )
+          )
+        else
+          val (truncateEff, entriesToAppend) =
+            resolveConflictingSuffix(effectiveEntries, prevCommit, getTermAt)
+          val newMatchIndex = effectivePrevIdx + effectiveEntries.size.toLong
+          val candidateCommit =
+            if req.leaderCommit > prevCommit then
+              math.max(prevCommit, math.min(req.leaderCommit, newMatchIndex))
+            else prevCommit
+          val finalFollower = Follower(
+            req.term,
+            votedForAfterStep,
+            Some(req.leaderId),
+            candidateCommit
+          )
+          val response = AppendEntriesResponse(
+            term = req.term,
+            success = true,
+            matchIndex = newMatchIndex
+          )
+          val appendEff =
+            if entriesToAppend.nonEmpty then List(AppendLogs(entriesToAppend))
             else Nil
-          else Nil
+          val commitEff =
+            if candidateCommit > prevCommit then
+              List(CommitEntries(LogIndex.unsafeFrom(candidateCommit)))
+            else Nil
 
-        Transition(
-          followerState,
-          stopLeaderEff ++ hardStateEff ++ List(ResetElectionTimer) ++
-            truncateEff ++ appendEff ++ commitEff ++
-            List(SendMessage(req.leaderId, response))
-        )
+          Transition(
+            finalFollower,
+            stopLeaderEff ++ hardStateEff ++ List(ResetElectionTimer) ++
+              truncateEff ++ appendEff ++ commitEff ++
+              List(SendMessage(req.leaderId, response))
+          )
 
-  /** Compute §5.3 fast-backtracking conflict hints (`conflictIndex`,
-    * `conflictTerm`).
-    */
+  /** Compute §5.3 fast-backtracking conflict hints purely via `@tailrec`. */
   private def computeConflictHint(
       prevLogIndex: Long,
       lastLogIndex: Long,
+      commitIndex: Long,
       getTermAt: Long => Option[Long]
   ): (Long, Option[Long]) =
+    @tailrec
+    def rewindTermStart(idx: Long, cTerm: Long, floor: Long): Long =
+      if idx > floor && getTermAt(idx - 1L).contains(cTerm) then
+        rewindTermStart(idx - 1L, cTerm, floor)
+      else idx
+
     if lastLogIndex < prevLogIndex then (lastLogIndex + 1L, None)
     else
       getTermAt(prevLogIndex) match
         case None        => (math.max(1L, lastLogIndex + 1L), None)
         case Some(cTerm) =>
-          var firstIdx = prevLogIndex
-          while firstIdx > 1L && getTermAt(firstIdx - 1L).contains(cTerm) do
-            firstIdx -= 1L
-          (firstIdx, Some(cTerm))
+          val floor = math.max(1L, commitIndex + 1L)
+          (rewindTermStart(prevLogIndex, cTerm, floor), Some(cTerm))
 
-  /** Raft §5.3 Rule 3 & 4: If an existing entry conflicts with a new one (same
-    * index, different terms), delete the existing entry and all that follow it;
-    * append any new entries not already in the log (preserving idempotency if a
-    * delayed/duplicate RPC carries a prefix of an already-longer matching log).
+  /** Raft §5.3 Rule 3 & 4: truncate uncommitted conflicting suffix (`>
+    * commitIndex`) and append new entries idempotently.
     */
   private def resolveConflictingSuffix(
       incoming: Seq[Log],
+      commitIndex: Long,
       getTermAt: Long => Option[Long]
   ): (List[Effect], Seq[Log]) =
-    incoming.indexWhere { entry =>
+    val uncommitted = incoming.dropWhile(_.index <= commitIndex)
+    uncommitted.indexWhere { entry =>
       getTermAt(entry.index) match
         case Some(existingTerm) => existingTerm != entry.term
         case None               => false
     } match
       case -1 =>
-        val firstMissing = incoming.indexWhere(e => getTermAt(e.index).isEmpty)
+        val firstMissing =
+          uncommitted.indexWhere(e => getTermAt(e.index).isEmpty)
         if firstMissing == -1 then (Nil, Seq.empty)
-        else (Nil, incoming.drop(firstMissing))
+        else (Nil, uncommitted.drop(firstMissing))
       case conflictPos =>
-        val conflictEntry = incoming(conflictPos)
+        val conflictEntry = uncommitted(conflictPos)
         (
           List(TruncateLog(conflictEntry.index)),
-          incoming.drop(conflictPos)
+          uncommitted.drop(conflictPos)
         )
 
   private def onAppendEntriesResponse(
@@ -461,9 +535,11 @@ object RaftLogic:
       clusterOpt: Option[ClusterConfig]
   ): Transition =
     if resp.term > state.term then
-      val stopEff = state match
-        case _: Leader => List(StopLeader)
-        case _         => Nil
+      val stopEff = stepDownEffectsFromLeader(
+        state,
+        s"Leader stepped down to term ${resp.term}",
+        None
+      )
       Transition(
         state.stepDown(resp.term),
         stopEff ++ List(
@@ -598,17 +674,15 @@ object RaftLogic:
         case _ =>
           Transition.pure(state)
 
+  @tailrec
   private def findLastIndexWithTerm(
       targetTerm: Long,
-      maxIndex: Long,
+      currentIndex: Long,
       getTermAt: Long => Option[Long]
   ): Option[Long] =
-    var i = maxIndex
-    var found: Option[Long] = None
-    while i >= 1L && found.isEmpty do
-      if getTermAt(i).contains(targetTerm) then found = Some(i)
-      i -= 1L
-    found
+    if currentIndex < 1L then None
+    else if getTermAt(currentIndex).contains(targetTerm) then Some(currentIndex)
+    else findLastIndexWithTerm(targetTerm, currentIndex - 1L, getTermAt)
 
   private def resolvePendingReads(
       leader: Leader,
@@ -619,24 +693,22 @@ object RaftLogic:
   ): (Leader, List[Effect]) =
     if leader.pendingReads.isEmpty then (leader, Nil)
     else
-      var remaining = Map.empty[String, PendingRead]
-      val readyBuf = List.newBuilder[Effect]
-      leader.pendingReads.foreach { case (id, pending) =>
-        val updatedAcks = pending.acks + localId + ackFrom
-        val hasQuorum = clusterOpt match
-          case Some(cl) => cl.hasQuorum(updatedAcks)
-          case None     => updatedAcks.size > clusterSize / 2
-        if hasQuorum then readyBuf += ReadIndexReady(id, pending.readIndex)
-        else remaining = remaining.updated(id, pending.copy(acks = updatedAcks))
-      }
-      (leader.copy(pendingReads = remaining), readyBuf.result())
+      val (remaining, readyEffectsRev) =
+        leader.pendingReads.foldLeft(
+          (Map.empty[String, PendingRead], List.empty[Effect])
+        ) { case ((remAcc, effAcc), (id, pending)) =>
+          val updatedAcks = pending.acks + localId + ackFrom
+          val hasQuorum = clusterOpt match
+            case Some(cl) => cl.hasQuorum(updatedAcks)
+            case None     => updatedAcks.size > clusterSize / 2
+          if hasQuorum then
+            (remAcc, ReadIndexReady(id, pending.readIndex) :: effAcc)
+          else (remAcc.updated(id, pending.copy(acks = updatedAcks)), effAcc)
+        }
+      (leader.copy(pendingReads = remaining), readyEffectsRev.reverse)
 
   /** Handle `RequestVoteRequest` (§5.2, §9.6 Pre-Vote, §6 Leader Stickiness,
     * §3.10 Leadership Transfer).
-    *
-    * **Critical Pre-Vote Safety (§9.6)**: When `req.isPreVote == true`, the
-    * receiver MUST NEVER increment its term, step down from Leader/Candidate,
-    * clear `votedFor`, or emit `PersistHardState`.
     */
   private def onRequestVote(
       state: NodeState,
@@ -699,9 +771,14 @@ object RaftLogic:
         )
       else
         val steppedDown = req.term > state.term
-        val stopLeaderEff = state match
-          case _: Leader if steppedDown => List(StopLeader)
-          case _                        => Nil
+        val stopLeaderEff =
+          if steppedDown then
+            stepDownEffectsFromLeader(
+              state,
+              s"Leader stepped down to term ${req.term}",
+              None
+            )
+          else Nil
 
         val baseState = if steppedDown then state.stepDown(req.term) else state
         baseState match
@@ -769,8 +846,8 @@ object RaftLogic:
       clusterSize: Int,
       clusterOpt: Option[ClusterConfig]
   ): Transition =
-    val isEligibleVoter = clusterOpt.forall(_.isVoter(config.localId))
-    if !isEligibleVoter then Transition.pure(state)
+    val isEligibleCampaigner = clusterOpt.forall(_.canCampaign(config.localId))
+    if !isEligibleCampaigner then Transition.pure(state)
     else
       state match
         case _: Leader =>
@@ -783,6 +860,7 @@ object RaftLogic:
           if singleVoterQuorum then
             startRealElection(
               f.term,
+              f.commitIndex,
               config,
               lastLogIndex,
               lastLogTerm,
@@ -790,7 +868,8 @@ object RaftLogic:
               clusterOpt
             )
           else if config.preVoteEnabled then
-            val preCandidate = PreCandidate(f.term, Set(config.localId))
+            val preCandidate =
+              PreCandidate(f.term, Set(config.localId), f.commitIndex)
             val preVoteReq = RequestVoteRequest(
               term = f.term + 1L,
               candidateId = config.localId,
@@ -806,6 +885,7 @@ object RaftLogic:
           else
             startRealElection(
               f.term,
+              f.commitIndex,
               config,
               lastLogIndex,
               lastLogTerm,
@@ -814,7 +894,8 @@ object RaftLogic:
             )
 
         case p: PreCandidate =>
-          val preCandidate = PreCandidate(p.term, Set(config.localId))
+          val preCandidate =
+            PreCandidate(p.term, Set(config.localId), p.commitIndex)
           val preVoteReq = RequestVoteRequest(
             term = p.term + 1L,
             candidateId = config.localId,
@@ -831,6 +912,7 @@ object RaftLogic:
         case c: Candidate =>
           startRealElection(
             c.term,
+            c.commitIndex,
             config,
             lastLogIndex,
             lastLogTerm,
@@ -883,8 +965,10 @@ object RaftLogic:
       config: RaftConfig,
       lastLogIndex: Long,
       lastLogTerm: Long,
-      getTermAt: Long => Option[Long]
+      getTermAt: Long => Option[Long],
+      clusterOpt: Option[ClusterConfig]
   ): Transition =
+    val _ = clusterOpt
     state match
       case l: Leader =>
         val hbEffects =
@@ -893,9 +977,7 @@ object RaftLogic:
       case _ =>
         Transition.pure(state)
 
-  /** `ReadIndex` handler (§6.4): confirms leadership before serving a
-    * linearizable local read.
-    */
+  /** `ReadIndex` handler (§6.4). */
   private def onReadIndex(
       state: NodeState,
       req: ReadIndexRequest,
@@ -980,7 +1062,7 @@ object RaftLogic:
     state match
       case l: Leader if req.term <= l.term =>
         if req.target == config.localId then Transition.pure(l)
-        else if clusterOpt.exists(!_.isVoter(req.target)) then
+        else if clusterOpt.exists(!_.canCampaign(req.target)) then
           Transition.pure(l)
         else
           val targetMatch = l.matchIndex.getOrElse(req.target, 0L)
@@ -1012,10 +1094,7 @@ object RaftLogic:
       case _ =>
         Transition.pure(state)
 
-  /** `TimeoutNowRequest` handler (§3.10): recipient immediately starts a real
-    * election with `isTransfer = true`, bypassing Pre-Vote and peer
-    * `leaderStickiness`.
-    */
+  /** `TimeoutNowRequest` handler (§3.10). */
   private def onTimeoutNow(
       state: NodeState,
       req: TimeoutNowRequest,
@@ -1026,10 +1105,13 @@ object RaftLogic:
       clusterOpt: Option[ClusterConfig]
   ): Transition =
     if req.term < state.term then Transition.pure(state)
+    else if clusterOpt.exists(!_.canCampaign(config.localId)) then
+      Transition.pure(state)
     else
       val baseTerm = math.max(state.term, req.term)
       startRealElection(
         baseTerm,
+        state.commitIndex,
         config,
         lastLogIndex,
         lastLogTerm,
@@ -1038,9 +1120,7 @@ object RaftLogic:
         isTransfer = true
       )
 
-  /** `CheckQuorumTimeout` handler (§6.2): leader steps down if partitioned from
-    * a quorum of voters during the election window.
-    */
+  /** `CheckQuorumTimeout` handler (§6.2). */
   private def onCheckQuorum(
       state: NodeState,
       config: RaftConfig,
@@ -1056,16 +1136,14 @@ object RaftLogic:
         if hasQuorum then
           Transition.pure(l.copy(recentlyActive = Set(config.localId)))
         else
-          val rejectReads = l.pendingReads.keys.toList.map { id =>
-            ReadIndexRejected(
-              id,
-              "Leader stepped down: CheckQuorum failed",
-              None
-            )
-          }
+          val stopEffs = stepDownEffectsFromLeader(
+            l,
+            "Leader stepped down: CheckQuorum failed",
+            None
+          )
           Transition(
-            Follower(l.term, Some(config.localId), None),
-            (StopLeader :: ResetElectionTimer :: rejectReads)
+            Follower(l.term, Some(config.localId), None, l.commitIndex),
+            StopLeader :: ResetElectionTimer :: stopEffs.drop(1)
           )
       case _ =>
         Transition.pure(state)
@@ -1087,17 +1165,24 @@ object RaftLogic:
       )
     else
       val steppedDown = req.term > state.term
-      val stopEff = state match
-        case _: Leader if steppedDown => List(StopLeader)
-        case _                        => Nil
+      val stopEff =
+        if steppedDown then
+          stepDownEffectsFromLeader(
+            state,
+            s"Leader stepped down to term ${req.term}",
+            Some(req.leaderId)
+          )
+        else Nil
       val votedFor = state match
         case f: Follower if !steppedDown => f.votedFor
         case _                           => None
       val persistEff =
         if steppedDown then List(PersistHardState(req.term, None)) else Nil
-      val follower = Follower(req.term, votedFor, Some(req.leaderId))
+      val prevCommit = state.commitIndex
 
       if !req.done then
+        val follower =
+          Follower(req.term, votedFor, Some(req.leaderId), prevCommit)
         Transition(
           follower,
           stopEff ++ persistEff ++ List(
@@ -1114,8 +1199,15 @@ object RaftLogic:
         )
       else
         val alreadyCovered =
-          req.lastIncludedIndex <= lastLogIndex &&
-            getTermAt(req.lastIncludedIndex).contains(req.lastIncludedTerm)
+          req.lastIncludedIndex <= prevCommit || (
+            req.lastIncludedIndex <= lastLogIndex &&
+              getTermAt(req.lastIncludedIndex).contains(req.lastIncludedTerm)
+          )
+        val nextCommit =
+          if alreadyCovered then prevCommit
+          else math.max(prevCommit, req.lastIncludedIndex)
+        val follower =
+          Follower(req.term, votedFor, Some(req.leaderId), nextCommit)
         val installEff =
           if alreadyCovered then Nil
           else
@@ -1125,6 +1217,9 @@ object RaftLogic:
               ),
               CommitEntries(LogIndex.unsafeFrom(req.lastIncludedIndex))
             )
+        val reportedMatch =
+          if req.lastIncludedIndex <= prevCommit then prevCommit
+          else req.lastIncludedIndex
         Transition(
           follower,
           stopEff ++ persistEff ++ List(
@@ -1135,7 +1230,7 @@ object RaftLogic:
               InstallSnapshotResponse(
                 req.term,
                 success = true,
-                matchIndex = req.lastIncludedIndex
+                matchIndex = reportedMatch
               )
             )
           )
@@ -1144,12 +1239,19 @@ object RaftLogic:
   private def onInstallSnapshotResponse(
       state: NodeState,
       resp: InstallSnapshotResponse,
-      sender: Option[NodeId]
+      config: RaftConfig,
+      leaderLastIndex: Long,
+      clusterSize: Int,
+      getTermAt: Long => Option[Long],
+      sender: Option[NodeId],
+      clusterOpt: Option[ClusterConfig]
   ): Transition =
     if resp.term > state.term then
-      val stopEff = state match
-        case _: Leader => List(StopLeader)
-        case _         => Nil
+      val stopEff = stepDownEffectsFromLeader(
+        state,
+        s"Leader stepped down to term ${resp.term}",
+        None
+      )
       Transition(
         state.stepDown(resp.term),
         stopEff ++ List(PersistHardState(resp.term, None), ResetElectionTimer)
@@ -1157,29 +1259,65 @@ object RaftLogic:
     else
       (state, sender) match
         case (l: Leader, Some(peerId))
-            if resp.success && resp.matchIndex > 0L =>
+            if resp.term == l.term && resp.success && resp.matchIndex > 0L =>
           val newMatch =
             math.max(l.matchIndex.getOrElse(peerId, 0L), resp.matchIndex)
           val newNext =
             math.max(l.nextIndex.getOrElse(peerId, 1L), newMatch + 1L)
+          val updated0 = l
+            .withMatchIndex(peerId, newMatch)
+            .withNextIndex(peerId, newNext)
+            .copy(recentlyActive = l.recentlyActive + config.localId + peerId)
+          val newCommit = clusterOpt match
+            case Some(cl) =>
+              updated0.calculateCommitIndexForCluster(
+                config.localId,
+                cl,
+                leaderLastIndex,
+                getTermAt
+              )
+            case None =>
+              updated0.calculateCommitIndex(
+                clusterSize,
+                getTermAt,
+                leaderLastIndex
+              )
+          val commitEff =
+            if newCommit > l.commitIndex then
+              List(CommitEntries(LogIndex.unsafeFrom(newCommit)))
+            else Nil
+          Transition(updated0.withCommitIndex(newCommit), commitEff)
+        case (l: Leader, Some(peerId)) if resp.term == l.term && resp.success =>
           Transition.pure(
-            l.withMatchIndex(peerId, newMatch).withNextIndex(peerId, newNext)
+            l.copy(recentlyActive = l.recentlyActive + config.localId + peerId)
           )
         case _ =>
           Transition.pure(state)
+
+  private def hasCommittedInLeaderTerm(
+      l: Leader,
+      lastLogIndex: Long,
+      getTermAt: Long => Option[Long]
+  ): Boolean =
+    if l.commitIndex == 0L then lastLogIndex == 0L
+    else getTermAt(l.commitIndex).contains(l.term)
 
   private def onAddServer(
       state: NodeState,
       req: AddServerRequest,
       config: RaftConfig,
       lastLogIndex: Long,
+      getTermAt: Long => Option[Long],
       sender: Option[NodeId],
       clusterOpt: Option[ClusterConfig]
   ): Transition =
     state match
       case l: Leader =>
+        val readyInTerm = hasCommittedInLeaderTerm(l, lastLogIndex, getTermAt)
         clusterOpt match
-          case Some(cl) if !cl.isInJointConsensus =>
+          case Some(cl)
+              if !cl.isInJointConsensus && l.transferTarget.isEmpty &&
+                (req.isLearner || readyInTerm) =>
             val role =
               if req.isLearner then NodeRole.Learner else NodeRole.Voter
             val nextCfg =
@@ -1188,14 +1326,13 @@ object RaftLogic:
                 cl.beginJointConsensus(
                   cl.members.updated(req.newServer, NodeRole.Voter)
                 )
-            val cfgEntry = Log(
+            val cfgEntry = Log.configuration(
               index = lastLogIndex + 1L,
               term = l.term,
-              logType = LogType.Configuration,
-              data = ClusterConfig.encode(nextCfg)
+              config = nextCfg
             )
             val updatedLeader = l
-              .withNextIndex(req.newServer, lastLogIndex + 2L)
+              .withNextIndex(req.newServer, cfgEntry.index)
               .withMatchIndex(req.newServer, 0L)
             val replyEff = sender.toList.map { s =>
               SendMessage(
@@ -1240,24 +1377,27 @@ object RaftLogic:
       req: RemoveServerRequest,
       config: RaftConfig,
       lastLogIndex: Long,
+      getTermAt: Long => Option[Long],
       sender: Option[NodeId],
       clusterOpt: Option[ClusterConfig]
   ): Transition =
     state match
       case l: Leader =>
+        val readyInTerm = hasCommittedInLeaderTerm(l, lastLogIndex, getTermAt)
         clusterOpt match
           case Some(cl)
-              if !cl.isInJointConsensus && (cl.members - req.server).values
-                .exists(r => r == NodeRole.Voter || r == NodeRole.Witness) =>
+              if !cl.isInJointConsensus && l.transferTarget.isEmpty &&
+                (cl.isLearner(req.server) || readyInTerm) &&
+                (cl.members - req.server).values
+                  .exists(r => r == NodeRole.Voter || r == NodeRole.Witness) =>
             val targetMembers = cl.members - req.server
             val nextCfg =
               if cl.isLearner(req.server) then cl.removeMember(req.server)
               else cl.beginJointConsensus(targetMembers)
-            val cfgEntry = Log(
+            val cfgEntry = Log.configuration(
               index = lastLogIndex + 1L,
               term = l.term,
-              logType = LogType.Configuration,
-              data = ClusterConfig.encode(nextCfg)
+              config = nextCfg
             )
             val replyEff = sender.toList.map { s =>
               SendMessage(

@@ -29,7 +29,9 @@ object Snapshot:
       lastIncludedTerm = pending.lastIncludedTerm,
       data = Stream
         .emits(pending.chunks)
-        .flatMap(chunk => Stream.chunk(Chunk.array(chunk))),
+        .flatMap(chunk =>
+          Stream.chunk(Chunk.byteBuffer(chunk.asReadOnlyByteBuffer))
+        ),
       config = pending.config
     )
 

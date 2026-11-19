@@ -302,7 +302,10 @@ private final class RaftNodeImpl[F[_]: Async](
       _ <- logger.info(s"Starting RAFT node ${config.localId.value}")
       hs <- stableStore.hardState
       _ <- recoverSnapshotAndConfig
-      _ <- stateRef.set(Follower(hs.term, hs.votedFor, None))
+      recoveredApplied <- lastAppliedRef.get
+      _ <- stateRef.set(
+        Follower(hs.term, hs.votedFor, None, recoveredApplied)
+      )
       _ <- resetElectionTimer
       fiber <- runEventLoop.start
       _ <- eventLoopFiberRef.set(Some(fiber))
@@ -928,7 +931,14 @@ private final class RaftNodeImpl[F[_]: Async](
                     case _         => Async[F].unit
                   stopEff *>
                     stableStore.setHardState(Term.unsafeFrom(req.term), None) *>
-                    stateRef.set(Follower(req.term, None, Some(req.leaderId)))
+                    stateRef.set(
+                      Follower(
+                        req.term,
+                        None,
+                        Some(req.leaderId),
+                        state.commitIndex
+                      )
+                    )
                 else Async[F].unit
               val replyTerm = math.max(state.term, req.term)
               stepDownEffs *>
@@ -2116,7 +2126,9 @@ private final class RaftNodeImpl[F[_]: Async](
         logger.info(
           s"Leader ${config.localId.value} removed from voters at index $committedIdx; stepping down"
         ) *>
-          stateRef.set(Follower(l.term, None, None)) *>
+          stateRef.set(
+            Follower(l.term, None, None, math.max(l.commitIndex, committedIdx))
+          ) *>
           handleLeaderStepDown
 
       case _ =>

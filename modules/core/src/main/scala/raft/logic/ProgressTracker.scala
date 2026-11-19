@@ -125,18 +125,6 @@ final case class Progress(
 
   /** Backtrack `nextIdx` on `AppendEntries` rejection using §5.3 conflict
     * hints.
-    *
-    * @param rejectedIndex
-    *   the `prevLogIndex` or match hint reported by the follower
-    * @param conflictIndex
-    *   optional first index of conflicting term (or follower `lastIndex + 1`)
-    * @param conflictTerm
-    *   optional term of the conflicting entry on the follower
-    * @param findLastIndexOfTerm
-    *   leader lookup returning highest index in leader log with `term`, if any
-    * @return
-    *   `(updatedProgress, decremented)` — `false` if rejection was stale/out of
-    *   order
     */
   def maybeDecrTo(
       rejectedIndex: Long,
@@ -189,8 +177,8 @@ enum VoteResult:
   case Lost
   case Pending
 
-/** Cluster-wide quorum, election, and replication progress tracker inspired by
-  * `tikv/raft-rs`'s `ProgressTracker`.
+/** Pure, immutable cluster-wide quorum, election, and replication progress
+  * tracker inspired by `tikv/raft-rs`'s `ProgressTracker`.
   */
 final case class ProgressTracker(
     config: ClusterConfig,
@@ -213,13 +201,11 @@ final case class ProgressTracker(
       if voterSet.isEmpty then VoteResult.Won
       else
         val maj = (voterSet.size / 2) + 1
-        var yes = 0
-        var no = 0
-        voterSet.foreach { id =>
+        val (yes, no) = voterSet.foldLeft((0, 0)) { case ((y, n), id) =>
           votes.get(id) match
-            case Some(true)  => yes += 1
-            case Some(false) => no += 1
-            case None        => ()
+            case Some(true)  => (y + 1, n)
+            case Some(false) => (y, n + 1)
+            case None        => (y, n)
         }
         if yes >= maj then VoteResult.Won
         else if (voterSet.size - no) < maj then VoteResult.Lost
@@ -245,7 +231,7 @@ final case class ProgressTracker(
             progress.get(id).map(_.matched).getOrElse(0L)
           )
         val sorted = matchedVals.sorted(Ordering[Long].reverse)
-        sorted(voterSet.size / 2)
+        sorted.lift(voterSet.size / 2).getOrElse(0L)
 
     val newCommitted = committedFor(config.newVoters)
     config.oldVoters match
@@ -265,6 +251,17 @@ final case class ProgressTracker(
     copy(progress = progress.map { case (id, p) =>
       id -> p.copy(recentActive = id == localId)
     })
+
+  /** Update a single peer's [[Progress]], returning `(nextTracker, output)`. */
+  def modifyProgress[A](
+      id: NodeId,
+      defaultOut: A
+  )(fn: Progress => (Progress, A)): (ProgressTracker, A) =
+    progress.get(id) match
+      case Some(p) =>
+        val (np, out) = fn(p)
+        (copy(progress = progress.updated(id, np)), out)
+      case None => (this, defaultOut)
 
   /** Update a single peer's [[Progress]]. */
   def updateProgress(id: NodeId, fn: Progress => Progress): ProgressTracker =

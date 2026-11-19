@@ -15,34 +15,31 @@ The Rust ecosystem (`tikv/raft-rs` and `openraft`, building on `etcd/raft`) inve
 
 In this library, `raft-core` has **zero third-party dependencies** (`libraryDependencies` is empty in `Compile`). You can drive consensus at two levels:
 
-- **`RaftLogic`**: Pure stateless functions `(NodeState, RaftMessage, ...) => Transition(NodeState, List[Effect])` for fine-grained transition inspection and teaching.
-- **`RawNode`**: Full stateful-in-memory Sans-I/O consensus engine pairing `RaftLogic` with `ProgressTracker`, bounded `Inflights` pipelining, logical tick clocks, and an unstable log overlay, emitting atomic `Ready` and `LightReady` work batches.
+- **`RaftLogic`**: Pure stateless functions `(NodeState, RaftMessage, ...) => Transition(NodeState, List[Effect])` for single-step transition inspection.
+- **`ConsensusKernel` & `RawNode`**: `ConsensusKernel` (`raft.kernel.ConsensusKernel`) is a **100% pure, `var`-free Mealy state machine** `(KernelState, input, RaftStorage) => KernelState` combining role transitions, `ProgressTracker` (`Probe` / `Replicate` / `Snapshot` + `Inflights`), SplitMix64 election jitter, multi-chunk snapshot reassembly, Joint Consensus rollback, and `Witness` payload stripping. `RawNode` is a thin ~120-line cursor over `ConsensusKernel` emitting atomic `Ready` and `LightReady` work batches.
 
 ---
 
 ## Architectural Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         HOST SYSTEM (Your Code)                         │
-│   Timers / Event Loop  ·  WAL / RocksDB / Mmap  ·  TCP / gRPC / Actors  │
-└──────────┬─────────────────────────▲────────────────────────┬───────────┘
-           │ 1. tick()               │ 3. ready()             │ 4. advance(rd)
-           │    step(from, msg)      │    Ready {             │    -> LightReady
-           │    propose(bytes)       │      messages,         │
-           │    readIndex(ctx)       │      entries,          │
-           ▼                         │      hardState,        ▼
-┌────────────────────────────────────┴────────────────────────────────────┐
-│                    raft-core: RawNode (Zero I/O)                        │
-│                                                                         │
-│  ┌──────────────────┐  ┌─────────────────────────┐  ┌────────────────┐  │
-│  │  Role & Clocks   │  │    ProgressTracker      │  │ Unstable Log   │  │
-│  │  Follower /      │  │  Probe / Replicate /    │  │ Overlay +      │  │
-│  │  PreCandidate /  │  │  Snapshot + Inflights   │  │ Read-Only      │  │
-│  │  Candidate /     │  │  Dual Joint Quorum      │  │ RaftStorage    │  │
-│  │  Leader          │  └─────────────────────────┘  └────────────────┘  │
-│  └──────────────────┘                                                   │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Host["HOST SYSTEM (Virtual Threads / Cats Effect / Simulator)"]
+        LOOP["Event Loop: tick() / step(from, msg) / proposeBytes(payload) / readIndex(ctx)"]
+        EXEC["Ready Executor: send(messages) -> WAL fsync -> send(persistedMessages) -> apply(committedEntries)"]
+    end
+
+    subgraph Core["raft-core: RawNode -> Pure ConsensusKernel (Zero I/O, Zero vars)"]
+        KS["Immutable KernelState (NodeState + Monotonic commitIndex + SplitMix64 PRNG)"]
+        PT["ProgressTracker (Probe / Replicate / Snapshot + Inflights + Dual Joint Quorum)"]
+        UL["UnstableLog Overlay + PendingSnapshot Reassembler + Read-Only RaftStorage"]
+    end
+
+    LOOP -->|"Pure Step"| KS
+    KS --- PT
+    KS --- UL
+    KS -->|"ready()"| EXEC
+    EXEC -->|"advance(rd) -> LightReady"| KS
 ```
 
  Notice a critical directional rule borrowed from `tikv/raft-rs`:
@@ -79,24 +76,23 @@ Why synchronous? Because consensus state machines need fast `term(prevLogIndex)`
 
 A naive Raft leader blasts `AppendEntries` to every peer on every write regardless of whether that peer is online, lagging by 500,000 entries, or recovering from a partition. `RawNode` instead tracks each voter, learner, and witness through a 3-state machine modeled on `tikv/raft-rs`:
 
-```
-                  matched & moved
-     ┌─────────┐ ───────────────► ┌─────────────┐
-     │  Probe  │                  │  Replicate  │
-     │ (max 1) │ ◄─────────────── │ (pipelined) │
-     └────┬────┘  reject / stall  └──────┬──────┘
-          │                              │
-          │ log compacted                │ log compacted
-          ▼                              ▼
-     ┌──────────────────────────────────────────┐
-     │                 Snapshot                 │
-     │   (paused until snapshotIndex matched)   │
-     └──────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Probe
+    Probe --> Replicate: "ACK matched & moved"
+    Replicate --> Probe: "Rejection or stalled window"
+    Probe --> Snapshot: "Follower nextIdx < firstIndex"
+    Replicate --> Snapshot: "Follower nextIdx < firstIndex"
+    Snapshot --> Probe: "InstallSnapshotResponse(matched >= snapIdx)"
 ```
 
 1. **`Probe`**: Used right after an election or after a rejection/packet drop. At most **one** probe RPC is in flight (`paused = true` until ACK/NACK). Rejections carry `(conflictTerm, conflictIndex)` hints so the leader jumps backward over entire conflicting terms in a single RTT instead of decrementing `nextIndex` one entry at a time.
-2. **`Replicate`**: Entered once a follower confirms its exact `matchIndex`. The leader optimistically advances `nextIndex` and pipelines multiple `AppendEntries` batches concurrently, bounded by a zero-allocation `Inflights` ring buffer (`config.pipelining.maxInflight`) for natural backpressure. If packet loss causes `nextIndex` to outrun `matchIndex`, the next heartbeat ACK transitions the peer back to `Probe` so lost entries are immediately retransmitted.
-3. **`Snapshot`**: Entered when a follower requires an entry older than `storage.firstIndex` (already compacted). Replication pauses while an `InstallSnapshot` stream brings the follower up to `pendingSnapshot`.
+2. **`Replicate`**: Entered once a follower confirms its exact `matchIndex`. The leader optimistically advances `nextIndex` and pipelines multiple `AppendEntries` batches concurrently, bounded by a zero-allocation `Inflights` ring buffer (`config.pipelining.maxInflight`) for natural backpressure. For `NodeRole.Witness` peers, `ConsensusKernel` automatically strips `LogType.Command` payload bytes (`Log.stripForWitness`) while preserving `(index, term)` metadata and `Configuration` entries.
+3. **`Snapshot`**: Entered when a follower requires an entry older than `storage.firstIndex` (already compacted). Replication pauses while single-chunk or multi-chunk `InstallSnapshot` RPCs bring the follower up to `pendingSnapshot`.
+
+> [!IMPORTANT]
+> **Structural `hasUnpersistedTermOrVote` Guard (§5.1 / §5.2)** & **Configuration Truncation Rollback (§4.1)**:
+> Inside `ConsensusKernel.enqueueMessage`, whenever `currentHardState.term != lastPersistedHardState.term` or `votedFor` has changed, **every** outbound message (even a read-only higher-term heartbeat reply) is automatically routed to `Ready.persistedMessages` so a node can never externally acknowledge a new term before flushing `HardState` to disk. Similarly, whenever an uncommitted `LogType.Configuration` (`RCFG` v2 binary + CRC32) entry is truncated by a new leader's `AppendEntries`, both `ConsensusKernel` and `MemStorage` deterministically reconstruct the active `ClusterConfig` from the latest snapshot plus surviving log entries.
 
 ---
 

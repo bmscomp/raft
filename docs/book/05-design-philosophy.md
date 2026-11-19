@@ -42,30 +42,14 @@ The function receives the current node state and an incoming event (an RPC from 
 
 The runtime — which is a separate piece of code that **you** control — is responsible for actually executing those effects (sending messages, writing to disk, etc.).
 
-```
-┌──────────────────────────────────────┐
-│           Your Runtime               │
-│                                      │
-│   ┌──────────────────────────────┐   │
-│   │     Pure Logic (RaftLogic)   │   │
-│   │                              │   │
-│   │   (state, msg)               │   │
-│   │       → (newState, effects)  │   │
-│   │                              │   │
-│   │   No I/O. No sockets.        │   │
-│   │   No threads. No disk.       │   │
-│   └──────────────┬───────────────┘   │
-│                  │                   │
-│                  ▼                   │
-│   ┌──────────────────────────────┐   │
-│   │     Effect Interpreter       │   │
-│   │                              │   │
-│   │   Broadcast(msg) → gRPC      │   │
-│   │   Persist(term)  → RocksDB   │   │
-│   │   Commit(idx)    → apply FSM │   │
-│   │   ResetTimer     → scheduler │   │
-│   └──────────────────────────────┘   │
-└──────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Runtime["Your Host Runtime (Cats Effect / Virtual Threads / Simulator)"]
+        KERNEL["Pure Consensus Engine (ConsensusKernel & RaftLogic) — (state, input) => (nextState, effects / Ready)"]
+        INTERP["Effect & Ready Interpreter (WAL fsync, gRPC sendBatch, StateMachine.apply, TimerService)"]
+    end
+
+    KERNEL --> INTERP
 ```
 
 > **Note — This pattern has deep roots.** The idea of separating pure computation from side-effect execution is central to functional programming. Haskell uses monads for this; Elm uses the "Elm Architecture" (Model-View-Update); Redux in JavaScript uses reducers and middleware. In the distributed systems world, the idea of modeling a protocol as a state machine fed by inputs was formalized by Fred Schneider (1990) and is the basis of TLA+ specifications. What's unusual here is applying it to an *implementation*, not just a spec.
@@ -150,32 +134,31 @@ This is important because in a Raft implementation, you're constantly working wi
 
 > **Note — Why not just use case class wrappers?** You could wrap `Long` in a case class (`case class Term(value: Long)`), but this introduces heap allocation and boxing overhead on every term comparison, which happens on every single RPC. Opaque types give you the safety at zero cost.
 
-## Immutability: No Shared Mutable State
+## Immutability, Structural `Bytes` & Error-Accumulating Validation
 
-All state objects in the protocol logic are **immutable** Scala case classes. State transitions return new instances rather than mutating existing ones:
+All state objects, log entries, snapshot chunks, and protocol messages in `raft-core` are **deeply immutable** Scala 3 values:
+
+- **Immutable `Bytes` (`raft.state.Bytes`)**: On the JVM, raw `Array[Byte]` fields inside `case class`es break structural equality (`==` compares array references) and allow callers to mutate shared buffers in place. `Log`, `SnapshotMetadata`, `PendingSnapshot`, and `InstallSnapshotRequest` encapsulate payloads inside `Bytes` — copying defensively at `Array[Byte]` boundaries while exposing zero-copy read-only `ByteBuffer` views and SIMD-intrinsified `Arrays.equals` / `Arrays.hashCode`.
+- **Monotonic `commitIndex` Across All Roles**: Every `NodeState` (`Follower`, `PreCandidate`, `Candidate`, `Leader`) carries `commitIndex` so committed prefixes are never regressed or truncated across elections or higher-term step-downs.
+- **Error-Accumulating Smart Constructors (`Validated[ConfigError, A]`)**: Configuration types (`RaftConfig.validate`, `BatchConfig.validate`, `PipelineConfig.validate`, `NodeId.validate`, `ClusterConfig.validate`) validate invariants purely without allocating stack traces, accumulating *all* invalid fields in a single `Validated.Invalid(errors: Vector[ConfigError])` pass:
 
 ```scala
-// Each node state is an immutable case class
-case class Follower(
-  term: Long,
-  votedFor: Option[NodeId],
-  leaderId: Option[NodeId]
+import scala.concurrent.duration.*
+import raft.state.{NodeId, RaftConfig, Validated}
+
+val checked = RaftConfig.validate(
+  localId = NodeId("node-1"),
+  electionTimeoutMin = 150.millis,
+  electionTimeoutMax = 300.millis,
+  heartbeatInterval = 50.millis
 )
 
-case class Candidate(
-  term: Long,
-  votesReceived: Set[NodeId]
-)
-
-case class Leader(
-  term: Long,
-  matchIndex: Map[NodeId, Long],
-  commitIndex: Long
-  // ...
-)
+checked match
+  case Validated.Valid(cfg)      => // guaranteed valid RaftConfig
+  case Validated.Invalid(errors) => // every violated invariant reported together
 ```
 
-There are **no `var`s** in the protocol logic. No shared mutable state. No locks. No race conditions. The runtime holds the current state in a `Ref[F, NodeState]` (a Cats Effect atomic reference) and atomically swaps it after each transition:
+There are **zero `var`s**, **zero `while` loops**, and **zero `null`s** in `ConsensusKernel`, `RaftLogic`, `ProgressTracker`, and `JsonCodec`. The runtime holds the current state in an atomic cell (`Ref[F, NodeState]` or `AtomicReference[KernelState]`) and swaps immutable values atomically:
 
 ```scala
 // In the runtime event loop (simplified)
