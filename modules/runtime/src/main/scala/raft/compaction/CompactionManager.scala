@@ -63,6 +63,12 @@ class CompactionManager[F[_]: Async](
     onCompacted: Option[CoreSnapshotMetadata => F[Unit]] = None
 ):
 
+  /** Record an externally installed snapshot index so compaction thresholds
+    * measure entries strictly after the installed snapshot.
+    */
+  def recordInstalledSnapshot(index: Long): F[Unit] =
+    lastSnapshotIndexRef.update(math.max(_, index))
+
   /** Check the compaction policy and execute a snapshot if warranted.
     *
     * This method is safe to call on every applied entry — it short-circuits

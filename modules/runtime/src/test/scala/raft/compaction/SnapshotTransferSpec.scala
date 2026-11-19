@@ -34,7 +34,9 @@ class SnapshotTransferSpec extends AnyFlatSpec with Matchers:
     private var sent: Vector[(NodeId, RaftMessage)] = Vector.empty
 
     def send(to: NodeId, msg: RaftMessage): IO[Unit] = IO {
-      sent = sent :+ (to, msg)
+      this.synchronized {
+        sent = sent :+ (to, msg)
+      }
     }
 
     def broadcast(msg: RaftMessage): IO[Unit] = IO.unit
@@ -44,7 +46,8 @@ class SnapshotTransferSpec extends AnyFlatSpec with Matchers:
       msgs.toList.traverse_(msg => send(to, msg))
     def shutdown: IO[Unit] = IO.unit
 
-    def sentMessages: Vector[(NodeId, RaftMessage)] = sent
+    def sentMessages: Vector[(NodeId, RaftMessage)] =
+      this.synchronized(sent)
 
   "SnapshotTransfer" should "send single chunk for small snapshot" in {
     val test = for

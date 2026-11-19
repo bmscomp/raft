@@ -4,14 +4,22 @@ import java.io.File
 import java.net.InetSocketAddress
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
 import cats.effect.{Async, Resource, Sync}
+import cats.effect.implicits.*
 import cats.effect.std.{Dispatcher, Queue}
 import cats.syntax.all.*
 import com.google.protobuf.ByteString
 import fs2.Stream
-import io.grpc.{ManagedChannel, Server, Status}
+import io.grpc.{
+  ManagedChannel,
+  Server,
+  Status,
+  StatusException,
+  StatusRuntimeException
+}
 import io.grpc.netty.shaded.io.grpc.netty.{
   NettyChannelBuilder,
   NettyServerBuilder
@@ -20,7 +28,7 @@ import io.grpc.stub.StreamObserver
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.noop.NoOpLogger
 
-import raft.spi.{Transport, TransportConfig, TransportFactory}
+import raft.spi.{RaftTransport, Transport, TransportConfig, TransportFactory}
 import raft.state.NodeId
 import raft.transport.grpc.proto.*
 
@@ -28,11 +36,19 @@ import raft.transport.grpc.proto.*
   *
   * Operates on raw `Array[Byte]` payloads wrapped in Protobuf [[WireEnvelope]]
   * frames over persistent HTTP/2 Netty channels, delegating consensus payload
-  * serialization to the codec layer (see [[raft.spi.Transport.withCodec]]).
+  * serialization to [[ProtobufMessageCodec]] (or any custom
+  * [[raft.message.SimpleMessageCodec]] via [[raft.spi.Transport.withCodec]]).
   *
-  * Network errors on individual sends are logged and absorbed so transient peer
-  * outages or partitions never crash the consensus event loop; Raft's own
-  * heartbeat and retry ticks handle retransmission.
+  * Features:
+  *   - '''Bounded inbound backpressure''': `Queue.bounded(maxInboundQueueSize)`
+  *     suspends Netty RPC handlers before exhausting JVM heap under flood load.
+  *   - '''Channel lifecycle hygiene''': `updatePeers` evicts and shuts down
+  *     removed peer `ManagedChannel`s so membership rotations never leak
+  *     sockets.
+  *   - '''Bounded transient retry''': transient `UNAVAILABLE` and
+  *     `DEADLINE_EXCEEDED` failures retry up to `config.maxRetries` with
+  *     bounded exponential backoff before yielding cleanly to Raft's next
+  *     heartbeat/election tick.
   */
 class GrpcTransport[F[_]: Async](
     config: GrpcConfig,
@@ -54,46 +70,108 @@ class GrpcTransport[F[_]: Async](
   }
 
   private val channels = new ConcurrentHashMap[String, ManagedChannel]()
+  @volatile private var closed: Boolean = false
 
-  /** Dynamically updates the peer address routing table (useful for Joint
-    * Consensus membership changes or ephemeral test port discovery).
+  private[grpc] def activeChannelAddresses: Set[String] =
+    channels.keySet().asScala.toSet
+
+  /** Dynamically updates the peer address routing table and shuts down any
+    * `ManagedChannel`s whose target addresses are no longer in `newPeers`.
     */
   def updatePeers(newPeers: Map[NodeId, String]): F[Unit] =
-    Sync[F].delay {
-      peerMap.clear()
+    Sync[F].blocking {
+      val keepAddresses = newPeers.values.toSet
+      val existingKeys = peerMap.keySet().asScala.toList
+      existingKeys.foreach { key =>
+        if !newPeers.contains(key) then
+          val _ = peerMap.remove(key)
+      }
       newPeers.foreach { case (id, addr) =>
         val _ = peerMap.put(id, addr)
       }
+
+      val evicted = channels
+        .keySet()
+        .asScala
+        .toList
+        .filterNot(keepAddresses.contains)
+        .flatMap(addr => Option(channels.remove(addr)))
+
+      evicted.foreach(shutdownChannel(_, 1L))
     }
 
   def send(to: NodeId, msg: Array[Byte]): F[Unit] =
     Option(peerMap.get(to)) match
       case Some(address) =>
-        val rpcCall =
-          for
-            channel <- getOrCreateChannel(address)
-            envelope = WireEnvelope(
-              senderId = transportConfig.localId.value,
-              payload = ByteString.copyFrom(msg)
+        val envelope = WireEnvelope(
+          senderId = transportConfig.localId.value,
+          payload = ByteString.copyFrom(msg)
+        )
+        sendWithRetry(to, address, envelope, attempt = 0).handleErrorWith {
+          err =>
+            logger.warn(
+              s"gRPC delivery to ${to.value}@$address failed after retries: ${err.getMessage}"
             )
-            _ <- logger.debug(
-              s"gRPC send to ${to.value}@$address (${msg.length} bytes)"
-            )
-            _ <- Async[F].fromFuture(
-              Sync[F].delay(
-                RaftServiceGrpc.stub(channel).sendEnvelope(envelope)
-              )
-            )
-          yield ()
-
-        rpcCall.handleErrorWith { err =>
-          logger.warn(
-            s"gRPC delivery to ${to.value}@$address failed: ${err.getMessage}"
-          )
         }
 
       case None =>
         logger.warn(s"Unknown peer: ${to.value}")
+
+  private def sendWithRetry(
+      to: NodeId,
+      address: String,
+      envelope: WireEnvelope,
+      attempt: Int
+  ): F[Unit] =
+    val singleAttempt =
+      for
+        channel <- getOrCreateChannel(address)
+        _ <- logger.debug(
+          s"gRPC send to ${to.value}@$address (${envelope.payload.size()} bytes, attempt=${attempt + 1})"
+        )
+        _ <- Async[F].fromFuture(
+          Sync[F].delay(
+            RaftServiceGrpc
+              .stub(channel)
+              .withDeadlineAfter(
+                transportConfig.connectionTimeout.toMillis,
+                TimeUnit.MILLISECONDS
+              )
+              .sendEnvelope(envelope)
+          )
+        )
+      yield ()
+
+    singleAttempt.handleErrorWith { err =>
+      if attempt < config.maxRetries && isTransientGrpcError(err) then
+        val shift = math.min(attempt, 6)
+        val rawDelayMs = config.retryBackoff.toMillis * (1L << shift)
+        val boundedDelayMs =
+          math.min(rawDelayMs, config.maxRetryBackoff.toMillis)
+        (if boundedDelayMs > 0L then Async[F].sleep(boundedDelayMs.millis)
+         else Async[F].unit) *>
+          prepareChannelForRetry(address) *>
+          sendWithRetry(to, address, envelope, attempt + 1)
+      else Async[F].raiseError(err)
+    }
+
+  private def isTransientGrpcError(err: Throwable): Boolean =
+    val codeOpt = err match
+      case sre: StatusRuntimeException => Some(sre.getStatus.getCode)
+      case se: StatusException         => Some(se.getStatus.getCode)
+      case _                           => None
+    codeOpt.exists(c =>
+      c == Status.Code.UNAVAILABLE || c == Status.Code.DEADLINE_EXCEEDED
+    )
+
+  private def prepareChannelForRetry(address: String): F[Unit] =
+    Sync[F].delay {
+      Option(channels.get(address)).foreach { ch =>
+        if ch.isShutdown || ch.isTerminated then
+          val _ = channels.remove(address, ch)
+        else ch.resetConnectBackoff()
+      }
+    }
 
   def sendBatch(to: NodeId, msgs: Seq[Array[Byte]]): F[Unit] =
     msgs.toList.traverse_(msg => send(to, msg))
@@ -101,7 +179,7 @@ class GrpcTransport[F[_]: Async](
   def broadcast(msg: Array[Byte]): F[Unit] =
     Sync[F]
       .delay(peerMap.keySet().asScala.toList)
-      .flatMap(_.traverse_(peer => send(peer, msg)))
+      .flatMap(_.parTraverse_(peer => send(peer, msg)))
 
   def receive: Stream[F, (NodeId, Array[Byte])] =
     Stream.fromQueueUnterminated(incomingQueue)
@@ -115,12 +193,13 @@ class GrpcTransport[F[_]: Async](
   def shutdown: F[Unit] =
     logger.info("Shutting down gRPC transport") *>
       Sync[F].blocking {
-        channels.values().asScala.foreach { ch =>
-          val _ = ch.shutdown()
-          if !ch.awaitTermination(2, TimeUnit.SECONDS) then
-            val _ = ch.shutdownNow()
+        val toClose = this.synchronized {
+          closed = true
+          val snapshot = channels.values().asScala.toList
+          channels.clear()
+          snapshot
         }
-        channels.clear()
+        toClose.foreach(shutdownChannel(_, 2L))
         serverOpt.foreach { srv =>
           val _ = srv.shutdown()
           if !srv.awaitTermination(5, TimeUnit.SECONDS) then
@@ -128,33 +207,46 @@ class GrpcTransport[F[_]: Async](
         }
       }
 
+  private def shutdownChannel(ch: ManagedChannel, waitSeconds: Long): Unit =
+    val _ = ch.shutdown()
+    if !ch.awaitTermination(waitSeconds, TimeUnit.SECONDS) then
+      val _ = ch.shutdownNow()
+
   private def getOrCreateChannel(address: String): F[ManagedChannel] =
     Sync[F].delay {
-      channels.computeIfAbsent(
-        address,
-        target => {
-          val base = NettyChannelBuilder
-            .forTarget(target)
-            .maxInboundMessageSize(config.maxMessageSize)
-            .keepAliveTime(
-              config.keepAliveInterval.toMillis,
-              TimeUnit.MILLISECONDS
-            )
-            .keepAliveTimeout(
-              config.keepAliveTimeout.toMillis,
-              TimeUnit.MILLISECONDS
-            )
-          val configured =
-            if config.useTls then base else base.usePlaintext()
-          configured.build()
-        }
-      )
+      Option(channels.get(address)) match
+        case Some(existing) if !closed => existing
+        case _                         =>
+          this.synchronized {
+            if closed then
+              throw Status.UNAVAILABLE
+                .withDescription("GrpcTransport is shut down")
+                .asRuntimeException()
+            Option(channels.get(address)).getOrElse {
+              val base = NettyChannelBuilder
+                .forTarget(address)
+                .maxInboundMessageSize(config.maxMessageSize)
+                .keepAliveTime(
+                  config.keepAliveInterval.toMillis,
+                  TimeUnit.MILLISECONDS
+                )
+                .keepAliveTimeout(
+                  config.keepAliveTimeout.toMillis,
+                  TimeUnit.MILLISECONDS
+                )
+              val configured =
+                if config.useTls then base else base.usePlaintext()
+              val built = configured.build()
+              val _ = channels.put(address, built)
+              built
+            }
+          }
     }
 
 object GrpcTransport:
 
-  /** Creates a live Netty-backed [[GrpcTransport]] with a bound gRPC server and
-    * automatic channel/server teardown.
+  /** Creates a live Netty-backed [[GrpcTransport]] with a bounded inbound
+    * queue, bound gRPC server, and automatic channel/server teardown.
     */
   def resource[F[_]: Async](
       grpcConfig: GrpcConfig,
@@ -170,7 +262,9 @@ object GrpcTransport:
     Dispatcher.parallel[F].flatMap { dispatcher =>
       Resource.make(
         for
-          queue <- Queue.unbounded[F, (NodeId, Array[Byte])]
+          queue <- Queue.bounded[F, (NodeId, Array[Byte])](
+            grpcConfig.maxInboundQueueSize
+          )
           service = buildService(queue, dispatcher)
           server <- Sync[F].blocking(startServer(grpcConfig, service))
           _ <- logger.info(
@@ -184,6 +278,24 @@ object GrpcTransport:
           Some(server)
         )
       )(_.shutdown)
+    }
+
+  /** Creates a live Netty-backed `(GrpcTransport[F], RaftTransport[F])` pair
+    * wired with [[ProtobufMessageCodec]] by default.
+    */
+  def raftResource[F[_]: Async](
+      grpcConfig: GrpcConfig,
+      transportConfig: TransportConfig
+  ): Resource[F, (GrpcTransport[F], RaftTransport[F])] =
+    raftResource(grpcConfig, transportConfig, NoOpLogger[F])
+
+  def raftResource[F[_]: Async](
+      grpcConfig: GrpcConfig,
+      transportConfig: TransportConfig,
+      logger: Logger[F]
+  ): Resource[F, (GrpcTransport[F], RaftTransport[F])] =
+    resource(grpcConfig, transportConfig, logger).map { raw =>
+      (raw, Transport.withCodec(raw, ProtobufMessageCodec))
     }
 
   private def startServer(
@@ -201,6 +313,11 @@ object GrpcTransport:
         grpcConfig.keepAliveTimeout.toMillis,
         TimeUnit.MILLISECONDS
       )
+      .permitKeepAliveTime(
+        math.min(5000L, grpcConfig.keepAliveInterval.toMillis),
+        TimeUnit.MILLISECONDS
+      )
+      .permitKeepAliveWithoutCalls(true)
       .addService(
         RaftServiceGrpc.bindService(service, ExecutionContext.global)
       )
@@ -224,12 +341,12 @@ object GrpcTransport:
   ): RaftServiceGrpc.RaftService =
     new RaftServiceGrpc.RaftService:
       override def sendEnvelope(request: WireEnvelope): Future[WireAck] =
-        val enqueue = incomingQueue.offer(
+        val enqueue = incomingQueue.tryOffer(
           (NodeId(request.senderId), request.payload.toByteArray)
         )
         dispatcher
           .unsafeToFuture(enqueue)
-          .map(_ => WireAck(accepted = true))(
+          .map(accepted => WireAck(accepted = accepted))(
             ExecutionContext.parasitic
           )
 
@@ -238,7 +355,7 @@ object GrpcTransport:
       ): Future[AppendEntriesResponse] =
         Future.failed(
           Status.UNIMPLEMENTED
-            .withDescription("Use SendEnvelope wire framing")
+            .withDescription("Use SendEnvelope + ProtobufMessageCodec framing")
             .asRuntimeException()
         )
 
@@ -247,7 +364,7 @@ object GrpcTransport:
       ): Future[RequestVoteResponse] =
         Future.failed(
           Status.UNIMPLEMENTED
-            .withDescription("Use SendEnvelope wire framing")
+            .withDescription("Use SendEnvelope + ProtobufMessageCodec framing")
             .asRuntimeException()
         )
 
@@ -260,7 +377,9 @@ object GrpcTransport:
           override def onCompleted(): Unit =
             responseObserver.onError(
               Status.UNIMPLEMENTED
-                .withDescription("Use SendEnvelope wire framing")
+                .withDescription(
+                  "Use SendEnvelope + ProtobufMessageCodec framing"
+                )
                 .asRuntimeException()
             )
 

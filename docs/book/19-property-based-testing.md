@@ -17,6 +17,14 @@ The library's pure functional design makes property-based testing unusually prac
 
 No mocks, no timeouts, no network simulators. Just functions and data.
 
+```mermaid
+flowchart LR
+    GEN["ScalaCheck Generators (Events, LogIds, Payloads)"] --> SUT["Pure Kernel (RaftLogic, ProgressTracker, Codecs)"]
+    SUT --> ORACLE["Invariant Oracle (5 Safety Laws + Isomorphism)"]
+    ORACLE -->|"Pass (100+ cases)"| DONE["Verified Property"]
+    ORACLE -->|"Falsified"| SHRINK["Deterministic Shrinker (Minimal 3-5 Step Trace + Seed)"]
+```
+
 ## The Five Safety Properties
 
 The Raft paper (§5.2) defines five properties that a correct implementation must satisfy. These are our test targets:
@@ -189,19 +197,53 @@ property("State Machine Safety: no conflicting applies") =
   }
 ```
 
+## Algebraic & Codec Isomorphism Laws Beyond Event Traces
+
+Event-schedule properties catch multi-step state machine bugs, while **algebraic law properties** verify the mathematical building blocks that `RaftLogic` and `RawNode` rely on:
+
+### 1. Lexicographic Total Order on `LogId` (§5.4.1 Election Restriction)
+
+Raft's Election Restriction compares candidate and voter logs by `(lastLogTerm, lastLogIndex)`. If `LogId.compare` ever violated transitivity or antisymmetry, three nodes could form a voting cycle where none can win, or worse, grant a vote to a stale log (`TypesAndDomainSpec`):
+
+```scala
+forAll(logIdGen, logIdGen, logIdGen) { (a, b, c) =>
+  a.compare(a) shouldBe 0
+  a.compare(b).sign shouldBe -b.compare(a).sign
+  if a <= b && b <= c then (a <= c) shouldBe true
+}
+```
+
+### 2. Joint Consensus Commit Monotonicity (`ProgressTracker`)
+
+During a Joint Consensus transition $C_{\text{old},\text{new}}$, `maximalCommittedIndex` computes $\min(\text{committed}(C_{\text{old}}), \text{committed}(C_{\text{new}}))$. Advancing any peer's `matched` index by $\Delta > 0$ must never cause the joint quorum commit index to regress (`ReadyAndProgressTrackerSpec`):
+
+```scala
+forAll(matchGen) { case (m1, m2, m3, m4, m5, delta) =>
+  val c0 = base.maximalCommittedIndex
+  val c1 = base.updateProgress(n2, p => p.copy(matched = p.matched + delta)).maximalCommittedIndex
+  c1 should be >= c0
+}
+```
+
+### 3. Wire-Codec Round-Trip Isomorphism (`JsonCodec` & `ProtobufMessageCodec`)
+
+A subtle escaping or varint bug in a wire codec can silently corrupt `conflictTerm`, flip `isTransfer`, or truncate binary snapshot chunks. `JsonCodecPropertySpec` and `ProtobufMessageCodecSpec` generate all 17 `RaftMessage` variants populated with arbitrary `Array[Byte]` payloads, ASCII control characters (`0x00`–`0x1f`), quotes, backslashes, and multi-byte UTF-8 symbols, asserting exact round-trip identity:
+
+$$\forall m \in \text{RaftMessage}: \quad \text{decode}(\text{encode}(m)) = \text{Right}(m)$$
+
 ## Running the Properties
 
 ```scala
-// In your test suite
-class SafetyPropertySpec extends Properties("Raft Safety"):
-  include(ElectionSafetyProps)
-  include(LogMatchingProps)
-  include(LeaderAppendOnlyProps)
-  include(StateMachineSafetyProps)
+// Pure protocol, algebraic, and wire-codec property suites:
+// - modules/core/src/test/scala/raft/logic/SafetyPropertySpec.scala
+// - modules/core/src/test/scala/raft/state/TypesAndDomainSpec.scala
+// - modules/core/src/test/scala/raft/raw/ReadyAndProgressTrackerSpec.scala
+// - modules/core/src/test/scala/raft/codec/JsonCodecPropertySpec.scala
+// - modules/transport-grpc/src/test/scala/raft/transport/grpc/ProtobufMessageCodecSpec.scala
 ```
 
 ```bash
-sbt "testOnly *SafetyPropertySpec"
+sbt "testOnly *SafetyPropertySpec *TypesAndDomainSpec *ReadyAndProgressTrackerSpec *Codec*Spec"
 ```
 
 ScalaCheck will run each property 100 times by default (configurable via `minSuccessfulTests`). If a property fails, ScalaCheck **shrinks** the input to find the minimal failing case — typically reducing a 100-event sequence to 3-5 events that trigger the bug.

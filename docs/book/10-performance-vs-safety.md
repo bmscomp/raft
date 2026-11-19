@@ -379,6 +379,52 @@ Before incrementing its term and starting a real election, a node first asks a m
 
 ---
 
+## Optimization 7: Binary Protobuf Wire Framing, Channel Hygiene & Bounded Backpressure
+
+### The Problem
+
+A consensus engine's network adapter (`raft-transport-grpc`) faces three recurring systems bottlenecks:
+
+1. **Text + Base64 serialization amplification**: Encoding binary `Log.data` and `InstallSnapshotRequest.data` chunks inside JSON (`JsonCodec`) inflates wire payloads by ~33% (Base64) plus field-name overhead and UTF-8 parsing CPU on every RPC.
+2. **Unbounded inbound queues under packet storms**: If a partitioned follower reconnects or a burst of `AppendEntries` frames arrives faster than local WAL `msync` can drain them, an unbounded inbound queue (`Queue.unbounded`) buffers arbitrary byte arrays in heap until the JVM crashes with `OutOfMemoryError`.
+3. **Socket leaks across Joint Consensus rotations**: When nodes are removed via `ClusterConfig` membership changes and `updatePeers` updates the routing map, leaving old Netty `ManagedChannel`s open leaks file descriptors and keep-alive background threads.
+
+### The Architecture (`ProtobufMessageCodec` + `GrpcTransport`)
+
+`raft-transport-grpc` pairs `WireEnvelope` over Netty HTTP/2 with `ProtobufMessageCodec` (`RaftWirePayload` `oneof` message covering all 17 `RaftMessage` cases, including §5.3 `conflict_index` / `conflict_term` hints and §3.10 `is_transfer` flags):
+
+```mermaid
+flowchart LR
+    subgraph Sender["Leader / Sender Node"]
+        RM["RaftMessage (Log / Snapshot bytes)"]
+        PBC["ProtobufMessageCodec (Zero Base64)"]
+        RETRY["Bounded Retry (UNAVAILABLE Backoff)"]
+        CH["Netty ManagedChannel Pool (Evicts Removed Peers)"]
+    end
+
+    subgraph Receiver["Follower / Receiver Node"]
+        SRV["Netty HTTP/2 RaftService"]
+        BQ["Bounded Queue (maxInboundQueueSize = 4096)"]
+        DEC["ProtobufMessageCodec.decode"]
+        LOOP["RaftNode Consensus Loop"]
+    end
+
+    RM --> PBC --> RETRY --> CH
+    CH -->|"WireEnvelope (HTTP/2)"| SRV
+    SRV -->|"Backpressure on saturation"| BQ --> DEC --> LOOP
+```
+
+### Safety & Resource Guarantees
+
+| Mechanism | Throughput / Resource Impact | Consensus Safety Impact |
+| :--- | :--- | :--- |
+| **`ProtobufMessageCodec`** | Zero Base64 expansion; raw `ByteString` copy for WAL entries and snapshot chunks | ✅ Lossless round-trip across all 17 `RaftMessage` variants |
+| **Bounded Queue (`maxInboundQueueSize`)** | Bounds heap memory; applies TCP/HTTP2 window backpressure when full | ✅ Preserves safety (delayed messages are indistinguishable from slow links in asynchronous Raft) |
+| **Channel Eviction in `updatePeers`** | Immediately shuts down `ManagedChannel`s for removed peer addresses | ✅ Prevents socket exhaustion during repeated membership changes |
+| **Bounded Transient Retry (`maxRetries`)** | Absorbs brief `UNAVAILABLE` / `DEADLINE_EXCEEDED` blips during peer boot | ✅ Bounded by `maxRetryBackoff`; falls back cleanly to Raft heartbeat retransmission |
+
+---
+
 ## Putting It All Together: Configuration Profiles
 
 Here are three configuration profiles for different deployment scenarios:
@@ -441,27 +487,30 @@ val aggressive = RaftConfig(
 | **ReadIndex** | ~10× (reads) | ✅ None — one-RTT confirmation | N/A |
 | **Lease Reads** | ~100× (reads) | ⚠️ Depends on bounded clock drift | 100ms |
 | **Pre-Vote** | N/A | ✅ Prevents disruption, minor liveness cost | On |
+| **Binary Protobuf + Bounded Queue** | ~33% smaller wire frames + bounded heap | ✅ None — pure transport & backpressure | `ProtobufMessageCodec` + `4096` |
 
 > [!IMPORTANT]
-> The most dangerous column in this table is "Safety Impact." Only two optimizations introduce risk: **pipelining** (manageable with correct implementation) and **lease reads** (requires clock synchronization). Everything else is pure win. Start with batching and parallel replication — they're free safety-wise and deliver the biggest gains.
+> The most dangerous column in this table is "Safety Impact." Only two optimizations introduce risk: **pipelining** (manageable with correct `Inflights` tracking) and **lease reads** (requires bounded clock drift). Everything else is a pure win.
 
 ```mermaid
-quadrantChart
-    title Optimization Tradeoff Map
-    x-axis Low Risk --> High Risk
-    y-axis Low Gain --> High Gain
-    quadrant-1 "Sweet Spot"
-    quadrant-2 "Diminishing Returns"
-    quadrant-3 "Low Priority"
-    quadrant-4 "Use With Caution"
-    Batching: [0.1, 0.9]
-    Parallel Replication: [0.1, 0.5]
-    Pre-Vote: [0.15, 0.3]
-    ReadIndex: [0.2, 0.7]
-    Pipelining: [0.4, 0.85]
-    Lease Reads: [0.7, 0.8]
+flowchart TD
+    subgraph SafeWins["Zero Consensus Risk (Enable First)"]
+        B["Batching (Amortize msync)"]
+        PR["Parallel Replication (Concurrent Peer Sends)"]
+        PB["ProtobufMessageCodec + Bounded Queue"]
+        PV["Pre-Vote + CheckQuorum"]
+        RI["ReadIndex (1-RTT Quorum Read)"]
+    end
+
+    subgraph Careful["Protocol State / Clock Assumptions"]
+        PIPE["Pipelining (Requires Monotonic matchIndex & Inflights)"]
+        LR["Lease Reads (Requires maxClockDrift < Lease Margin)"]
+    end
+
+    SafeWins --> PIPE
+    PIPE --> LR
 ```
 
 ---
 
-*Next: [Chapter 11 — Failure Modes: A Practitioner's Field Guide](11-failure-modes.md) catalogs the most common Raft failure scenarios — leader crashes, network partitions, split votes, term inflation, and more — with concrete diagnostic steps and prevention mechanisms.*
+*Next: [Chapter 11 — Failure Modes: A Practitioner's Field Guide](11-failure-modes.md) catalogs the most common Raft failure scenarios — leader crashes, network partitions, split votes, term inflation, torn storage writes, and more — with concrete diagnostic steps and prevention mechanisms.*

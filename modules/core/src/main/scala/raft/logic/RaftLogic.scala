@@ -533,7 +533,10 @@ object RaftLogic:
                     case Some(target)
                         if target == peerId && updatedMatch >= leaderLastIndex =>
                       (
-                        leaderAfterReads.copy(transferTarget = None),
+                        leaderAfterReads.copy(
+                          transferTarget = None,
+                          leaseUntil = 0L
+                        ),
                         List(
                           TimeoutNow(target),
                           SendMessage(
@@ -983,7 +986,7 @@ object RaftLogic:
           val targetMatch = l.matchIndex.getOrElse(req.target, 0L)
           if targetMatch >= lastLogIndex then
             Transition.withEffects(
-              l.copy(transferTarget = Some(req.target)),
+              l.copy(transferTarget = Some(req.target), leaseUntil = 0L),
               TransferLeadership(req.target),
               TimeoutNow(req.target),
               SendMessage(req.target, TimeoutNowRequest(l.term, config.localId))
@@ -1002,7 +1005,7 @@ object RaftLogic:
               leaderCommit = l.commitIndex
             )
             Transition.withEffects(
-              l.copy(transferTarget = Some(req.target)),
+              l.copy(transferTarget = Some(req.target), leaseUntil = 0L),
               TransferLeadership(req.target),
               SendMessage(req.target, catchUpProbe)
             )
