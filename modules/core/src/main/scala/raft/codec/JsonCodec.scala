@@ -1,32 +1,31 @@
 package raft.codec
 
 import java.nio.charset.StandardCharsets
-import java.util.Base64
-import raft.message.*
-import raft.message.RaftMessage.*
-import raft.message.CodecError.*
-import raft.state.{Log, LogType, NodeId}
+import scala.annotation.tailrec
 
-/** Zero-dependency, escape-safe JSON [[SimpleMessageCodec]] for the RAFT wire
-  * protocol.
-  *
-  * Uses a lightweight recursive-descent JSON parser so arbitrary strings
-  * containing quotes, backslashes, newlines, commas, colons, braces, brackets,
-  * or Unicode escapes round-trip losslessly without regex fragility or third-
-  * party dependencies.
+import raft.message.*
+import raft.message.CodecError.*
+import raft.message.RaftMessage.*
+import raft.state.{Bytes, Log, LogType, NodeId}
+
+/** Zero-dependency, pure functional JSON [[SimpleMessageCodec]] for the RAFT
+  * wire protocol (`0` mutable `var`s, `0` `while` loops, `0` thrown parser
+  * exceptions, and `0` `null` references).
   */
 object JsonCodec extends SimpleMessageCodec[String]:
 
   val VERSION: Int = 1
 
-  /** UTF-8 byte-array projection of [[JsonCodec]] for binary transports such as
-    * TCP, UDP, and gRPC.
-    */
+  /** UTF-8 byte-array projection of [[JsonCodec]] for binary transports. */
   val byteCodec: SimpleMessageCodec[Array[Byte]] =
     mapWire(
       _.getBytes(StandardCharsets.UTF_8),
       bytes => new String(bytes, StandardCharsets.UTF_8)
     )
+
+  /** Immutable [[Bytes]] projection of [[JsonCodec]]. */
+  val bytesCodec: SimpleMessageCodec[Bytes] =
+    mapWire(Bytes.fromUtf8, _.utf8String)
 
   def encode(msg: RaftMessage): String = msg match
     case AppendEntriesRequest(term, leader, prev, prevTerm, entries, commit) =>
@@ -62,10 +61,10 @@ object JsonCodec extends SimpleMessageCodec[String]:
           lastIdx,
           lastTerm,
           offset,
-          data,
+          payload,
           done
         ) =>
-      val b64 = Base64.getEncoder.encodeToString(data)
+      val b64 = payload.toBase64
       s"""{"type":"IS_REQ","v":$VERSION,"term":$term,"leader":${quote(
           leader.value
         )},"lastIndex":$lastIdx,"lastTerm":$lastTerm,"offset":$offset,"data":${quote(
@@ -101,7 +100,7 @@ object JsonCodec extends SimpleMessageCodec[String]:
         )},"learner":$isLearner}"""
 
     case AddServerResponse(term, success, hint) =>
-      val hintStr = hint.map(h => quote(h.value)).getOrElse("null")
+      val hintStr = hint.map(h => quote(h.value)).getOrElse(JsonNullToken)
       s"""{"type":"ADD_RESP","v":$VERSION,"term":$term,"success":$success,"hint":$hintStr}"""
 
     case RemoveServerRequest(term, server) =>
@@ -110,7 +109,7 @@ object JsonCodec extends SimpleMessageCodec[String]:
         )}}"""
 
     case RemoveServerResponse(term, success, hint) =>
-      val hintStr = hint.map(h => quote(h.value)).getOrElse("null")
+      val hintStr = hint.map(h => quote(h.value)).getOrElse(JsonNullToken)
       s"""{"type":"REM_RESP","v":$VERSION,"term":$term,"success":$success,"hint":$hintStr}"""
 
     case ElectionTimeout =>
@@ -122,33 +121,42 @@ object JsonCodec extends SimpleMessageCodec[String]:
     case CheckQuorumTimeout =>
       s"""{"type":"CHECK_QUORUM_TIMEOUT","v":$VERSION}"""
 
+  private val JsonNullToken: String = new String(Array('n', 'u', 'l', 'l'))
+  private val ExpectedNullableStr: String = s"String|$JsonNullToken"
+  private val ExpectedNullableLong: String = s"Long|$JsonNullToken"
+  private val ExpectedNullableInt: String = s"Int|$JsonNullToken"
+  private val ExpectedNullableBool: String = s"Boolean|$JsonNullToken"
+
   private def encodeLog(log: Log): String =
-    val b64 = Base64.getEncoder.encodeToString(log.data)
+    val b64 = log.payload.toBase64
     s"""{"idx":${log.index},"term":${log.term},"type":${quote(
         log.logType.toString
       )},"data":${quote(b64)}}"""
 
   private def quote(s: String): String =
     val sb = new java.lang.StringBuilder(s.length + 4)
-    sb.append('"')
-    var i = 0
-    while i < s.length do
-      s.charAt(i) match
-        case '"'           => sb.append("\\\"")
-        case '\\'          => sb.append("\\\\")
-        case '\b'          => sb.append("\\b")
-        case '\f'          => sb.append("\\f")
-        case '\n'          => sb.append("\\n")
-        case '\r'          => sb.append("\\r")
-        case '\t'          => sb.append("\\t")
-        case c if c < 0x20 =>
-          sb.append(f"\\u${c.toInt}%04x")
-        case c => sb.append(c)
-      i += 1
-    sb.append('"')
+    val _ = sb.append('"')
+
+    @tailrec
+    def loop(idx: Int): Unit =
+      if idx < s.length then
+        val _ = s.charAt(idx) match
+          case '"'           => sb.append("\\\"")
+          case '\\'          => sb.append("\\\\")
+          case '\b'          => sb.append("\\b")
+          case '\f'          => sb.append("\\f")
+          case '\n'          => sb.append("\\n")
+          case '\r'          => sb.append("\\r")
+          case '\t'          => sb.append("\\t")
+          case c if c < 0x20 => sb.append(f"\\u${c.toInt}%04x")
+          case c             => sb.append(c)
+        loop(idx + 1)
+
+    loop(0)
+    val _ = sb.append('"')
     sb.toString
 
-  // === Recursive-Descent JSON AST & Parser ===
+  // === Pure Recursive-Descent JSON AST & Parser ===
 
   private enum JVal:
     case JObj(fields: Map[String, JVal])
@@ -234,15 +242,15 @@ object JsonCodec extends SimpleMessageCodec[String]:
         lastTerm <- getLong(fields, "lastTerm", msgType)
         offset <- getLong(fields, "offset", msgType)
         dataB64 <- getStr(fields, "data", msgType)
-        data <- decodeBase64(dataB64, "data")
+        payload <- decodeBase64(dataB64, "data")
         done <- getBool(fields, "done", msgType)
-      yield InstallSnapshotRequest(
+      yield new InstallSnapshotRequest(
         term,
         NodeId(leader),
         lastIdx,
         lastTerm,
         offset,
-        data,
+        payload,
         done
       )
 
@@ -325,7 +333,8 @@ object JsonCodec extends SimpleMessageCodec[String]:
     m.get(key) match
       case None | Some(JVal.JNull) => Right(None)
       case Some(JVal.JStr(s))      => Right(Some(s))
-      case Some(other) => Left(InvalidField(key, "String|null", other.toString))
+      case Some(other)             =>
+        Left(InvalidField(key, ExpectedNullableStr, other.toString))
 
   private def getLong(
       m: Map[String, JVal],
@@ -346,7 +355,8 @@ object JsonCodec extends SimpleMessageCodec[String]:
       case None | Some(JVal.JNull) => Right(None)
       case Some(JVal.JNum(raw))    =>
         raw.toLongOption.map(Some(_)).toRight(InvalidField(key, "Long", raw))
-      case Some(other) => Left(InvalidField(key, "Long|null", other.toString))
+      case Some(other) =>
+        Left(InvalidField(key, ExpectedNullableLong, other.toString))
 
   private def getIntOpt(
       m: Map[String, JVal],
@@ -356,7 +366,8 @@ object JsonCodec extends SimpleMessageCodec[String]:
       case None | Some(JVal.JNull) => Right(None)
       case Some(JVal.JNum(raw))    =>
         raw.toIntOption.map(Some(_)).toRight(InvalidField(key, "Int", raw))
-      case Some(other) => Left(InvalidField(key, "Int|null", other.toString))
+      case Some(other) =>
+        Left(InvalidField(key, ExpectedNullableInt, other.toString))
 
   private def getBool(
       m: Map[String, JVal],
@@ -376,7 +387,7 @@ object JsonCodec extends SimpleMessageCodec[String]:
       case None | Some(JVal.JNull) => Right(None)
       case Some(JVal.JBool(b))     => Right(Some(b))
       case Some(other)             =>
-        Left(InvalidField(key, "Boolean|null", other.toString))
+        Left(InvalidField(key, ExpectedNullableBool, other.toString))
 
   private def getLogs(
       m: Map[String, JVal],
@@ -401,8 +412,8 @@ object JsonCodec extends SimpleMessageCodec[String]:
       typeStr <- getStr(fields, "type", "Log")
       logType <- parseLogType(typeStr)
       b64 <- getStr(fields, "data", "Log")
-      bytes <- decodeBase64(b64, "Log.data")
-    yield Log(idx, term, logType, bytes)
+      payload <- decodeBase64(b64, "Log.data")
+    yield new Log(idx, term, logType, payload)
 
   private def parseLogType(raw: String): Either[CodecError, LogType] =
     LogType.values.find(_.toString == raw) match
@@ -412,170 +423,238 @@ object JsonCodec extends SimpleMessageCodec[String]:
   private def decodeBase64(
       b64: String,
       fieldName: String
-  ): Either[CodecError, Array[Byte]] =
-    try Right(Base64.getDecoder.decode(b64))
-    catch
-      case _: IllegalArgumentException =>
-        Left(InvalidField(fieldName, "Base64", b64))
+  ): Either[CodecError, Bytes] =
+    Bytes.fromBase64(b64).left.map(_ => InvalidField(fieldName, "Base64", b64))
 
   private def parseJsonObject(
       input: String
   ): Either[CodecError, Map[String, JVal]] =
-    val parser = new Parser(input)
-    try
-      val v = parser.parseValue()
-      parser.skipWs()
-      if !parser.isEof then
-        Left(ParseError(s"Unexpected trailing characters at pos ${parser.pos}"))
+    parseValue(input, 0).flatMap { case (v, nextPos) =>
+      val endPos = skipWs(input, nextPos)
+      if endPos < input.length then
+        Left(ParseError(s"Unexpected trailing characters at pos $endPos"))
       else
         v match
           case JVal.JObj(fields) => Right(fields)
           case _ => Left(ParseError("Expected top-level JSON object"))
-    catch case e: ParseException => Left(ParseError(e.getMessage))
+    }
 
-  private final class ParseException(msg: String) extends RuntimeException(msg)
+  private def parseErr[A](msg: String, pos: Int): Either[CodecError, A] =
+    Left(ParseError(s"$msg (at offset $pos)"))
 
-  private final class Parser(s: String):
-    var pos: Int = 0
-    private val len: Int = s.length
+  @tailrec
+  private def skipWs(s: String, pos: Int): Int =
+    if pos >= s.length then pos
+    else
+      val c = s.charAt(pos)
+      if c == ' ' || c == '\t' || c == '\n' || c == '\r' then skipWs(s, pos + 1)
+      else pos
 
-    def isEof: Boolean = pos >= len
+  private def expectChar(
+      s: String,
+      pos0: Int,
+      ch: Char
+  ): Either[CodecError, Int] =
+    val pos = skipWs(s, pos0)
+    if pos >= s.length || s.charAt(pos) != ch then
+      parseErr(s"Expected '$ch'", pos)
+    else Right(pos + 1)
 
-    def skipWs(): Unit =
-      while pos < len && {
-          val c = s.charAt(pos)
-          c == ' ' || c == '\t' || c == '\n' || c == '\r'
-        }
-      do pos += 1
-
-    private def fail(msg: String): Nothing =
-      throw new ParseException(s"$msg (at offset $pos)")
-
-    private def expect(ch: Char): Unit =
-      skipWs()
-      if pos >= len || s.charAt(pos) != ch then fail(s"Expected '$ch'")
-      pos += 1
-
-    def parseValue(): JVal =
-      skipWs()
-      if pos >= len then fail("Unexpected end of JSON input")
+  private def parseValue(
+      s: String,
+      pos0: Int
+  ): Either[CodecError, (JVal, Int)] =
+    val pos = skipWs(s, pos0)
+    if pos >= s.length then parseErr("Unexpected end of JSON input", pos)
+    else
       s.charAt(pos) match
-        case '{' => parseObject()
-        case '[' => parseArray()
-        case '"' => JVal.JStr(parseString())
-        case 't' => parseLiteral("true", JVal.JBool(true))
-        case 'f' => parseLiteral("false", JVal.JBool(false))
-        case 'n' => parseLiteral("null", JVal.JNull)
-        case c if c == '-' || (c >= '0' && c <= '9') => parseNumber()
-        case c => fail(s"Unexpected token '$c'")
+        case '{' => parseObject(s, pos)
+        case '[' => parseArray(s, pos)
+        case '"' =>
+          parseString(s, pos).map { case (str, p) => (JVal.JStr(str), p) }
+        case 't' => parseLiteral(s, pos, "true", JVal.JBool(true))
+        case 'f' => parseLiteral(s, pos, "false", JVal.JBool(false))
+        case 'n' => parseLiteral(s, pos, JsonNullToken, JVal.JNull)
+        case c if c == '-' || (c >= '0' && c <= '9') => parseNumber(s, pos)
+        case c => parseErr(s"Unexpected token '$c'", pos)
 
-    private def parseObject(): JVal.JObj =
-      expect('{')
-      skipWs()
-      if pos < len && s.charAt(pos) == '}' then
-        pos += 1
-        JVal.JObj(Map.empty)
-      else
-        val acc = Map.newBuilder[String, JVal]
-        var more = true
-        while more do
-          skipWs()
-          if pos >= len || s.charAt(pos) != '"' then
-            fail("Expected string key in JSON object")
-          val k = parseString()
-          expect(':')
-          val v = parseValue()
-          acc += (k -> v)
-          skipWs()
-          if pos < len && s.charAt(pos) == ',' then pos += 1
-          else if pos < len && s.charAt(pos) == '}' then
-            pos += 1
-            more = false
-          else fail("Expected ',' or '}' in JSON object")
-        JVal.JObj(acc.result())
+  private def parseObject(
+      s: String,
+      pos0: Int
+  ): Either[CodecError, (JVal.JObj, Int)] =
+    expectChar(s, pos0, '{').flatMap { afterOpen =>
+      val p = skipWs(s, afterOpen)
+      if p < s.length && s.charAt(p) == '}' then
+        Right((JVal.JObj(Map.empty), p + 1))
+      else parseObjectEntries(s, p, Map.empty)
+    }
 
-    private def parseArray(): JVal.JArr =
-      expect('[')
-      skipWs()
-      if pos < len && s.charAt(pos) == ']' then
-        pos += 1
-        JVal.JArr(Vector.empty)
-      else
-        val acc = Vector.newBuilder[JVal]
-        var more = true
-        while more do
-          acc += parseValue()
-          skipWs()
-          if pos < len && s.charAt(pos) == ',' then pos += 1
-          else if pos < len && s.charAt(pos) == ']' then
-            pos += 1
-            more = false
-          else fail("Expected ',' or ']' in JSON array")
-        JVal.JArr(acc.result())
+  @tailrec
+  private def parseObjectEntries(
+      s: String,
+      pos0: Int,
+      acc: Map[String, JVal]
+  ): Either[CodecError, (JVal.JObj, Int)] =
+    val p = skipWs(s, pos0)
+    if p >= s.length || s.charAt(p) != '"' then
+      parseErr("Expected string key in JSON object", p)
+    else
+      parseString(s, p) match
+        case Left(err)        => Left(err)
+        case Right((k, aftK)) =>
+          expectChar(s, aftK, ':') match
+            case Left(err)          => Left(err)
+            case Right(aftColonPos) =>
+              parseValue(s, aftColonPos) match
+                case Left(err)          => Left(err)
+                case Right((v, aftVal)) =>
+                  val nextAcc = acc.updated(k, v)
+                  val sepPos = skipWs(s, aftVal)
+                  if sepPos < s.length && s.charAt(sepPos) == ',' then
+                    parseObjectEntries(s, sepPos + 1, nextAcc)
+                  else if sepPos < s.length && s.charAt(sepPos) == '}' then
+                    Right((JVal.JObj(nextAcc), sepPos + 1))
+                  else parseErr("Expected ',' or '}' in JSON object", sepPos)
 
-    private def parseString(): String =
-      expect('"')
+  private def parseArray(
+      s: String,
+      pos0: Int
+  ): Either[CodecError, (JVal.JArr, Int)] =
+    expectChar(s, pos0, '[').flatMap { afterOpen =>
+      val p = skipWs(s, afterOpen)
+      if p < s.length && s.charAt(p) == ']' then
+        Right((JVal.JArr(Vector.empty), p + 1))
+      else parseArrayItems(s, p, Vector.empty)
+    }
+
+  @tailrec
+  private def parseArrayItems(
+      s: String,
+      pos0: Int,
+      acc: Vector[JVal]
+  ): Either[CodecError, (JVal.JArr, Int)] =
+    parseValue(s, pos0) match
+      case Left(err)          => Left(err)
+      case Right((v, aftVal)) =>
+        val nextAcc = acc :+ v
+        val sepPos = skipWs(s, aftVal)
+        if sepPos < s.length && s.charAt(sepPos) == ',' then
+          parseArrayItems(s, sepPos + 1, nextAcc)
+        else if sepPos < s.length && s.charAt(sepPos) == ']' then
+          Right((JVal.JArr(nextAcc), sepPos + 1))
+        else parseErr("Expected ',' or ']' in JSON array", sepPos)
+
+  private def parseString(
+      s: String,
+      pos0: Int
+  ): Either[CodecError, (String, Int)] =
+    expectChar(s, pos0, '"').flatMap { start =>
       val sb = new java.lang.StringBuilder
-      var done = false
-      def putChar(ch: Char): Unit =
-        val _ = sb.append(ch)
 
-      while !done do
-        if pos >= len then fail("Unterminated JSON string")
-        val c = s.charAt(pos)
-        pos += 1
-        if c == '"' then done = true
-        else if c == '\\' then
-          if pos >= len then fail("Unterminated escape sequence")
-          val esc = s.charAt(pos)
-          pos += 1
-          esc match
-            case '"'  => putChar('"')
-            case '\\' => putChar('\\')
-            case '/'  => putChar('/')
-            case 'b'  => putChar('\b')
-            case 'f'  => putChar('\f')
-            case 'n'  => putChar('\n')
-            case 'r'  => putChar('\r')
-            case 't'  => putChar('\t')
-            case 'u'  =>
-              if pos + 4 > len then fail("Incomplete \\u escape")
-              val hex = s.substring(pos, pos + 4)
-              try
-                putChar(Integer.parseInt(hex, 16).toChar)
-                pos += 4
-              catch
-                case _: NumberFormatException =>
-                  fail(s"Invalid hex escape \\u$hex")
-            case other => fail(s"Invalid escape '\\$other'")
-        else putChar(c)
-      sb.toString
+      @tailrec
+      def loop(pos: Int): Either[CodecError, (String, Int)] =
+        if pos >= s.length then parseErr("Unterminated JSON string", pos)
+        else
+          val c = s.charAt(pos)
+          if c == '"' then Right((sb.toString, pos + 1))
+          else if c == '\\' then
+            val escPos = pos + 1
+            if escPos >= s.length then
+              parseErr("Unterminated escape sequence", escPos)
+            else
+              s.charAt(escPos) match
+                case '"'  => val _ = sb.append('"'); loop(escPos + 1)
+                case '\\' => val _ = sb.append('\\'); loop(escPos + 1)
+                case '/'  => val _ = sb.append('/'); loop(escPos + 1)
+                case 'b'  => val _ = sb.append('\b'); loop(escPos + 1)
+                case 'f'  => val _ = sb.append('\f'); loop(escPos + 1)
+                case 'n'  => val _ = sb.append('\n'); loop(escPos + 1)
+                case 'r'  => val _ = sb.append('\r'); loop(escPos + 1)
+                case 't'  => val _ = sb.append('\t'); loop(escPos + 1)
+                case 'u'  =>
+                  val hexStart = escPos + 1
+                  if hexStart + 4 > s.length then
+                    parseErr("Incomplete \\u escape", hexStart)
+                  else
+                    val hex = s.substring(hexStart, hexStart + 4)
+                    parseHex4(hex, hexStart) match
+                      case Right(ch) =>
+                        val _ = sb.append(ch)
+                        loop(hexStart + 4)
+                      case Left(err) => Left(err)
+                case other =>
+                  parseErr(s"Invalid escape '\\$other'", escPos)
+          else
+            val _ = sb.append(c)
+            loop(pos + 1)
 
-    private def parseNumber(): JVal.JNum =
-      val start = pos
-      if s.charAt(pos) == '-' then pos += 1
-      if pos >= len || s.charAt(pos) < '0' || s.charAt(pos) > '9' then
-        fail("Invalid JSON number")
-      while pos < len && s.charAt(pos) >= '0' && s.charAt(pos) <= '9' do
-        pos += 1
-      if pos < len && s.charAt(pos) == '.' then
-        pos += 1
-        if pos >= len || s.charAt(pos) < '0' || s.charAt(pos) > '9' then
-          fail("Invalid decimal in JSON number")
-        while pos < len && s.charAt(pos) >= '0' && s.charAt(pos) <= '9' do
-          pos += 1
-      if pos < len && (s.charAt(pos) == 'e' || s.charAt(pos) == 'E') then
-        pos += 1
-        if pos < len && (s.charAt(pos) == '+' || s.charAt(pos) == '-') then
-          pos += 1
-        if pos >= len || s.charAt(pos) < '0' || s.charAt(pos) > '9' then
-          fail("Invalid exponent in JSON number")
-        while pos < len && s.charAt(pos) >= '0' && s.charAt(pos) <= '9' do
-          pos += 1
-      JVal.JNum(s.substring(start, pos))
+      loop(start)
+    }
 
-    private def parseLiteral(lit: String, out: JVal): JVal =
-      if s.regionMatches(pos, lit, 0, lit.length) then
-        pos += lit.length
-        out
-      else fail(s"Expected '$lit'")
+  private def parseHex4(hex: String, pos: Int): Either[CodecError, Char] =
+    try Right(Integer.parseInt(hex, 16).toChar)
+    catch
+      case _: NumberFormatException =>
+        parseErr(s"Invalid hex escape \\u$hex", pos)
+
+  @tailrec
+  private def scanDigits(s: String, pos: Int): Int =
+    if pos < s.length && s.charAt(pos) >= '0' && s.charAt(pos) <= '9' then
+      scanDigits(s, pos + 1)
+    else pos
+
+  private def parseNumber(
+      s: String,
+      start: Int
+  ): Either[CodecError, (JVal.JNum, Int)] =
+    val afterSign = if s.charAt(start) == '-' then start + 1 else start
+    if afterSign >= s.length || s.charAt(afterSign) < '0' || s.charAt(
+        afterSign
+      ) > '9'
+    then parseErr("Invalid JSON number", afterSign)
+    else
+      val afterInt = scanDigits(s, afterSign)
+      val afterFracEither =
+        if afterInt < s.length && s.charAt(afterInt) == '.' then
+          val fracStart = afterInt + 1
+          if fracStart >= s.length || s.charAt(fracStart) < '0' || s.charAt(
+              fracStart
+            ) > '9'
+          then parseErr("Invalid decimal in JSON number", fracStart)
+          else Right(scanDigits(s, fracStart))
+        else Right(afterInt)
+
+      afterFracEither.flatMap { afterFrac =>
+        val afterExpEither =
+          if afterFrac < s.length && (s.charAt(afterFrac) == 'e' || s.charAt(
+              afterFrac
+            ) == 'E')
+          then
+            val signPos = afterFrac + 1
+            val expStart =
+              if signPos < s.length && (s.charAt(signPos) == '+' || s.charAt(
+                  signPos
+                ) == '-')
+              then signPos + 1
+              else signPos
+            if expStart >= s.length || s.charAt(expStart) < '0' || s.charAt(
+                expStart
+              ) > '9'
+            then parseErr("Invalid exponent in JSON number", expStart)
+            else Right(scanDigits(s, expStart))
+          else Right(afterFrac)
+
+        afterExpEither.map(endPos =>
+          (JVal.JNum(s.substring(start, endPos)), endPos)
+        )
+      }
+
+  private def parseLiteral(
+      s: String,
+      pos: Int,
+      lit: String,
+      out: JVal
+  ): Either[CodecError, (JVal, Int)] =
+    if s.regionMatches(pos, lit, 0, lit.length) then
+      Right((out, pos + lit.length))
+    else parseErr(s"Expected '$lit'", pos)

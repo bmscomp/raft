@@ -143,17 +143,7 @@ class JsonCodecPropertySpec
       expected: RaftMessage,
       decoded: Either[CodecError, RaftMessage]
   ): Unit =
-    (expected, decoded) match
-      case (exp: InstallSnapshotRequest, Right(act: InstallSnapshotRequest)) =>
-        act.term shouldBe exp.term
-        act.leaderId shouldBe exp.leaderId
-        act.lastIncludedIndex shouldBe exp.lastIncludedIndex
-        act.lastIncludedTerm shouldBe exp.lastIncludedTerm
-        act.offset shouldBe exp.offset
-        act.data.toSeq shouldBe exp.data.toSeq
-        act.done shouldBe exp.done
-      case (_, other) =>
-        other shouldBe Right(expected)
+    decoded shouldBe Right(expected)
 
   "JsonCodec property round-trips" - {
     "should losslessly round-trip all 17 RaftMessage variants across tricky UTF-8, control chars, and binary payloads" in {
@@ -165,6 +155,9 @@ class JsonCodecPropertySpec
 
         val utf8 = JsonCodec.byteCodec.encode(msg)
         assertSameMessage(msg, JsonCodec.byteCodec.decode(utf8))
+
+        val immutBytes = JsonCodec.bytesCodec.encode(msg)
+        assertSameMessage(msg, JsonCodec.bytesCodec.decode(immutBytes))
 
         val lifted = eitherCodec.encode(msg).flatMap(eitherCodec.decode)
         assertSameMessage(msg, lifted)

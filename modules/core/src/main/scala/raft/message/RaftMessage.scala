@@ -1,141 +1,163 @@
 package raft.message
 
-import raft.state.{Log, NodeId}
+import raft.state.{Bytes, Log, NodeId}
 
-/** Sealed hierarchy of all RAFT RPC messages and logical timer events. */
-enum RaftMessage:
+/** Sealed algebraic hierarchy of all RAFT RPC messages and logical timer
+  * events.
+  *
+  * Every variant is deeply immutable and satisfies structural value equality
+  * (`==`) and hashing — including [[RaftMessage.InstallSnapshotRequest]], which
+  * wraps snapshot chunk bytes inside [[raft.state.Bytes]].
+  */
+sealed trait RaftMessage extends Product with Serializable
+
+object RaftMessage:
 
   /** Replicate log entries or send a heartbeat (§5.3). */
-  case AppendEntriesRequest(
+  final case class AppendEntriesRequest(
       term: Long,
       leaderId: NodeId,
       prevLogIndex: Long,
       prevLogTerm: Long,
       entries: Seq[Log],
       leaderCommit: Long
-  )
+  ) extends RaftMessage
 
   /** Response to [[AppendEntriesRequest]] with optional §5.3 fast-backtracking
     * conflict hints (`conflictIndex` and `conflictTerm`).
     */
-  case AppendEntriesResponse(
+  final case class AppendEntriesResponse(
       term: Long,
       success: Boolean,
       matchIndex: Long,
       conflictIndex: Option[Long] = None,
       conflictTerm: Option[Long] = None
-  )
+  ) extends RaftMessage
 
-  /** Request a vote or speculative pre-vote (§5.2, §9.6, §3.10).
-    *
-    * @param isPreVote
-    *   `true` for non-binding Pre-Vote probes (`term` is `currentTerm + 1`)
-    * @param isTransfer
-    *   `true` when campaigning immediately upon receiving `TimeoutNowRequest`,
-    *   bypassing `leaderStickiness` on peers (`tikv/raft-rs`
-    *   `CampaignTransfer`)
-    */
-  case RequestVoteRequest(
+  /** Request a vote or speculative pre-vote (§5.2, §9.6, §3.10). */
+  final case class RequestVoteRequest(
       term: Long,
       candidateId: NodeId,
       lastLogIndex: Long,
       lastLogTerm: Long,
       isPreVote: Boolean = false,
       isTransfer: Boolean = false
-  )
+  ) extends RaftMessage
 
   /** Response to [[RequestVoteRequest]]. */
-  case RequestVoteResponse(
+  final case class RequestVoteResponse(
       term: Long,
       voteGranted: Boolean,
       isPreVote: Boolean = false
-  )
+  ) extends RaftMessage
 
-  /** Stream a snapshot chunk from leader to lagging follower (§7). */
-  case InstallSnapshotRequest(
+  /** Stream an immutable snapshot chunk from leader to lagging follower (§7).
+    */
+  final case class InstallSnapshotRequest(
       term: Long,
       leaderId: NodeId,
       lastIncludedIndex: Long,
       lastIncludedTerm: Long,
       offset: Long,
-      data: Array[Byte],
+      payload: Bytes,
       done: Boolean
-  )
+  ) extends RaftMessage:
+    /** Defensive `Array[Byte]` copy of [[payload]]. */
+    def data: Array[Byte] = payload.toArray
+
+  object InstallSnapshotRequest:
+    def apply(
+        term: Long,
+        leaderId: NodeId,
+        lastIncludedIndex: Long,
+        lastIncludedTerm: Long,
+        offset: Long,
+        data: Array[Byte],
+        done: Boolean
+    ): InstallSnapshotRequest =
+      new InstallSnapshotRequest(
+        term = term,
+        leaderId = leaderId,
+        lastIncludedIndex = lastIncludedIndex,
+        lastIncludedTerm = lastIncludedTerm,
+        offset = offset,
+        payload = Bytes.copyFrom(data),
+        done = done
+      )
 
   /** Response to [[InstallSnapshotRequest]]. */
-  case InstallSnapshotResponse(
+  final case class InstallSnapshotResponse(
       term: Long,
       success: Boolean,
       matchIndex: Long = 0L
-  )
+  ) extends RaftMessage
 
   /** Administrative request on leader to transfer leadership to `target`
     * (§3.10).
     */
-  case TransferLeadershipRequest(
+  final case class TransferLeadershipRequest(
       term: Long,
       target: NodeId
-  )
+  ) extends RaftMessage
 
   /** Direct RPC from departing leader to `target` once caught up, instructing
     * `target` to start an immediate election (`isTransfer = true`).
     */
-  case TimeoutNowRequest(
+  final case class TimeoutNowRequest(
       term: Long,
       leaderId: NodeId
-  )
+  ) extends RaftMessage
 
   /** Client request for a linearizable read via the `ReadIndex` protocol
     * (§6.4).
     */
-  case ReadIndexRequest(
+  final case class ReadIndexRequest(
       requestId: String
-  )
+  ) extends RaftMessage
 
   /** Response to [[ReadIndexRequest]]. */
-  case ReadIndexResponse(
+  final case class ReadIndexResponse(
       requestId: String,
       success: Boolean,
       readIndex: Long
-  )
+  ) extends RaftMessage
 
   /** Request to add a server (`Voter` or `Learner`) to the cluster (§6). */
-  case AddServerRequest(
+  final case class AddServerRequest(
       term: Long,
       newServer: NodeId,
       isLearner: Boolean = false
-  )
+  ) extends RaftMessage
 
   /** Response to [[AddServerRequest]]. */
-  case AddServerResponse(
+  final case class AddServerResponse(
       term: Long,
       success: Boolean,
       leaderHint: Option[NodeId]
-  )
+  ) extends RaftMessage
 
   /** Request to remove a server from the cluster (§6). */
-  case RemoveServerRequest(
+  final case class RemoveServerRequest(
       term: Long,
       server: NodeId
-  )
+  ) extends RaftMessage
 
   /** Response to [[RemoveServerRequest]]. */
-  case RemoveServerResponse(
+  final case class RemoveServerResponse(
       term: Long,
       success: Boolean,
       leaderHint: Option[NodeId]
-  )
+  ) extends RaftMessage
 
   /** Logical election timeout event. */
-  case ElectionTimeout
+  case object ElectionTimeout extends RaftMessage
 
   /** Logical heartbeat timeout event. */
-  case HeartbeatTimeout
+  case object HeartbeatTimeout extends RaftMessage
 
   /** Logical leader `CheckQuorum` verification event (§6.2). */
-  case CheckQuorumTimeout
+  case object CheckQuorumTimeout extends RaftMessage
 
-object RaftMessage:
   extension (msg: RaftMessage)
     def term: Option[Long] = msg match
       case m: AppendEntriesRequest      => Some(m.term)
