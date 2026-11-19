@@ -1,7 +1,9 @@
 package raft.transport.grpc
 
 import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path}
 import scala.concurrent.duration.*
+import scala.sys.process.{Process, ProcessLogger}
 
 import cats.effect.IO
 import cats.effect.std.Queue
@@ -264,11 +266,13 @@ class GrpcTransportSpec extends AnyFlatSpec with Matchers:
 
         got <- raft2.receive.head.compile.lastOrError.timeout(5.seconds)
         _ = got shouldBe (n1 -> msg)
-        _ = raw1.activeChannelAddresses should contain allOf (addr2, addr3)
+        addrsBefore <- raw1.activeChannelAddresses
+        _ = addrsBefore should contain allOf (addr2, addr3)
 
         // Remove n3 from peer map -> channel to addr3 must be evicted and shut down
         _ <- raw1.updatePeers(Map(n2 -> addr2))
-        _ = raw1.activeChannelAddresses shouldBe Set(addr2)
+        addrsAfter <- raw1.activeChannelAddresses
+        _ = addrsAfter shouldBe Set(addr2)
       yield ()
     }
 
@@ -318,4 +322,276 @@ class GrpcTransportSpec extends AnyFlatSpec with Matchers:
       }
 
     test.unsafeRunSync()
+  }
+
+  it should "validate GrpcConfig via error-accumulating Validated smart constructor" in {
+    val bad = GrpcConfig.validate(
+      host = "   ",
+      port = 70000,
+      maxMessageSize = 0,
+      keepAliveInterval = 0.millis,
+      keepAliveTimeout = (-1).millis,
+      useTls = true,
+      tlsCertPath = None,
+      tlsKeyPath = Some("  "),
+      maxRetries = -1,
+      retryBackoff = 100.millis,
+      maxRetryBackoff = 10.millis,
+      maxInboundQueueSize = 0
+    )
+    bad.isValid shouldBe false
+    bad.toEither.left.toOption.get.size shouldBe 10
+
+    val good = GrpcConfig.validate(
+      host = "127.0.0.1",
+      port = 0,
+      useTls = false,
+      retryBackoff = 10.millis,
+      maxRetryBackoff = 50.millis
+    )
+    good.isValid shouldBe true
+  }
+
+  it should "pack sendBatch into a single WireEnvelope.payloads RPC and retry on WireAck(accepted = false) backpressure (FP7, ST4)" in {
+    val senderCfg = GrpcConfig(
+      host = "127.0.0.1",
+      port = 0,
+      maxRetries = 10,
+      retryBackoff = 25.millis,
+      maxRetryBackoff = 80.millis
+    )
+    // Receiver queue capacity = 5 for the batch test, then = 1 for saturation backpressure!
+    val batchTest = (for
+      sender <- GrpcTransport.resource[IO](
+        senderCfg,
+        TransportConfig(n1, "127.0.0.1:0", Map.empty),
+        logger
+      )
+      receiver <- GrpcTransport.resource[IO](
+        GrpcConfig(host = "127.0.0.1", port = 0, maxInboundQueueSize = 5),
+        TransportConfig(n2, "127.0.0.1:0", Map.empty),
+        logger
+      )
+    yield (sender, receiver)).use { case (sender, receiver) =>
+      for
+        rAddr <- receiver.localAddress
+        _ <- sender.updatePeers(Map(n2 -> rAddr))
+        frames = (1 to 5).map(i => s"frame-$i".getBytes(StandardCharsets.UTF_8))
+        _ <- sender.sendBatch(n2, frames)
+        got <- receiver.receive.take(5).compile.toVector.timeout(5.seconds)
+        stats <- sender.transportStats
+      yield
+        got.map(p => new String(p._2, StandardCharsets.UTF_8)) shouldBe
+          Vector("frame-1", "frame-2", "frame-3", "frame-4", "frame-5")
+        stats.batchesSent shouldBe 1L
+        stats.envelopesSent shouldBe 1L
+    }
+
+    val backpressureTest = (for
+      sender <- GrpcTransport.resource[IO](
+        senderCfg,
+        TransportConfig(n1, "127.0.0.1:0", Map.empty),
+        logger
+      )
+      tinyReceiver <- GrpcTransport.resource[IO](
+        GrpcConfig(host = "127.0.0.1", port = 0, maxInboundQueueSize = 1),
+        TransportConfig(n2, "127.0.0.1:0", Map.empty),
+        logger
+      )
+    yield (sender, tinyReceiver)).use { case (sender, tinyReceiver) =>
+      for
+        rAddr <- tinyReceiver.localAddress
+        _ <- sender.updatePeers(Map(n2 -> rAddr))
+        // Fill the single slot in tinyReceiver's inbound queue
+        _ <- sender.send(n2, "first".getBytes(StandardCharsets.UTF_8))
+        // Second send hits WireAck(accepted = false) -> backs off & retries until consumer drains!
+        secondFiber <- sender
+          .send(n2, "second".getBytes(StandardCharsets.UTF_8))
+          .start
+        _ <- IO.sleep(70.millis)
+        firstGot <- tinyReceiver.receive.head.compile.lastOrError
+          .timeout(5.seconds)
+        _ <- secondFiber.joinWithNever
+        secondGot <- tinyReceiver.receive.head.compile.lastOrError
+          .timeout(5.seconds)
+        stats <- sender.transportStats
+      yield
+        new String(firstGot._2, StandardCharsets.UTF_8) shouldBe "first"
+        new String(secondGot._2, StandardCharsets.UTF_8) shouldBe "second"
+        stats.backpressureRetries should be >= 1L
+    }
+
+    (batchTest *> backpressureTest).unsafeRunSync()
+  }
+
+  it should "enforce mTLS X.509 client certificate identity against spoofed sender_id (ST4)" in {
+    def deleteRec(p: Path): Unit =
+      if Files.exists(p) then
+        if Files.isDirectory(p) then
+          val s = Files.list(p)
+          try s.iterator().forEachRemaining(deleteRec)
+          finally s.close()
+        val _ = Files.deleteIfExists(p)
+
+    def runOpenSsl(cwd: Path, args: Seq[String]): Unit =
+      val log = ProcessLogger(_ => (), _ => ())
+      val code = Process(args, cwd.toFile).!(log)
+      require(code == 0, s"openssl failed ($code): ${args.mkString(" ")}")
+
+    val pkiDir = Files.createTempDirectory("raft-grpc-mtls-id-")
+    try
+      val caKey = pkiDir.resolve("ca.key")
+      val caCrt = pkiDir.resolve("ca.crt")
+      runOpenSsl(
+        pkiDir,
+        Seq(
+          "openssl",
+          "req",
+          "-x509",
+          "-newkey",
+          "rsa:2048",
+          "-nodes",
+          "-keyout",
+          caKey.toString,
+          "-out",
+          caCrt.toString,
+          "-days",
+          "2",
+          "-subj",
+          "/CN=RaftTestCA"
+        )
+      )
+
+      def issueCert(id: String): (Path, Path) =
+        val rawKey = pkiDir.resolve(s"$id-raw.key")
+        val key = pkiDir.resolve(s"$id.key")
+        val csr = pkiDir.resolve(s"$id.csr")
+        val crt = pkiDir.resolve(s"$id.crt")
+        val ext = pkiDir.resolve(s"$id.ext")
+        val _ = Files.writeString(
+          ext,
+          s"subjectAltName=IP:127.0.0.1,DNS:localhost,URI:spiffe://raft.local/ns/default/sa/$id\nextendedKeyUsage=serverAuth,clientAuth\n"
+        )
+        runOpenSsl(
+          pkiDir,
+          Seq(
+            "openssl",
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            rawKey.toString,
+            "-out",
+            csr.toString,
+            "-subj",
+            s"/CN=$id"
+          )
+        )
+        runOpenSsl(
+          pkiDir,
+          Seq(
+            "openssl",
+            "pkcs8",
+            "-topk8",
+            "-nocrypt",
+            "-in",
+            rawKey.toString,
+            "-out",
+            key.toString
+          )
+        )
+        runOpenSsl(
+          pkiDir,
+          Seq(
+            "openssl",
+            "x509",
+            "-req",
+            "-in",
+            csr.toString,
+            "-CA",
+            caCrt.toString,
+            "-CAkey",
+            caKey.toString,
+            "-CAcreateserial",
+            "-out",
+            crt.toString,
+            "-days",
+            "2",
+            "-extfile",
+            ext.toString
+          )
+        )
+        (crt, key)
+
+      val (n1Crt, n1Key) = issueCert("node-1")
+      val (n2Crt, n2Key) = issueCert("node-2")
+
+      val n1GrpcCfg = GrpcConfig(
+        host = "127.0.0.1",
+        port = 0,
+        useTls = true,
+        tlsCertPath = Some(n1Crt.toString),
+        tlsKeyPath = Some(n1Key.toString),
+        tlsTrustCertPath = Some(caCrt.toString),
+        tlsClientAuth = true,
+        verifyPeerIdentity = true
+      )
+      val n2GrpcCfg = GrpcConfig(
+        host = "127.0.0.1",
+        port = 0,
+        useTls = true,
+        tlsCertPath = Some(n2Crt.toString),
+        tlsKeyPath = Some(n2Key.toString),
+        tlsTrustCertPath = Some(caCrt.toString),
+        tlsClientAuth = true,
+        verifyPeerIdentity = true,
+        maxRetries = 1
+      )
+
+      val prog = (for
+        srv1 <- GrpcTransport.resource[IO](
+          n1GrpcCfg,
+          TransportConfig(n1, "127.0.0.1:0", Map.empty),
+          logger
+        )
+        honestPeer2 <- GrpcTransport.resource[IO](
+          n2GrpcCfg,
+          TransportConfig(n2, "127.0.0.1:0", Map.empty),
+          logger
+        )
+        // Compromised node-2 holds CA-valid node-2.crt, but spoofs localId = node-3!
+        spoofingPeer2 <- GrpcTransport.resource[IO](
+          n2GrpcCfg,
+          TransportConfig(n3, "127.0.0.1:0", Map.empty),
+          logger
+        )
+      yield (srv1, honestPeer2, spoofingPeer2)).use {
+        case (srv1, honestPeer2, spoofingPeer2) =>
+          for
+            addr1 <- srv1.localAddress
+            _ <- honestPeer2.updatePeers(Map(n1 -> addr1))
+            _ <- spoofingPeer2.updatePeers(Map(n1 -> addr1))
+
+            // 1. Spoofed sender_id = "node-3" using node-2.crt MUST be rejected with PERMISSION_DENIED
+            _ <- spoofingPeer2.send(
+              n1,
+              "spoofed-vote".getBytes(StandardCharsets.UTF_8)
+            )
+            // 2. Honest sender_id = "node-2" using node-2.crt MUST succeed
+            _ <- honestPeer2.send(
+              n1,
+              "authentic-vote".getBytes(StandardCharsets.UTF_8)
+            )
+            received <- srv1.receive.head.compile.lastOrError.timeout(5.seconds)
+            srvStats <- srv1.transportStats
+          yield
+            received._1 shouldBe n2
+            new String(received._2, StandardCharsets.UTF_8) shouldBe
+              "authentic-vote"
+            srvStats.rejectedSpoofedEnvelopes shouldBe 1L
+      }
+
+      prog.unsafeRunSync()
+    finally deleteRec(pkiDir)
   }

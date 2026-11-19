@@ -15,6 +15,7 @@ service RaftService {
 message WireEnvelope {
   string sender_id = 1;
   bytes payload = 2;
+  repeated bytes payloads = 3;
 }
 
 message WireAck {

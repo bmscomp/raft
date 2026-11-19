@@ -332,28 +332,31 @@ When Raft RPCs traverse WAN backbones or public cloud interconnects, always enab
 ```mermaid
 flowchart LR
     subgraph DC1["DC-Primary (us-east)"]
-        N1["Node A (node-a.crt + ca.crt)"]
+        N1["Node A (CN=node-a, spiffe://.../node-a)"]
     end
     subgraph DC2["DC-Secondary (eu-west)"]
-        N2["Node C (node-c.crt + ca.crt)"]
+        N2["Node C (CN=node-c, spiffe://.../node-c)"]
     end
-    Rogue["Untrusted Host (rogue.crt)"]
+    Rogue["Untrusted Cert (rogue.crt)"]
+    Spoof["Compromised Node B (CN=node-b spoofing sender_id=node-a)"]
 
-    N1 <-->|"mTLS HTTP/2 (Verified X.509 SAN + ClientAuth.REQUIRE)"| N2
+    N1 <-->|"mTLS HTTP/2 + Batched WireEnvelope.payloads"| N2
     Rogue -.->|"TLS Handshake Rejected"| N1
+    Spoof -.->|"PERMISSION_DENIED (X.509 Identity Mismatch)"| N1
 ```
 
 ```scala
 import raft.transport.grpc.GrpcConfig
 
-val crossDcMtlsGrpc = GrpcConfig(
+val crossDcMtlsGrpc = GrpcConfig.validate(
   host = "0.0.0.0",
   port = 9443,
   useTls = true,
   tlsCertPath = Some("/etc/raft/tls/node.crt"),
   tlsKeyPath = Some("/etc/raft/tls/node-pkcs8.key"),
   tlsTrustCertPath = Some("/etc/raft/tls/cluster-ca.crt"),
-  tlsClientAuth = true
+  tlsClientAuth = true,
+  verifyPeerIdentity = true
 )
 ```
 

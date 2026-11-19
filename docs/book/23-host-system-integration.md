@@ -177,15 +177,38 @@ val mtlsTransportResource =
       tlsCertPath = Some("/etc/raft/pki/node-1.crt"),
       tlsKeyPath = Some("/etc/raft/pki/node-1.key"),       // PKCS#8 PEM
       tlsTrustCertPath = Some("/etc/raft/pki/ca.crt"),     // Cluster Root CA
-      tlsClientAuth = true                                 // Enforce mTLS ClientAuth.REQUIRE
+      tlsClientAuth = true,                                // Enforce mTLS ClientAuth.REQUIRE
+      verifyPeerIdentity = true                            // Bind WireEnvelope.sender_id to X.509 CN / SPIFFE URI
     ),
     TransportConfig(local, "0.0.0.0:9090", peers)
   )
 ```
 
-Notice two operational details built into `GrpcTransport`:
-1. **Dynamic membership routing**: Call `grpcTransport.updatePeers(newMap)` whenever a Joint Consensus configuration change adds or retires nodes.
-2. **Fault isolation**: If peer `node-3` crashes or is network-partitioned, `send(node-3, msg)` logs and absorbs the `UNAVAILABLE` status so `broadcast` continues replicating to `node-2` without disrupting the leader's event loop.
+```mermaid
+sequenceDiagram
+    participant L as "Leader GrpcTransport (AtomicCell Pool)"
+    participant N as "Netty HTTP/2 + mTLS Interceptor"
+    participant F as "Follower RaftService (Bounded Queue)"
+
+    L->>N: "SendEnvelope(sender_id='node-1', payloads=[AE_1..AE_k])"
+    N->>N: "Extract X.509 CN / SPIFFE URI into Context.Key"
+    alt "sender_id not in X.509 identities"
+        N-->>L: "Status.PERMISSION_DENIED (rejectedSpoofedEnvelopes++)"
+    else "Authentic peer identity"
+        N->>F: "Offer k frames to bounded incomingQueue"
+        alt "Queue saturated"
+            F-->>L: "WireAck(accepted=false) -> RESOURCE_EXHAUSTED backoff"
+        else "Accepted"
+            F-->>L: "WireAck(accepted=true)"
+        end
+    end
+```
+
+Notice four operational guarantees built into `GrpcTransport`:
+1. **Lock-free pure `AtomicCell` channel pool**: Peer routing maps and Netty `ManagedChannel` lifecycles are serialized via `AtomicCell[F, ChannelPoolState]` without `ConcurrentHashMap` or monitor locks; `updatePeers(newMap)` atomically evicts and closes retired channels.
+2. **Single-RPC batch framing (`WireEnvelope.payloads`)**: Pipelined `AppendEntries` bursts (`sendBatch`) traverse HTTP/2 in a single `WireEnvelope` RPC rather than `N` unary calls.
+3. **End-to-end queue backpressure**: When a follower's bounded `incomingQueue` saturates (`WireAck(accepted = false)`), the sender treats the response as transient `RESOURCE_EXHAUSTED` and backs off exponentially without tearing down healthy sockets.
+4. **Cryptographic `sender_id` binding**: Under `tlsClientAuth && verifyPeerIdentity`, a compromised peer holding a valid CA-signed certificate for `node-2` cannot impersonate `sender_id = "node-1"`.
 
 ---
 

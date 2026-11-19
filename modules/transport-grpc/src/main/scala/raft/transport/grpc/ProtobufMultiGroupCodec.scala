@@ -1,8 +1,9 @@
 package raft.transport.grpc
 
+import scala.annotation.tailrec
 import scala.util.control.NonFatal
 
-import raft.message.{CodecError, RaftMessage}
+import raft.message.CodecError
 import raft.message.RaftMessage.{AppendEntriesRequest, AppendEntriesResponse}
 import raft.multigroup.GroupEnvelope
 import raft.state.{GroupId, NodeId}
@@ -79,14 +80,7 @@ object ProtobufMultiGroupCodec:
             fromEnvelopeProto(envProto).map(Vector(_))
 
           case pb.MultiRaftWireFrame.Frame.Batch(batchProto) =>
-            val builder = Vector.newBuilder[GroupEnvelope]
-            val iter = batchProto.envelopes.iterator
-            var err: Option[CodecError] = None
-            while iter.hasNext && err.isEmpty do
-              fromEnvelopeProto(iter.next()) match
-                case Right(env) => builder += env
-                case Left(ce)   => err = Some(ce)
-            err.toLeft(builder.result())
+            decodeBatchEnvelopes(batchProto.envelopes.toVector)
 
           case pb.MultiRaftWireFrame.Frame.CoalescedHeartbeat(hbProto) =>
             Right(fromCoalescedHeartbeatProto(hbProto))
@@ -98,6 +92,21 @@ object ProtobufMultiGroupCodec:
               Some(e)
             )
           )
+
+  private def decodeBatchEnvelopes(
+      protos: Vector[pb.MultiGroupEnvelopeProto]
+  ): Either[CodecError, Vector[GroupEnvelope]] =
+    @tailrec
+    def loop(
+        idx: Int,
+        acc: Vector[GroupEnvelope]
+    ): Either[CodecError, Vector[GroupEnvelope]] =
+      if idx >= protos.length then Right(acc)
+      else
+        fromEnvelopeProto(protos(idx)) match
+          case Right(env) => loop(idx + 1, acc :+ env)
+          case Left(ce)   => Left(ce)
+    loop(0, Vector.empty)
 
   private def toEnvelopeProto(env: GroupEnvelope): pb.MultiGroupEnvelopeProto =
     pb.MultiGroupEnvelopeProto(
