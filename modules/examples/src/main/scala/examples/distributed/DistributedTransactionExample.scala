@@ -236,22 +236,48 @@ object DistributedTransactionExample extends IOApp.Simple:
     def getTransactionLog: F[List[TxnResult]] = txnLog.get
 
     def snapshot: F[Stream[F, Byte]] =
-      state.get.map { s =>
+      for
+        s <- state.get
+        vs <- versions.get
+        gv <- globalVersion.get
+      yield
+        val header = s"GV\t$gv"
+        val body = s.toSeq.sortBy(_._1).map { case (k, v) =>
+          val ver = vs.getOrElse(k, 0L)
+          s"KV\t$k\t$ver\t$v"
+        }
         Stream
-          .emits(s.map((k, v) => s"$k=$v").mkString("\n").getBytes)
+          .emits(
+            (header +: body)
+              .mkString("\n")
+              .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+          )
           .covary[F]
-      }
+
     def restore(data: Stream[F, Byte]): F[Unit] =
       data.compile.to(Array).flatMap { bytes =>
-        val entries = new String(bytes)
-          .split("\n")
-          .flatMap { line =>
-            line.split("=", 2) match
-              case Array(k, v) => Some(k -> v)
-              case _           => None
+        val str = new String(bytes, java.nio.charset.StandardCharsets.UTF_8)
+        if str.isEmpty then
+          state.set(Map.empty) *> versions.set(Map.empty) *> globalVersion.set(
+            0L
+          )
+        else
+          val lines = str.split("\n").toList
+          val restoredGv = lines
+            .collectFirst {
+              case l if l.startsWith("GV\t") => l.drop(3).toLongOption
+            }
+            .flatten
+            .getOrElse(0L)
+          val kvAndVer = lines.flatMap { line =>
+            line.split("\t", 4) match
+              case Array("KV", k, verStr, v) =>
+                Some((k, v, verStr.toLongOption.getOrElse(0L)))
+              case _ => None
           }
-          .toMap
-        state.set(entries)
+          state.set(kvAndVer.map((k, v, _) => k -> v).toMap) *>
+            versions.set(kvAndVer.map((k, _, ver) => k -> ver).toMap) *>
+            globalVersion.set(restoredGv)
       }
 
   object TransactionalStore:
@@ -269,10 +295,10 @@ object DistributedTransactionExample extends IOApp.Simple:
       _ <- IO.println("  DISTRIBUTED TRANSACTIONS WITH RAFT")
       _ <- IO.println("═" * 70)
       _ <- IO.println("")
-      _ <- runDemo
+      _ <- runDemoWithStore.void
     yield ()
 
-  private def runDemo: IO[Unit] =
+  def runDemoWithStore: IO[TransactionalStore[IO]] =
     for
       store <- TransactionalStore[IO]
 
@@ -474,4 +500,4 @@ object DistributedTransactionExample extends IOApp.Simple:
 """)
       _ <- IO.println("═" * 70)
       _ <- IO.println("\n✅ Distributed transaction example complete!")
-    yield ()
+    yield store

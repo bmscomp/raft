@@ -1554,6 +1554,13 @@ private final class RaftNodeImpl[F[_]: Async](
               runTransfer.start.void
           }
 
+  private def sendMessageWithMetrics(to: NodeId, msg: RaftMessage): F[Unit] =
+    val voteMetric = msg match
+      case RequestVoteResponse(term, true, false) =>
+        metrics.onVoteGranted(config.localId, to, term)
+      case _ => Async[F].unit
+    transport.send(to, msg) *> voteMetric
+
   private def executeEffects(effects: List[Eff]): F[Unit] =
     effects match
       case Nil                          => Async[F].unit
@@ -1561,20 +1568,47 @@ private final class RaftNodeImpl[F[_]: Async](
         val (moreSends, rest) = tail.span(_.isInstanceOf[Eff.SendMessage])
         val allSends =
           s :: moreSends.collect { case sm: Eff.SendMessage => sm }
+        val heartbeatPeerCount = allSends
+          .collect {
+            case Eff.SendMessage(to, ae: AppendEntriesRequest)
+                if ae.entries.isEmpty =>
+              to
+          }
+          .distinct
+          .size
+        val hbMetric =
+          if heartbeatPeerCount > 0 then
+            metrics.onHeartbeatSent(config.localId, heartbeatPeerCount)
+          else Async[F].unit
         val byPeer = allSends.groupBy(_.to).toList
         dispatchPeers(byPeer) { case (peer, msgs) =>
-          msgs.traverse_(m => transport.send(peer, m.message))
-        } *> executeEffects(rest)
+          msgs.traverse_(m => sendMessageWithMetrics(peer, m.message))
+        } *> hbMetric *> executeEffects(rest)
       case head :: tail =>
         executeSingleEffect(head) *> executeEffects(tail)
 
   private def executeSingleEffect(effect: Eff): F[Unit] =
     effect match
       case Eff.SendMessage(to, msg) =>
-        transport.send(to, msg)
+        val hbMetric = msg match
+          case ae: AppendEntriesRequest if ae.entries.isEmpty =>
+            metrics.onHeartbeatSent(config.localId, 1)
+          case _ => Async[F].unit
+        sendMessageWithMetrics(to, msg) *> hbMetric
 
       case Eff.Broadcast(msg) =>
-        transport.broadcast(msg)
+        val bcastMetric = msg match
+          case req: RequestVoteRequest =>
+            metrics.onElectionStarted(config.localId, req.term)
+          case ae: AppendEntriesRequest if ae.entries.isEmpty =>
+            clusterRef.get.flatMap { cl =>
+              val peerCount = (cl.allNodes - config.localId).size
+              if peerCount > 0 then
+                metrics.onHeartbeatSent(config.localId, peerCount)
+              else Async[F].unit
+            }
+          case _ => Async[F].unit
+        transport.broadcast(msg) *> bcastMetric
 
       case Eff.PersistHardState(term, vf) =>
         stableStore.setHardState(Term.unsafeFrom(term), vf)

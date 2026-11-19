@@ -15,6 +15,9 @@ import raft.state.{ClusterConfig, NodeId, NodeRole, NodeState, RaftConfig}
 object JointConsensusExample:
 
   def main(args: Array[String]): Unit =
+    val _ = runMigration()
+
+  def runMigration(): (Boolean, Set[NodeId], Long) =
     println("=" * 70)
     println("  JOINT CONSENSUS MEMBERSHIP CHANGE EXAMPLE (§6)")
     println("=" * 70)
@@ -111,4 +114,9 @@ object JointConsensusExample:
     pump()
     println(
       s"\n4. Replicated post-reconfiguration entry across new voters: commitIndex=${nodes(n4)._1.commitIndex} on ${n4.value} & ${nodes(n5)._1.commitIndex} on ${n5.value}"
+    )
+    (
+      nodes(n2)._1.clusterConfig.isInJointConsensus,
+      nodes(n2)._1.clusterConfig.voters,
+      nodes(n4)._1.commitIndex
     )

@@ -7,7 +7,7 @@ import org.typelevel.log4cats.noop.NoOpLogger
 
 import raft.RaftNode
 import raft.metrics.RaftMetrics
-import raft.state.{GroupId, LogId, NodeId, NodeState}
+import raft.state.{ClusterConfig, GroupId, LogId, NodeId, NodeState}
 import raft.state.NodeState.Leader
 
 /** Coordinator for managing multiple independent Raft consensus groups on a
@@ -54,6 +54,17 @@ trait MultiRaftNode[F[_]]:
 
   /** Initiate graceful leadership transfer on `groupId` to `target` (§3.10). */
   def transferGroupLeadership(groupId: GroupId, target: NodeId): F[Unit]
+
+  /** Propose a Joint Consensus / membership configuration change on `groupId`
+    * (§6).
+    */
+  def proposeConfChangeToGroup(
+      groupId: GroupId,
+      newConfig: ClusterConfig
+  ): F[LogId]
+
+  /** Inspect the active [[ClusterConfig]] of `groupId`. */
+  def getGroupClusterConfig(groupId: GroupId): F[Option[ClusterConfig]]
 
   /** Rebalance shard leadership across physical hosts: for every group in
     * `preferredLeaders` where this node is currently the active `Leader` and
@@ -198,6 +209,19 @@ private final class MultiRaftNodeImpl[F[_]: Async](
 
   def transferGroupLeadership(groupId: GroupId, target: NodeId): F[Unit] =
     withGroupNode(groupId)(_.transferLeadership(target))
+
+  def proposeConfChangeToGroup(
+      groupId: GroupId,
+      newConfig: ClusterConfig
+  ): F[LogId] =
+    withGroupNode(groupId)(_.proposeConfChange(newConfig))
+
+  def getGroupClusterConfig(groupId: GroupId): F[Option[ClusterConfig]] =
+    groupsRef.get.flatMap { groups =>
+      groups.get(groupId) match
+        case Some((node, _)) => node.getClusterConfig.map(Some(_))
+        case None            => Async[F].pure(None)
+    }
 
   def rebalanceLeadership(preferredLeaders: Map[GroupId, NodeId]): F[Int] =
     groupsRef.get.flatMap { groups =>

@@ -149,6 +149,9 @@ object DistributedCounterExample extends IOApp.Simple:
     def receive(nodeId: NodeId): F[(NodeId, RaftMessage)] =
       queues(nodeId).take
 
+    def tryReceive(nodeId: NodeId): F[Option[(NodeId, RaftMessage)]] =
+      queues(nodeId).tryTake
+
   object SimulatedNetwork:
     def apply[F[_]: Async](nodeIds: List[NodeId]): F[SimulatedNetwork[F]] =
       nodeIds
@@ -180,13 +183,14 @@ object DistributedCounterExample extends IOApp.Simple:
   class SimulatedNode[F[_]: Async](
       val nodeId: NodeId,
       config: RaftConfig,
+      cluster: ClusterConfig,
       network: SimulatedNetwork[F],
       stateMachine: CounterStateMachine[F],
       stateRef: Ref[F, NodeState],
       logRef: Ref[F, Vector[Log]],
       commitIndex: Ref[F, Long]
   ):
-    private val clusterSize = 3
+    private val clusterSize = cluster.voters.size
 
     def getState: F[NodeState] = stateRef.get
     def getLog: F[Vector[Log]] = logRef.get
@@ -214,7 +218,8 @@ object DistributedCounterExample extends IOApp.Simple:
           lastLogTerm,
           clusterSize,
           getTermAt,
-          sender = Some(from)
+          sender = Some(from),
+          clusterOpt = Some(cluster)
         )
 
         // Apply new state
@@ -237,6 +242,9 @@ object DistributedCounterExample extends IOApp.Simple:
         case AppendLogs(entries) =>
           logRef.update(_ ++ entries)
 
+        case TruncateLog(fromIndex) =>
+          logRef.update(_.filter(_.index < fromIndex))
+
         case BecomeLeader =>
           Async[F].delay(println(s"    🎉 ${nodeId.value} became LEADER!"))
 
@@ -244,14 +252,15 @@ object DistributedCounterExample extends IOApp.Simple:
           for
             logs <- logRef.get
             currentCommit <- commitIndex.get
+            targetCommit = math.max(currentCommit, upToIndex.value)
             toApply = logs.filter(l =>
-              l.index > currentCommit && l.index <= upToIndex.value
+              l.index > currentCommit && l.index <= targetCommit
             )
             _ <- toApply.traverse_(log => stateMachine.apply(log))
-            _ <- commitIndex.set(upToIndex.value)
+            _ <- commitIndex.set(targetCommit)
           yield ()
 
-        case _ => Async[F].unit // Simplified - ignore other effects
+        case _ => Async[F].unit // Simplified - ignore timer/metrics effects
 
     /** Submit a command (only works if this node is the leader). */
     def submitCommand(cmd: CounterCommand): F[Boolean] =
@@ -261,13 +270,23 @@ object DistributedCounterExample extends IOApp.Simple:
           case l: Leader =>
             for
               logs <- logRef.get
-              newIndex = if logs.isEmpty then 1L else logs.last.index + 1
+              prevIdx = logs.lastOption.map(_.index).getOrElse(0L)
+              prevTerm = logs.lastOption.map(_.term).getOrElse(0L)
+              newIndex = prevIdx + 1L
               newLog = Log.command(newIndex, l.term, CounterCommand.encode(cmd))
               _ <- logRef.update(_ :+ newLog)
               _ <- Async[F].delay(
                 println(s"    📝 Leader appended: $cmd at index $newIndex")
               )
-            // In production: replicate to followers and wait for commit
+              appendReq = AppendEntriesRequest(
+                term = l.term,
+                leaderId = nodeId,
+                prevLogIndex = prevIdx,
+                prevLogTerm = prevTerm,
+                entries = Seq(newLog),
+                leaderCommit = l.commitIndex
+              )
+              _ <- network.broadcast(nodeId, appendReq)
             yield true
           case _ =>
             Async[F].pure(false) // Not leader
@@ -276,6 +295,7 @@ object DistributedCounterExample extends IOApp.Simple:
   object SimulatedNode:
     def apply[F[_]: Async](
         nodeId: NodeId,
+        cluster: ClusterConfig,
         network: SimulatedNetwork[F]
     ): F[SimulatedNode[F]] =
       for
@@ -292,6 +312,7 @@ object DistributedCounterExample extends IOApp.Simple:
       yield new SimulatedNode[F](
         nodeId,
         config,
+        cluster,
         network,
         fsm,
         state,
@@ -307,86 +328,90 @@ object DistributedCounterExample extends IOApp.Simple:
       )
       _ <- IO.println("═" * 70)
       _ <- IO.println("")
-      _ <- runSimulation
+      _ <- runSimulationWithResult.void
     yield ()
 
-  private def runSimulation: IO[Unit] =
+  private def drainNetwork(
+      nodes: List[SimulatedNode[IO]],
+      network: SimulatedNetwork[IO]
+  ): IO[Unit] =
+    val nodeMap = nodes.map(n => n.nodeId -> n).toMap
+    def loop: IO[Unit] =
+      nodes
+        .traverse { n =>
+          network.tryReceive(n.nodeId).flatMap {
+            case Some((from, msg)) =>
+              nodeMap(n.nodeId).processMessage(from, msg).as(true)
+            case None => IO.pure(false)
+          }
+        }
+        .flatMap { progressed =>
+          if progressed.exists(identity) then loop else IO.unit
+        }
+    loop
+
+  def runSimulationWithResult: IO[List[Long]] =
     for
       // Create 3-node cluster
       _ <- IO.println("Step 1: Creating 3-node cluster...")
       nodeIds = List(NodeId("node-1"), NodeId("node-2"), NodeId("node-3"))
+      cluster = ClusterConfig(nodeIds.toSet)
       network <- SimulatedNetwork[IO](nodeIds)
 
-      node1 <- SimulatedNode[IO](nodeIds(0), network)
-      node2 <- SimulatedNode[IO](nodeIds(1), network)
-      node3 <- SimulatedNode[IO](nodeIds(2), network)
+      node1 <- SimulatedNode[IO](nodeIds(0), cluster, network)
+      node2 <- SimulatedNode[IO](nodeIds(1), cluster, network)
+      node3 <- SimulatedNode[IO](nodeIds(2), cluster, network)
+      allNodes = List(node1, node2, node3)
 
       _ <- IO.println("   ✓ Created nodes: node-1, node-2, node-3\n")
 
-      // Step 2: Trigger election on node-1
+      // Step 2: Trigger election on node-1 and pump Pre-Vote + Real Vote rounds
       _ <- IO.println("Step 2: Triggering election (node-1 times out)...")
       _ <- node1.processMessage(nodeIds(0), ElectionTimeout)
+      preState <- node1.getState
+      _ <- IO.println(s"   node-1 initial transition: $preState")
 
-      state1 <- node1.getState
-      _ <- IO.println(s"   node-1 state: $state1")
-
-      // Step 3: Followers receive and respond to vote request
-      _ <- IO.println("\nStep 3: Processing vote requests...")
-
-      // Get vote request from node-1
-      msg2Tuple <- network.receive(nodeIds(1))
-      msg3Tuple <- network.receive(nodeIds(2))
-      from2 = msg2Tuple._1
-      msg2 = msg2Tuple._2
-      from3 = msg3Tuple._1
-      msg3 = msg3Tuple._2
-
-      _ <- IO.println(s"   node-2 received: ${msg2.getClass.getSimpleName}")
-      _ <- IO.println(s"   node-3 received: ${msg3.getClass.getSimpleName}")
-
-      _ <- node2.processMessage(from2, msg2)
-      _ <- node3.processMessage(from3, msg3)
-
-      // Step 4: Candidate receives votes
-      _ <- IO.println("\nStep 4: Candidate receives votes...")
-
-      resp1Tuple <- network.receive(nodeIds(0))
-      fromResp1 = resp1Tuple._1
-      resp1 = resp1Tuple._2
-      _ <- node1.processMessage(fromResp1, resp1)
-
-      resp2Tuple <- network.receive(nodeIds(0))
-      fromResp2 = resp2Tuple._1
-      resp2 = resp2Tuple._2
-      _ <- node1.processMessage(fromResp2, resp2)
+      _ <- IO.println(
+        "\nStep 3: Pumping Pre-Vote & Vote messages across cluster..."
+      )
+      _ <- drainNetwork(allNodes, network)
 
       leaderState <- node1.getState
-      _ <- IO.println(s"   node-1 state after votes: $leaderState\n")
+      _ <- IO.println(s"   node-1 state after election: $leaderState\n")
 
-      // Step 5: Submit commands to leader
-      _ <- IO.println("Step 5: Submitting commands to leader...")
+      // Step 4: Submit commands to leader and replicate to followers
+      _ <- IO.println("Step 4: Submitting & replicating commands to leader...")
 
       _ <- node1.submitCommand(CounterCommand.Increment)
+      _ <- drainNetwork(allNodes, network)
       _ <- node1.submitCommand(CounterCommand.Increment)
+      _ <- drainNetwork(allNodes, network)
       _ <- node1.submitCommand(CounterCommand.Add(10))
+      _ <- drainNetwork(allNodes, network)
       _ <- node1.submitCommand(CounterCommand.Decrement)
+      _ <- drainNetwork(allNodes, network)
+
+      // Broadcast heartbeat carrying updated leaderCommit so followers apply up to commitIndex
+      _ <- node1.processMessage(nodeIds(0), HeartbeatTimeout)
+      _ <- drainNetwork(allNodes, network)
 
       log1 <- node1.getLog
       _ <- IO.println(s"\n   Leader log: ${log1.size} entries")
 
-      // Step 6: Show state machine state
+      // Step 5: Show state machine state across all 3 replicas
       _ <- IO.println(
-        "\nStep 6: Showing state machine state..."
+        "\nStep 5: Verifying replicated state machine across all 3 nodes..."
       )
 
-      // In production, replication and commit advancement happen automatically.
-      // The leader replicates entries to followers, and once a majority confirms,
-      // entries are committed and applied to the state machine.
       value1 <- node1.getStateMachineValue
+      value2 <- node2.getStateMachineValue
+      value3 <- node3.getStateMachineValue
       applied1 <- node1.getAppliedLog
 
-      _ <- IO.println(s"\n   Counter value: $value1")
-      _ <- IO.println(s"   Applied log:")
+      _ <- IO.println(
+        s"\n   Counter values: node-1=$value1, node-2=$value2, node-3=$value3"
+      )
+      _ <- IO.println(s"   Applied log on leader:")
       _ <- applied1.traverse_(line => IO.println(s"      $line"))
 
       // Summary
@@ -425,4 +450,4 @@ object DistributedCounterExample extends IOApp.Simple:
 """)
       _ <- IO.println("═" * 70)
       _ <- IO.println("\n✅ Distributed computing example complete!")
-    yield ()
+    yield List(value1, value2, value3)

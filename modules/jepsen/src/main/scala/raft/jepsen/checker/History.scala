@@ -90,6 +90,31 @@ case class History(operations: Vector[Operation]):
       !(op.opType == OpType.Invoke && infoIndices.contains(op.index))
     })
 
+  /** Prepare history for WGL linearizability checking:
+    *   - Definite operations (`Ok` / `Fail`) keep both their `Invoke` and
+    *     completion records (`compTime = Some(t)`).
+    *   - Indeterminate reads (`Info` on `OpFunction.Read`) are removed because
+    *     pure reads never mutate state and carry no output constraint.
+    *   - Indeterminate mutations (`Info` on `Write` / `CAS`) retain their
+    *     `Invoke` with `comp = None` (`compTime = None`): under WGL semantics,
+    *     a timed-out write or CAS may have committed at any point `>= invTime`
+    *     or may never have taken effect at all.
+    */
+  def prepareForChecking: History =
+    val completedIndices = allCompletions.map(_.index).toSet
+    val infoIndices = operations
+      .filter(_.opType == OpType.Info)
+      .map(_.index)
+      .toSet
+    History(operations.filter { op =>
+      op.opType match
+        case OpType.Info   => false
+        case OpType.Invoke =>
+          completedIndices.contains(op.index) &&
+          (!infoIndices.contains(op.index) || op.function != OpFunction.Read)
+        case OpType.Ok | OpType.Fail => true
+    })
+
   /** Remove incomplete operations (invocations without any completion). An
     * invocation is complete if it has an Ok, Fail, or Info record.
     */

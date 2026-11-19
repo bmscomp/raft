@@ -13,55 +13,37 @@ A key-value store (Chapter 10) lets you read and write individual keys atomicall
 - **Swap**: exchange the values of two keys atomically
 - **Inventory check**: reserve an item only if the stock level is sufficient
 
-Without transactions, concurrent operations on multiple keys can leave the system in an **inconsistent state**. Here's the classic example:
+Without transactions, concurrent operations on multiple keys can leave the system in an **inconsistent state**. Here is the classic lost-update anomaly when two clients concurrently transfer `100` units from `A` (`500`) to `B` (`300`):
 
-```
-Time  Client-1                         Client-2
-─────────────────────────────────────────────────────
-  1   Read balance(A) = 500
-  2                                    Read balance(A) = 500
-  3                                    Read balance(B) = 300
-  4   Read balance(B) = 300
-  5   Write balance(A) = 400 }         
-  6   Write balance(B) = 400 } transfer $100
-  7                                    Write balance(A) = 400 }
-  8                                    Write balance(B) = 400 } transfer $100
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1 (Transfer 100)
+    participant S as Uncoordinated KV Store
+    participant C2 as Client 2 (Transfer 100)
 
-Result: A=400, B=400 (total $800 instead of $800)
-Wait — the total is still $800? Let's check: before, A=500+B=300=$800.
-After, A=400+B=400=$800. Seems fine?
-
-No. Two transfers of $100 happened, but A only decreased by $100. One transfer was lost.
-The correct result should be A=300, B=500 (two transfers: 500→400→300, 300→400→500).
+    C1->>S: Read balance(A) -> 500
+    C2->>S: Read balance(A) -> 500
+    C2->>S: Read balance(B) -> 300
+    C1->>S: Read balance(B) -> 300
+    C1->>S: Write A = 400, Write B = 400
+    C2->>S: Write A = 400, Write B = 400 (Overwrites C1!)
+    Note over C1,C2: Final A=400, B=400 instead of A=300, B=500 (one transfer lost!)
 ```
 
-The root cause is a **write-write conflict** — both clients read the same initial value and then overwrote each other's changes. This is the classic "lost update" anomaly.
+The root cause is a **write-write conflict** — both clients read the same initial value and then overwrote each other's changes.
 
 ## Design: Transactions on a Replicated Log
 
 The key insight: Raft's log already provides **total ordering**. Every log entry has a unique index, and entries are applied in index order on every node. If we encode each transaction as a **single log entry**, the state machine applies transactions one at a time, sequentially. This gives us **serializable isolation** — the gold standard of transaction isolation levels — essentially for free.
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    Transaction Flow                           │
-│                                                               │
-│  Client                                                       │
-│    │ submit(Transaction)                                      │
-│    ▼                                                          │
-│  Leader                                                       │
-│    │ encode → single Log entry                                │
-│    │ replicate via Raft (same as any other write)             │
-│    ▼                                                          │
-│  Committed (replicated to majority)                           │
-│    │                                                          │
-│    ▼                                                          │
-│  StateMachine.apply(log)                                      │
-│    │ decode transaction                                       │
-│    │ validate preconditions (CAS checks against live state).  │
-│    │ if all checks pass → apply all operations → Committed    │
-│    │ if any check fails → reject entire txn → ConflictDetected│
-│    │ if decode error → Aborted                                │ 
-└───────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    C["Client: submit(Transaction)"] --> L["Leader: Encode as Single Log Entry & Replicate"]
+    L --> Q["Quorum Committed at LogIndex i"]
+    Q --> SM["StateMachine.apply(log): Decode & Validate CAS Preconditions"]
+    SM -->|"All CAS Checks Match"| OK["Apply All Operations Atomically -> Committed(version)"]
+    SM -->|"Any CAS Mismatch"| CF["Leave State Untouched -> ConflictDetected(expected, actual)"]
+    SM -->|"Malformed Payload"| AB["Reject -> Aborted(reason)"]
 ```
 
 This design is often called **OCC** (Optimistic Concurrency Control). The "optimistic" part means: the client prepares the transaction based on its view of the state, submits it, and hopes no conflicting transaction committed in the meantime. If a conflict is detected at apply time, the transaction is rejected and the client retries. This is in contrast to **pessimistic** concurrency control (locking), which prevents conflicts by blocking concurrent access.
@@ -315,14 +297,49 @@ The `buildTxn` function takes the current state and builds a transaction based o
 
 > **Note — Exponential backoff:** The `10.millis` sleep is simple but naive. In production, use exponential backoff with jitter to avoid thundering herd problems when many clients conflict on the same keys simultaneously. A good formula: `min(maxBackoff, initialBackoff * 2^attempt) * (0.5 + random(0.5))`.
 
+## Scaling Beyond One Group: Cross-Shard 2PC over Multi-Raft
+
+Single-log OCC guarantees strict serializability when all keys in a transaction belong to the **same** Raft group. When keys are partitioned across multiple Raft groups (`MultiRaftNode`), a transfer between `acct-1` (on `ledger-shard-0`) and `acct-5` (on `ledger-shard-2`) spans two independent consensus logs.
+
+`examples.advanced.ShardedBankLedgerExample` solves cross-shard atomicity by layering **Raft-Backed Two-Phase Commit (2PC)** with **Escrow Holds** and **Client Session Deduplication**:
+
+```mermaid
+flowchart LR
+    subgraph Coord["tx-coord Raft Group"]
+        TR["TxRecord: Preparing -> Committed / Aborted -> Completed"]
+    end
+
+    subgraph Src["Source Shard (ledger-shard-0)"]
+        P1["Phase 1: PrepareDebit(txId, acct, amt) -> Escrow Hold"]
+        C1["Phase 2: Commit2PC(txId) / Abort2PC(txId)"]
+    end
+
+    subgraph Dst["Target Shard (ledger-shard-2)"]
+        P2["Phase 1: PrepareCredit(txId, acct, amt) -> Validate"]
+        C2["Phase 2: Commit2PC(txId) / Abort2PC(txId)"]
+    end
+
+    TR --> P1 & P2
+    P1 & P2 --> C1 & C2
+```
+
+1. **Same-Shard Fast Path**: When `shardForAccount(from) == shardForAccount(to)`, `ShardedLedgerCluster.transfer` executes a single-entry `SameShardTransfer` with zero 2PC overhead.
+2. **Fault-Tolerant Coordinator**: Cross-shard transactions log `Begin(txId)` -> `DecideCommit(txId)` / `DecideAbort(txId)` -> `MarkCompleted(txId)` inside a dedicated Raft group (`tx-coord`), eliminating the single-coordinator blocking vulnerability of classic 2PC.
+3. **Deterministic Crash Recovery**: On restart or failover, `recoverInFlightTransactions` reads `tx-coord` via `readIndexFromGroup` and rolls back any `Preparing` holds via idempotent `Abort2PC` while rolling forward any `Committed` records via idempotent `Commit2PC`.
+
+See [Tutorial 16 — Building a Multi-Shard Transactional Ledger with Raft-Backed 2PC](../../tutorials/16-cross-shard-2pc-ledger.md) for a complete walkthrough.
+
 ## Run the Examples
 
 ```bash
-# Basic transactions with CAS conflict detection
-sbt "runMain examples.distributed.RaftTransactionExample"
+# Single-group OCC transactions with CAS conflict detection
+sbt "examples/runMain examples.distributed.DistributedTransactionExample"
 
-# Full distributed transaction simulation across a 3-node cluster
-sbt "runMain examples.distributed.DistributedTransactionExample"
+# 3-node replicated transactional state machine
+sbt "examples/runMain examples.distributed.RaftTransactionExample"
+
+# Full production Multi-Raft + gRPC + MmapWalEngine + Cross-Shard 2PC Bank Ledger
+sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"
 ```
 
 ---

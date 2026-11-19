@@ -39,12 +39,17 @@ class LoggingStateMachine[F[_]: Sync](
 
   def snapshot: F[Stream[F, Byte]] =
     applied.get.map { list =>
-      Stream.emits(list.mkString("\n").getBytes).covary[F]
+      Stream
+        .emits(
+          list.mkString("\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)
+        )
+        .covary[F]
     }
 
   def restore(data: Stream[F, Byte]): F[Unit] =
     data.compile.to(Array).flatMap { bytes =>
-      applied.set(new String(bytes).split("\n").toList)
+      val str = new String(bytes, java.nio.charset.StandardCharsets.UTF_8)
+      applied.set(if str.isEmpty then Nil else str.split("\n").toList)
     }
 
 object LoggingStateMachine:
@@ -65,9 +70,11 @@ object ThreeNodeClusterExample extends IOApp.Simple:
     IO.println("=== 3-Node RAFT Cluster Simulation ===") *>
       IO.println("\nThis example demonstrates state transitions without") *>
       IO.println("actual networking - using RaftLogic directly.\n") *>
-      runSimulation
+      runSimulation.void
 
-  private def runSimulation: IO[Unit] = IO {
+  def runSimulation: IO[(NodeState, NodeState, NodeState)] = IO {
+    val cluster = ClusterConfig(Set(node1Id, node2Id, node3Id))
+
     // Initialize three nodes as followers
     println("1. Initializing 3 nodes as Followers...")
 
@@ -91,7 +98,8 @@ object ThreeNodeClusterExample extends IOApp.Simple:
       config1,
       lastLogIndex = 0,
       lastLogTerm = 0,
-      clusterSize = 3
+      clusterSize = 3,
+      clusterOpt = Some(cluster)
     )
     node1State = transition1.state
 
@@ -108,8 +116,26 @@ object ThreeNodeClusterExample extends IOApp.Simple:
     // Node-2 and Node-3 receive vote request
     println("\n3. Node-2 and Node-3 receive vote request...")
 
-    val trans2 = RaftLogic.onMessage(node2State, voteReq, config2, 0, 0, 3)
-    val trans3 = RaftLogic.onMessage(node3State, voteReq, config3, 0, 0, 3)
+    val trans2 = RaftLogic.onMessage(
+      node2State,
+      voteReq,
+      config2,
+      0,
+      0,
+      3,
+      sender = Some(node1Id),
+      clusterOpt = Some(cluster)
+    )
+    val trans3 = RaftLogic.onMessage(
+      node3State,
+      voteReq,
+      config3,
+      0,
+      0,
+      3,
+      sender = Some(node1Id),
+      clusterOpt = Some(cluster)
+    )
 
     node2State = trans2.state
     node3State = trans3.state
@@ -134,21 +160,34 @@ object ThreeNodeClusterExample extends IOApp.Simple:
     println(s"\n   Vote from Node-2: granted=${resp2.voteGranted}")
     println(s"   Vote from Node-3: granted=${resp3.voteGranted}")
 
-    // Simulate heartbeat from new leader
-    println("\n4. Node-1 becomes leader, sends heartbeats...")
+    // Deliver votes back to Node-1 via RaftLogic -> promotes Candidate to Leader!
+    println(
+      "\n4. Node-1 receives majority votes, becomes leader, sends heartbeats..."
+    )
 
-    node1State = NodeState.Leader(term = 1, Map.empty, Map.empty)
-
-    val heartbeatTrans = RaftLogic.onMessage(
+    val afterVote2 = RaftLogic.onMessage(
       node1State,
-      RaftMessage.HeartbeatTimeout,
+      resp2,
       config1,
       0,
       0,
-      3
+      3,
+      sender = Some(node2Id),
+      clusterOpt = Some(cluster)
     )
+    val afterVote3 = RaftLogic.onMessage(
+      afterVote2.state,
+      resp3,
+      config1,
+      0,
+      0,
+      3,
+      sender = Some(node3Id),
+      clusterOpt = Some(cluster)
+    )
+    node1State = afterVote3.state
 
-    val heartbeat = heartbeatTrans.effects.collectFirst {
+    val heartbeat = afterVote2.effects.collectFirst {
       case Effect.Broadcast(msg: RaftMessage.AppendEntriesRequest) => msg
     }.get
 
@@ -159,8 +198,26 @@ object ThreeNodeClusterExample extends IOApp.Simple:
     // Followers receive heartbeat
     println("\n5. Followers receive heartbeat, acknowledge leader...")
 
-    val trans2b = RaftLogic.onMessage(node2State, heartbeat, config2, 0, 0, 3)
-    val trans3b = RaftLogic.onMessage(node3State, heartbeat, config3, 0, 0, 3)
+    val trans2b = RaftLogic.onMessage(
+      node2State,
+      heartbeat,
+      config2,
+      0,
+      0,
+      3,
+      sender = Some(node1Id),
+      clusterOpt = Some(cluster)
+    )
+    val trans3b = RaftLogic.onMessage(
+      node3State,
+      heartbeat,
+      config3,
+      0,
+      0,
+      3,
+      sender = Some(node1Id),
+      clusterOpt = Some(cluster)
+    )
 
     node2State = trans2b.state
     node3State = trans3b.state
@@ -175,4 +232,5 @@ object ThreeNodeClusterExample extends IOApp.Simple:
     println(s"   Node-3 (Follower): $node3State")
 
     println("\n✅ Cluster simulation complete!")
+    (node1State, node2State, node3State)
   }

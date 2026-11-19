@@ -48,20 +48,25 @@ class StorageBackedSnapshotStore[F[_]: Async] private (
       case None     => Async[F].unit
 
 object StorageBackedSnapshotStore:
-  /** Create a [[SnapshotStore]] directly backed by an [[MmapWalEngine]],
-    * delegating `list` and `delete` to the engine's snapshot directory.
+  /** Create a [[SnapshotStore]] backed by any [[StorageEngine]] (automatically
+    * delegating `list` and `delete` to on-disk snapshot directory scanning when
+    * backed by [[MmapWalEngine]]).
     */
   def apply[F[_]: Async](
-      engine: MmapWalEngine[F]
+      engine: StorageEngine[F]
   ): StorageBackedSnapshotStore[F] =
-    new StorageBackedSnapshotStore[F](
-      engine,
-      Some(() => engine.listSnapshots),
-      Some(idx => engine.deleteSnapshot(idx))
-    )
+    engine match
+      case mmap: MmapWalEngine[F @unchecked] =>
+        new StorageBackedSnapshotStore[F](
+          mmap,
+          Some(() => mmap.listSnapshots),
+          Some(idx => mmap.deleteSnapshot(idx))
+        )
+      case other =>
+        new StorageBackedSnapshotStore[F](other, None, None)
 
   /** Create a [[SnapshotStore]] backed by any generic [[StorageEngine]]. */
   def fromEngine[F[_]: Async](
       engine: StorageEngine[F]
   ): StorageBackedSnapshotStore[F] =
-    new StorageBackedSnapshotStore[F](engine, None, None)
+    apply(engine)
