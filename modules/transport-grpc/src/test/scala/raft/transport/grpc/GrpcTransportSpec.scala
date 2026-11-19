@@ -177,13 +177,27 @@ class GrpcTransportSpec extends AnyFlatSpec with Matchers:
       useTls = true,
       tlsCertPath = Some("/etc/certs/raft.pem"),
       tlsKeyPath = Some("/etc/certs/raft.key"),
+      tlsTrustCertPath = Some("/etc/certs/ca.pem"),
+      tlsClientAuth = true,
       maxRetries = 10
     )
     config.host shouldBe "10.0.0.1"
     config.port shouldBe 5000
     config.useTls shouldBe true
     config.tlsCertPath shouldBe Some("/etc/certs/raft.pem")
+    config.tlsTrustCertPath shouldBe Some("/etc/certs/ca.pem")
+    config.tlsClientAuth shouldBe true
     config.maxRetries shouldBe 10
+  }
+
+  it should "fail fast when useTls is true without tlsCertPath/tlsKeyPath" in {
+    val badCfg = GrpcConfig(host = "127.0.0.1", port = 0, useTls = true)
+    intercept[IllegalArgumentException] {
+      GrpcTransport
+        .resource[IO](badCfg, TransportConfig(n1, "127.0.0.1:0", Map.empty))
+        .use_
+        .unsafeRunSync()
+    }
   }
 
   "GrpcTransportFactory" should "create transport as managed resource with bound ephemeral port" in {

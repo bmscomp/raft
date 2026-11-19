@@ -175,10 +175,36 @@ sequenceDiagram
 
 When a node crashes (`SIGKILL` or power loss) and restarts against an existing `MmapWalEngine` directory, `MmapWalEngine.open` and `RaftNode.start` cooperate in four deterministic phases:
 
-1. **HardState Recovery**: `MmapHardState` reads and CRC32-verifies `hard_state.bin`, restoring `(term, votedFor)`.
-2. **WAL Index Recovery**: `MmapWalEngine` validates `index.ckpt` (`"WIDX"` v1 header + CRC32) or falls back to scanning `.wal` segment headers and entries, replaying any entries newer than the checkpoint.
+1. **HardState Recovery**: `MmapHardState` reads and CRC32-verifies the 280-byte `hard_state.bin` layout, restoring `(term, votedFor, commitIndex)` with hardware-aligned 8-byte `MemorySegment` accesses (`currentTerm` at offset `0`, `crc32` at offset `268`, and `commitIndex` at offset `272`).
+2. **Self-Healing WAL Index Recovery**: `MmapWalEngine` validates `index.ckpt` (`"WIDX"` v1 header + CRC32). If `index.ckpt` is missing, truncated, or fails CRC32 verification due to torn disk writes, `MmapWalEngine` logs a warning, discards the corrupted checkpoint, and deterministically reconstructs the full `WalIndex` by replaying every `.wal` segment header and entry on disk.
 3. **Snapshot & Membership Restoration**: `RaftNode.start` loads the highest numeric `snapshot-%020d.bin` via `SnapshotStore.loadLatest`, streams it into `StateMachine.restore`, advances `lastApplied` to `snap.lastIncludedIndex`, and reconstructs the latest `ClusterConfig` from the snapshot header plus any post-snapshot `LogType.Configuration` WAL entries.
 4. **Follower Catch-Up**: The node enters `Follower(hs.term, hs.votedFor, None)`. On the next leader `AppendEntriesRequest`, `commitIndex` advances and `applyCommittedEntries` replays only the uncompacted tail `(snap.lastIncludedIndex + 1 .. commitIndex)` onto the restored `StateMachine`.
+
+---
+
+## Live Partition Fencing, Self-Healing Storage & Mutual TLS (`EndToEndClusterResilienceSpec`)
+
+Beyond happy-path replication, production clusters face asymmetric WAN partitions, torn checkpoint files, Sans-I/O host loops, and untrusted network peers. `EndToEndClusterResilienceSpec` exercises four full-stack resilience scenarios over live Netty HTTP/2 sockets and off-heap FFM `MmapWalEngine` directories:
+
+```mermaid
+sequenceDiagram
+    participant OldL as "Partitioned Leader (2/5 Minority)"
+    participant Maj as "Majority Voters (3/5 Quorum)"
+    participant Rogue as "Untrusted Peer (Rogue CA)"
+
+    Note over OldL,Maj: "2/5 vs 3/5 Asymmetric Network Partition"
+    OldL->>OldL: "Appends uncommitted phantom WAL entries (cannot commit)"
+    OldL->>OldL: "CheckQuorum fires -> steps down & fences ReadIndex / writes"
+    Maj->>Maj: "Elects new Leader (term T+1) & commits k11..k25"
+    Note over OldL,Maj: "Partition Heals"
+    Maj->>OldL: "AppendEntries(term T+1) -> truncates phantom .wal tail & converges"
+    Rogue-xMaj: "mTLS Handshake Rejected (ClientAuth.REQUIRE / Untrusted CA)"
+```
+
+1. **5-Node Live Partition, Split-Brain Fencing & `PreVote` Rejoin**: Injects a directional `2/5` vs `3/5` partition over live gRPC transports while nodes write to real `.wal` files. Verifies that uncommitted writes on the minority leader cannot commit, `readIndex` is fenced, `CheckQuorum` steps the isolated leader down, the `3/5` majority elects a new leader and commits new batches, healing truncates the stale uncommitted `.wal` entries on disk, and a `1/5` isolated follower running `PreVote` rejoins without inflating the cluster's `HardState.currentTerm`.
+2. **Sans-I/O `RawNode` + `EngineBackedRaftStorage` + Live `GrpcTransport`**: Drives a 3-node zero-dependency `RawNode` cluster directly over `EngineBackedRaftStorage` (`MmapWalEngine`) and `GrpcTransport.raftResource` (`ProtobufMessageCodec`), verifying batch replication, `readIndex`, `compactTo` snapshot truncation, hard leader crash, and full disk recovery.
+3. **On-Disk `WIDX` (`index.ckpt`) Corruption Self-Healing**: Commits `1,050` entries across rotated `.wal` segments to trigger automatic `index.ckpt` creation (`>= 1,000` entries), stops a follower, flips payload bytes inside `index.ckpt` on disk, commits `50` additional entries on the surviving quorum, and restarts the follower — verifying automatic `.wal` replay fallback and convergence across all `1,100` keys.
+4. **End-to-End Mutual TLS (`mTLS`) & Rogue Peer Rejection**: Generates a cluster Root CA, PKCS#8 node keys, and X.509 SAN certificates (`serverAuth,clientAuth`), runs a 3-node encrypted cluster (`useTls = true`, `tlsClientAuth = true`, `tlsTrustCertPath = Some(ca.crt)`), and proves that a rogue peer signed by an untrusted CA attempting a spoofed `term = 9999` `AppendEntriesRequest` is rejected at the TLS handshake layer (`ClientAuth.REQUIRE`).
 
 ---
 
@@ -189,7 +215,7 @@ The repository verifies runtime, cross-module SPI factories, and application exa
 ```mermaid
 flowchart TB
     T1["Tier 1: Runtime Cluster Suites (modules/runtime) - InMemTransport + TestControl Virtual Time"]
-    T2["Tier 2: Cross-Module Full-Stack Suites (modules/itest) - GrpcTransport + MmapWalEngine + StorageEngineFactory + TransportRegistry + Jepsen WGL"]
+    T2["Tier 2: Cross-Module Full-Stack Suites (modules/itest) - GrpcTransport (Plaintext & mTLS) + MmapWalEngine + EngineBackedRaftStorage + Jepsen WGL"]
     T3["Tier 3: Production Application E2E Suites (modules/examples) - AdvancedShardedLedgerE2ESpec (2PC + Sessions + Crash Recovery) & ExamplesVerificationSpec (All 18 Examples)"]
 
     T1 --> T2 --> T3
@@ -198,7 +224,7 @@ flowchart TB
 | Tier | Module | Transport & Storage | What It Proves |
 |------|--------|---------------------|----------------|
 | **Runtime Cluster Suites** | `raft-runtime` (`modules/runtime/src/test/scala/raft/integration/`) | Partitionable `InMemTransport` + `InMemLogStore` / `InMemSnapshotStore` + `TestControl` | Virtual-time deterministic elections, 50-fiber concurrent `proposeAndCommit`, `CheckQuorum` minority step-down, `readIndex` / `leaseRead` safety, `transferLeadership`, `3 -> 5` Joint Consensus, leader self-removal, multi-chunk `SnapshotTransfer`, group-commit batching, `Inflights` pipelining, and `MultiRaftNode` coalesced heartbeats |
-| **Full-Stack Cross-Module Suites** | `raft-itest` (`FullStackGrpcMmapClusterSpec`, `MultiRaftGrpcMmapClusterSpec`, `FullLibraryEndToEndSpec`) | Live Netty HTTP/2 `GrpcTransport` + `GrpcTransportFactory` (`TransportRegistry`) + FFM `MmapWalEngine.factory` (`StorageEngineFactory`) | SPI factory wiring, Learner staging + chunked `InstallSnapshot`, `3 -> 5 -> 3` live Joint Consensus & channel eviction, `proposeConfChangeToGroup` per-shard migration, hard host crash + disk recovery, `RaftMetrics` telemetry, and concurrent WGL linearizability (`Write`, `Read`, `CAS`) |
+| **Full-Stack Cross-Module Suites** | `raft-itest` (`FullStackGrpcMmapClusterSpec`, `MultiRaftGrpcMmapClusterSpec`, `FullLibraryEndToEndSpec`, `EndToEndClusterResilienceSpec`) | Live Netty HTTP/2 `GrpcTransport` (plaintext & Mutual TLS) + `GrpcTransportFactory` + FFM `MmapWalEngine` + `EngineBackedRaftStorage` | SPI factory wiring, Learner staging + chunked `InstallSnapshot`, `3 -> 5 -> 3` live Joint Consensus, `proposeConfChangeToGroup` per-shard migration, 5-node live partition split-brain fencing & `.wal` conflict truncation, Sans-I/O `RawNode` over `MmapWalEngine` + gRPC, `WIDX` `index.ckpt` corruption self-healing, Mutual TLS (`mTLS`) rogue peer rejection, and concurrent WGL linearizability (`Write`, `Read`, `CAS`) |
 | **Application & Flagship Example Suites** | `raft-examples` (`AdvancedShardedLedgerE2ESpec`, `ExamplesVerificationSpec`) | 3-host `MultiRaftNode` + `GrpcTransport.multiGroupResource` + 12 `MmapWalEngine` stores | Cross-shard atomic 2PC conservation of money, `(clientId, seqNum)` idempotency across WAL snapshot compaction & leader transfer, mid-2PC coordinator crash recovery (`Preparing` rollback & `Committed` roll-forward), and continuous verification of all 18 runnable examples |
 
 ### Deterministic Virtual-Time Cluster Tests with `TestControl`

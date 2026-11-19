@@ -14,6 +14,7 @@ ThisBuild / scalaVersion := scala3Version
 ThisBuild / dynverSeparator := "-"
 ThisBuild / coverageMinimumStmtTotal := 85
 ThisBuild / coverageFailOnMinimum := true
+Global / concurrentRestrictions += Tags.limit(Tags.Test, 1)
 
 lazy val commonScalacOptions = Seq(
   "-encoding",

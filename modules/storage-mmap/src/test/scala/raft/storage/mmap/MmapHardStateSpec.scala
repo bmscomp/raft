@@ -154,4 +154,50 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
           hs.write(HardState(Term.unsafeFrom(1L), Some(oversized)))
         }
     }
+
+    "should persist commitIndex across close and reopen and guard it with CRC32" in {
+      val tmpDir = Files.createTempDirectory("raft-hs-commit-")
+      val hsPath = tmpDir.resolve("hard_state.bin")
+
+      val hs1 = MmapHardState.open(hsPath)
+      hs1.write(
+        HardState(
+          term = 7L,
+          votedFor = Some(NodeId("voter-1")),
+          commitIndex = 12_345L
+        )
+      )
+      hs1.close()
+
+      val hs2 = MmapHardState.open(hsPath)
+      try
+        hs2.read shouldBe HardState(
+          term = 7L,
+          votedFor = Some(NodeId("voter-1")),
+          commitIndex = 12_345L
+        )
+      finally hs2.close()
+
+      // Flip 1 bit in commitIndex at offset 279 and verify CRC32 detects corruption
+      val raw = Files.readAllBytes(hsPath)
+      raw(279) = (raw(279) ^ 0x01).toByte
+      Files.write(hsPath, raw)
+
+      val hs3 = MmapHardState.open(hsPath)
+      try
+        val ex = intercept[raft.state.RaftError.StorageCorruption] {
+          hs3.read
+        }
+        ex.reason should include("CRC32 mismatch")
+      finally
+        hs3.close()
+        Files.deleteIfExists(hsPath)
+        Files.deleteIfExists(tmpDir)
+    }
+
+    "should reject negative commitIndex" in withHardState { (hs, _) =>
+      intercept[IllegalArgumentException] {
+        hs.write(HardState(term = 1L, votedFor = None, commitIndex = -1L))
+      }
+    }
   }

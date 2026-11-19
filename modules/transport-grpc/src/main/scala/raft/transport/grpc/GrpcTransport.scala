@@ -21,8 +21,14 @@ import io.grpc.{
   StatusRuntimeException
 }
 import io.grpc.netty.shaded.io.grpc.netty.{
+  GrpcSslContexts,
   NettyChannelBuilder,
   NettyServerBuilder
+}
+import io.grpc.netty.shaded.io.netty.handler.ssl.{
+  ClientAuth,
+  SslContextBuilder,
+  SslProvider
 }
 import io.grpc.stub.StreamObserver
 import org.typelevel.log4cats.Logger
@@ -240,7 +246,21 @@ class GrpcTransport[F[_]: Async](
                   TimeUnit.MILLISECONDS
                 )
               val configured =
-                if config.useTls then base else base.usePlaintext()
+                if config.useTls then
+                  val baseSsl = GrpcSslContexts.configure(
+                    GrpcSslContexts.forClient(),
+                    SslProvider.JDK
+                  )
+                  val withTrust = config.tlsTrustCertPath.fold(baseSsl)(ca =>
+                    baseSsl.trustManager(new File(ca))
+                  )
+                  val withClientCert =
+                    (config.tlsCertPath, config.tlsKeyPath) match
+                      case (Some(cert), Some(key)) =>
+                        withTrust.keyManager(new File(cert), new File(key))
+                      case _ => withTrust
+                  base.sslContext(withClientCert.build())
+                else base.usePlaintext()
               val built = configured.build()
               val _ = channels.put(address, built)
               built
@@ -381,7 +401,18 @@ object GrpcTransport:
       if grpcConfig.useTls then
         (grpcConfig.tlsCertPath, grpcConfig.tlsKeyPath) match
           case (Some(cert), Some(key)) =>
-            base.useTransportSecurity(new File(cert), new File(key))
+            val baseSsl = GrpcSslContexts.configure(
+              SslContextBuilder.forServer(new File(cert), new File(key)),
+              SslProvider.JDK
+            )
+            val withTrust = grpcConfig.tlsTrustCertPath.fold(baseSsl)(ca =>
+              baseSsl.trustManager(new File(ca))
+            )
+            val finalSsl =
+              if grpcConfig.tlsClientAuth then
+                withTrust.clientAuth(ClientAuth.REQUIRE)
+              else withTrust
+            base.sslContext(finalSsl.build())
           case _ =>
             throw new IllegalArgumentException(
               "GrpcConfig.useTls is true, but tlsCertPath or tlsKeyPath was not provided"
