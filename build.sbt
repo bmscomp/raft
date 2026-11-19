@@ -76,6 +76,7 @@ lazy val runtime = project
   .settings(publishSettings, strictMainSettings)
   .settings(
     name := "raft-runtime",
+    Test / parallelExecution := false,
     scalacOptions ++= commonScalacOptions ++ Seq("-java-output-version", "21"),
     libraryDependencies ++= Seq(
       "org.typelevel" %% "cats-effect" % catsEffectVersion,
@@ -101,6 +102,7 @@ lazy val transportGrpc = project
   .settings(publishSettings, strictMainSettings)
   .settings(
     name := "raft-transport-grpc",
+    Test / parallelExecution := false,
     scalacOptions ++= commonScalacOptions,
     coverageExcludedFiles := ".*src_managed.*",
     Compile / PB.targets := Seq(
@@ -158,6 +160,7 @@ lazy val itest = project
     name := "raft-itest",
     publish / skip := true,
     coverageEnabled := false,
+    Test / parallelExecution := false,
     scalacOptions ++= commonScalacOptions,
     libraryDependencies ++= effectTestDependencies
   )

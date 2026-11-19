@@ -1,256 +1,241 @@
-# Chapter 17: Multi-Raft Group Design
+# Chapter 21: Multi-Raft Group Design, Native Protobuf Multiplexing & Coalesced Heartbeats
 
-*A single Raft group provides strong consistency for a replicated state machine, but it has inherent scalability limits: all writes go through one leader, the entire dataset must fit on every node, and throughput is bounded by the slowest majority member. This chapter discusses how to scale beyond those limits by partitioning data across multiple independent Raft groups — a pattern used by CockroachDB, TiKV, Yugabyte, and most production distributed databases.*
+*A single Raft group provides linearizable consistency for one replicated state machine, but hits fundamental ceilings: all writes flow through one leader, the full dataset must fit on every replica, and throughput is bounded by a single consensus log. This chapter shows how to partition state across hundreds or thousands of independent Raft groups — and how `MultiRaftNode`, `ProtobufMultiGroupCodec`, and per-host **Coalesced Heartbeats** (`CoalescedHeartbeatConfig`) eliminate the `O(G * M)` connection and heartbeat storms encountered in production systems like CockroachDB and TiKV.*
 
 ---
 
 ## Why a Single Group Isn't Enough
 
-A single Raft group has three fundamental bottlenecks:
+A single Raft group has three structural bottlenecks:
 
 ```mermaid
 flowchart LR
     subgraph Single["Single Raft Group"]
-        L["Leader\n(all writes)"]
-        F1["Follower"]
-        F2["Follower"]
+        L["Leader (All Writes & Quorum Reads)"]
+        F1["Follower 1"]
+        F2["Follower 2"]
     end
 
-    C1["Client"] --> L
-    C2["Client"] --> L
-    C3["Client"] --> L
-
-    style L fill:#ff9999
+    C1["Client 1"] --> L
+    C2["Client 2"] --> L
+    C3["Client 3"] --> L
+    L --> F1
+    L --> F2
 ```
 
-| Bottleneck | Why | Impact |
-|-----------|-----|--------|
-| **Write throughput** | All writes go through one leader | One node's CPU/disk is the ceiling |
-| **Data size** | Every node stores the full dataset | Dataset limited to one machine's storage |
-| **Read distribution** | Linearizable reads need leader confirmation | Read load concentrates on one node |
+| Bottleneck | Root Cause | Impact |
+| :--- | :--- | :--- |
+| **Write throughput** | Every proposal serializes through one leader's log | Capped at one host's NIC/NVMe budget |
+| **Storage capacity** | Every voter stores the entire state machine | Dataset bounded by a single server's disk |
+| **Failure blast radius** | Leader election pauses the entire log | All keys stall simultaneously during failover |
 
 ## The Multi-Raft Architecture
 
-The solution is **sharding**: partition the dataset across multiple independent Raft groups, each responsible for a subset of the data (a **range** or **partition**). Each group has its own leader election, replication, and commit tracking.
+**Multi-Raft** partitions the keyspace into independent consensus groups (**shards** or **ranges**). Each group maintains its own `HardState`, WAL, `SnapshotStore`, and `ClusterConfig`, while sharing physical servers and a single multiplexed transport mesh:
 
 ```mermaid
 flowchart TB
-    subgraph Node1["Physical Node 1"]
-        G1L["Group 1\n(Leader)"]
-        G2F["Group 2\n(Follower)"]
-        G3F["Group 3\n(Follower)"]
+    subgraph Node1["Physical Server n1 (1 HTTP/2 Port)"]
+        G0N1["shard-0 (Leader)"]
+        G1N1["shard-1 (Follower)"]
+        G2N1["shard-2 (Follower)"]
     end
 
-    subgraph Node2["Physical Node 2"]
-        G1F1["Group 1\n(Follower)"]
-        G2L["Group 2\n(Leader)"]
-        G3F2["Group 3\n(Follower)"]
+    subgraph Node2["Physical Server n2 (1 HTTP/2 Port)"]
+        G0N2["shard-0 (Follower)"]
+        G1N2["shard-1 (Leader)"]
+        G2N2["shard-2 (Follower)"]
     end
 
-    subgraph Node3["Physical Node 3"]
-        G1F2["Group 1\n(Follower)"]
-        G2F2["Group 2\n(Follower)"]
-        G3L["Group 3\n(Leader)"]
+    subgraph Node3["Physical Server n3 (1 HTTP/2 Port)"]
+        G0N3["shard-0 (Follower)"]
+        G1N3["shard-1 (Follower)"]
+        G2N3["shard-2 (Leader)"]
     end
 
-    G1L <--> G1F1
-    G1L <--> G1F2
-    G2L <--> G2F
-    G2L <--> G2F2
-    G3L <--> G3F
-    G3L <--> G3F2
+    Node1 <-->|"Single Multiplexed gRPC Channel"| Node2
+    Node2 <-->|"Single Multiplexed gRPC Channel"| Node3
+    Node1 <-->|"Single Multiplexed gRPC Channel"| Node3
 ```
 
-In this arrangement:
-- Each **Raft group** manages a portion of the keyspace (e.g., Group 1 handles keys `a-h`, Group 2 handles `i-p`, Group 3 handles `q-z`)
-- Each **physical node** hosts replicas from multiple groups
-- **Leadership is distributed** — different groups can have leaders on different nodes, spreading write load
-
-## Partitioning Strategies
-
-### Range Partitioning
-
-Assign contiguous key ranges to each group:
-
-| Group | Key Range | Example Keys |
-|-------|-----------|-------------|
-| Group 1 | `[a, h)` | `account:alice`, `balance:bob` |
-| Group 2 | `[h, p)` | `inventory:laptop`, `order:12345` |
-| Group 3 | `[p, z)` | `session:abc`, `user:carol` |
-
-**Pros:** Range scans are efficient (all keys in a range are in one group). Splitting is natural — just bisect the range.
-
-**Cons:** Hotspots if the workload is skewed (e.g., all keys start with `user:`).
-
-### Hash Partitioning
-
-Hash the key and assign based on the hash modulo the number of groups:
-
-```
-group(key) = hash(key) % numGroups
-```
-
-**Pros:** Even distribution regardless of key patterns.
-
-**Cons:** Range scans require querying all groups. Resharding changes key-to-group mapping.
-
-### CockroachDB's Approach
-
-CockroachDB uses **range partitioning with automatic splitting and merging**. When a range's data grows beyond a configurable threshold (64 MB by default), the range is automatically split into two. When adjacent ranges shrink, they merge. This keeps ranges balanced without manual intervention.
-
-## Key Design Challenges
-
-### 1. Routing: Which Group Handles This Key?
-
-The client (or a proxy layer) needs to know which group owns each key. Options:
-
-```mermaid
-flowchart LR
-    C["Client"] --> R["Router / Proxy"]
-    R --> G1["Group 1 Leader"]
-    R --> G2["Group 2 Leader"]
-    R --> G3["Group 3 Leader"]
-
-    RT["Routing Table\n(key → group → leader)"]
-    R -.-> RT
-```
-
-- **Client-side routing table**: the client caches the key-to-group mapping. If a key's group has moved (due to a split or leader change), the group returns a redirect and the client updates its cache. This is how CockroachDB and TiKV work.
-- **Proxy routing**: a stateless proxy layer handles routing. Simpler for clients, but adds one hop of latency.
-
-### 2. Cross-Group Transactions
-
-A single Raft group provides linearizable operations within its key range. But what if a transaction spans keys in different groups?
-
-```
-Transaction: Transfer $100 from account:alice (Group 1) to account:bob (Group 2)
-```
-
-This requires **distributed transactions** — a separate protocol on top of Raft. The standard approach is **two-phase commit (2PC)** between the groups, with each group acting as a participant:
-
-1. **Prepare**: Each involved group writes a `Prepared` entry to its Raft log
-2. **Commit/Abort**: A coordinator group writes the decision, then each participant commits or rolls back
-
-> **Note — Raft + 2PC.** TiKV and CockroachDB both use Raft for replication within each shard and 2PC (with optimizations like parallel commits and pipelining) for cross-shard transactions. The key insight is that 2PC's vulnerability to coordinator failure is mitigated by Raft: the coordinator itself is a Raft group, so it survives crashes. See the Percolator paper (*Peng & Dabek, "Large-scale Incremental Processing Using Distributed Transactions and Notifications", OSDI 2010*) for Google's original approach, which TiKV adapts.
-
-### 3. Leader Balancing
-
-If all group leaders land on the same physical node, you've recreated the single-leader bottleneck. Production systems actively balance leadership:
-
-- **Preferred leader**: each group has a preferred leader location, and leadership transfer (see [Chapter 3](03-raft-advanced-theory.md)) moves leadership there after disruptions
-- **Load-based balancing**: a control plane monitors write load per node and triggers leadership transfers to balance it
-- **Rack/zone awareness**: ensure each group has replicas in different failure domains
-
-### 4. Transport Multiplexing
-
-With *N* groups and *M* physical nodes, there are potentially `N × (M-1)` logical connections. This is wasteful — you should multiplex multiple Raft groups over a single physical connection per node pair:
-
-```
-Physical Node 1 ←→ Physical Node 2
-  └─ Group 1 messages
-  └─ Group 2 messages
-  └─ Group 3 messages
-```
-
-This requires a transport layer that routes messages to the correct group based on a group ID in the message header.
-
-## How This Library Supports Multi-Raft
-
-This library provides first-class multi-raft support through the `raft.multigroup` package. The pure functional `RaftLogic` core needed **zero changes** — multi-group support is a coordinator layer above `RaftNode`.
-
-### Core Types
-
-| Type | Purpose |
-|------|--------|
-| `GroupId` | Opaque type for type-safe group identifiers (zero runtime cost) |
-| `GroupEnvelope` | Wire-level wrapper tagging each `RaftMessage` with its target `GroupId` |
-| `GroupConfig[F]` | Per-group dependency bundle (log store, stable store, state machine, timers, optional `SnapshotStore[F]`) |
-| `MultiRaftNode[F]` | Coordinator managing group lifecycle and command routing |
-| `MultiGroupTransport[F]` | `O(1)` per-group bounded `Queue` demultiplexer over shared wire connections |
-| `GroupAwareCodec` | Envelope-aware serialization wrapping `SimpleMessageCodec` |
-
-### Creating Multiple Groups
-
-```scala
-import raft.state.*
-import raft.multigroup.*
-import raft.impl.*
-import cats.effect.IO
-
-for
-  // Shared transport multiplexes all groups over one connection per node pair
-  transport <- MultiGroupTransport[IO](
-    localId = NodeId("node-1"),
-    sendEnvelope = env => sendOverNetwork(env)  // your wire-level send
-  )
-
-  // Coordinator manages group lifecycle
-  multi <- MultiRaftNode[IO](NodeId("node-1"), transport)
-
-  // Create independent shards
-  _ <- multi.createGroup(GroupId("shard-0"), shardConfig0)
-  _ <- multi.createGroup(GroupId("shard-1"), shardConfig1)
-
-  // Submit to a specific group
-  _ <- multi.submitToGroup(GroupId("shard-0"), "key=value".getBytes)
-
-  // Query group state
-  state <- multi.getGroupState(GroupId("shard-0"))
-
-  // Dynamic lifecycle
-  _ <- multi.removeGroup(GroupId("shard-1"))
-  groups <- multi.listGroups  // Set(GroupId("shard-0"))
-yield ()
-```
-
-### Transport Multiplexing: `O(1)` Bounded Mailboxes vs. `O(G)` Broadcast
-
-A naive multi-group router built on a pub-sub `Topic` suffers from two production hazards:
-1. **`O(G)` Fan-Out Amplification**: Publishing every inbound packet to all `G` group streams forces `G - 1` groups to wake up, inspect, and discard packets meant for other shards.
-2. **Startup Subscription Races**: Because `createGroup(shardId)` starts asynchronously across nodes, peer A may send its initial `RequestVote` or `AppendEntries` milliseconds before peer B's fiber subscribes to a lazy `Topic` stream — dropping startup RPCs and stalling initial election for a full timeout cycle.
-
-`MultiGroupTransport` solves both problems by maintaining a lock-free `Ref[F, Map[GroupId, Queue[F, (NodeId, RaftMessage)]]]` of **per-group bounded mailboxes**:
-
-```mermaid
-flowchart LR
-    WIRE["Inbound GroupEnvelope (groupId, from, to, msg)"] --> DEMUX["MultiGroupTransport.dispatch — O(1) Map Lookup"]
-    DEMUX --> Q0["Bounded Queue: shard-0"]
-    DEMUX --> Q1["Bounded Queue: shard-1"]
-    DEMUX --> QN["Bounded Queue: shard-k"]
-    Q0 --> N0["RaftNode (shard-0)"]
-    Q1 --> N1["RaftNode (shard-1)"]
-    QN --> NN["RaftNode (shard-k)"]
-```
-
-- **Zero Startup Drops**: Envelopes arriving for `shard-0` before `RaftNode.start` begins pulling from `receive` are buffered in `shard-0`'s bounded `Queue` and drained in arrival order as soon as the event loop starts.
-- **Non-Blocking Isolation (`tryOffer`)**: If one shard's state machine stalls and fills its bounded queue (`maxQueueSize = 1024`), `dispatch` drops excess packets for that single shard without blocking the shared TCP/gRPC reader serving healthy shards.
-- **Clean Lifecycle Reclamation**: `MultiRaftNode.removeGroup(groupId)` calls `transport.unregisterGroup(groupId)`, releasing the mailbox and ignoring any late in-flight packets for the retired group.
-
-> **Run the example:** `sbt "runMain examples.distributed.MultiGroupExample"` demonstrates a sharded key-value store partitioning keys across two independent Raft groups.
-
-## Resource Sharing Across Groups
-
-Running many groups on one node introduces resource management concerns:
-
-| Resource | Sharing Strategy | Pitfall |
-|----------|-----------------|---------|
-| **Transport** | One TCP connection per node pair, multiplexed via `GroupEnvelope` | Message ordering must be per-group, not per-connection |
-| **Disk** | Shared WAL with per-group log prefixes | A slow group's `fsync` blocks all groups sharing the disk |
-| **Timers** | Shared timer wheel with per-group deadlines | Too many groups → timer granularity degrades |
-| **CPU** | Cats Effect fiber pool (work-stealing) | A group with expensive `apply` can starve others |
-
-## Scaling Considerations
-
-| Cluster Size | Groups | Leaders per Node | Approx. Write Throughput |
-|-------------|--------|-----------------|------------------------|
-| 3 nodes | 1 | 0-1 | 1× (single leader) |
-| 3 nodes | 10 | ~3 | ~3× (leadership spread) |
-| 3 nodes | 100 | ~33 | ~10× (diminishing returns from coordination) |
-| 9 nodes | 100 | ~11 | ~9× (more nodes = more parallelism) |
-
-> **Note — Diminishing returns.** More groups doesn't linearly increase throughput because each group still contends for disk I/O, network bandwidth, and CPU. The sweet spot depends on your hardware: SSDs handle many concurrent random writes well, HDDs do not. Profile with your actual workload.
+In this topology:
+- Each **Raft group** owns a disjoint key partition (for example, `shard-0` owns `[a, h)`, `shard-1` owns `[h, p)`, `shard-2` owns `[p, z)`).
+- Each **physical server** hosts replicas from many groups via `MultiRaftNode[F]`.
+- **Shard leadership is balanced** across servers (`rebalanceLeadership`) so every machine contributes leader CPU and WAL bandwidth.
 
 ---
 
-*Next: [Appendix A — Quick Reference](appendix-a-quick-reference.md) provides a one-page lookup for all types, effects, messages, and configuration parameters in the library.*
+## Partitioning & Cross-Group Coordination
 
+### Range vs. Hash Partitioning
+
+| Strategy | Assignment Rule | Strengths | Tradeoffs |
+| :--- | :--- | :--- | :--- |
+| **Range Partitioning** (CockroachDB, TiKV) | Contiguous lexicographic key intervals `[startKey, endKey)` | Efficient ordered range scans; natural dynamic range splits & merges | Sequential key writes (e.g., monotonic timestamps) can hotspot one shard |
+| **Consistent Hash Partitioning** | `ring.ceilingEntry(hash(key))` across virtual nodes | Uniform write spread regardless of key distribution | Cross-key range queries fan out across all shards |
+
+### Routing & Cross-Group Transactions
+
+```mermaid
+flowchart LR
+    C["Application Client"] --> R["Shard Router (Key -> GroupId + Leader Cache)"]
+    R -->|"shard-0"| L0["Server n1 (shard-0 Leader)"]
+    R -->|"shard-1"| L1["Server n2 (shard-1 Leader)"]
+    R -->|"shard-2"| L2["Server n3 (shard-2 Leader)"]
+```
+
+A single Raft group guarantees linearizability for any operation confined to its key range. When an atomic transfer spans multiple groups — for example, transferring \$100 from `account:alice` (`shard-0`) to `account:bob` (`shard-1`) — layer **Two-Phase Commit (2PC)** or Percolator-style write intents on top of Raft, where the transaction coordinator record itself lives inside a Raft group so coordinator crashes never block recovery.
+
+---
+
+## Solving the Two Multi-Raft Scaling Storms
+
+Naively hosting `G = 1,000` Raft groups across `M = 3` servers triggers two notorious distributed-systems pathologies:
+
+1. **The Socket Explosion (`G * (M - 1)` TCP Connections)**: Opening separate gRPC channels per group creates thousands of TLS handshakes, HTTP/2 keep-alive ping loops, and Netty buffer pools.
+2. **The Idle Heartbeat Storm (`O(G * M)` RPCs/sec)**: With `heartbeatInterval = 50ms`, 1,000 idle groups emit `2,000` outbound `AppendEntriesRequest`s + `2,000` `AppendEntriesResponse`s every `50ms` = **`80,000` RPCs/sec when zero clients are writing**.
+
+The library eliminates both bottlenecks through **three coordinated layers**:
+
+### Layer 1: `O(1)` Per-Group Bounded Mailboxes (`MultiGroupTransport`)
+
+Inbound envelopes never broadcast through a shared `O(G)` pub-sub topic. Instead, `MultiGroupTransport` routes each `GroupEnvelope` by `GroupId` in `O(1)` into a per-group bounded `Queue`:
+
+```mermaid
+flowchart LR
+    WIRE["Decoded MultiRaftWireFrame (1..N GroupEnvelopes)"] --> DEMUX["MultiGroupTransport.dispatchBatch — O(1) Lookup"]
+    DEMUX --> Q0["Bounded Queue: shard-0"]
+    DEMUX --> Q1["Bounded Queue: shard-1"]
+    DEMUX --> QK["Bounded Queue: shard-k"]
+    Q0 --> R0["RaftNode (shard-0)"]
+    Q1 --> R1["RaftNode (shard-1)"]
+    QK --> RK["RaftNode (shard-k)"]
+```
+
+- **Zero Startup Drops**: Early election or heartbeat frames arriving before a newly created shard's stream fiber starts pulling are buffered cleanly in its mailbox.
+- **Fault Isolation (`tryOffer`)**: A slow state machine on `shard-k` cannot backpressure the shared gRPC reader serving `shard-0 .. shard-(k-1)`.
+- **Clean Teardown**: `removeGroup(groupId)` purges both the inbound mailbox and any queued outbound heartbeats for that shard.
+
+### Layer 2: Per-Host Coalesced Heartbeats (`CoalescedHeartbeatConfig`)
+
+When `CoalescedHeartbeatConfig(enabled = true)` is active on `MultiGroupTransport`, unicast empty `AppendEntriesRequest` heartbeats (and optionally `AppendEntriesResponse` ACKs when `coalesceResponses = true`) targeting the same peer server are coalesced into a single wire batch:
+
+```mermaid
+sequenceDiagram
+    participant S0 as shard-0 Leader (on n1)
+    participant S1 as shard-1 Leader (on n1)
+    participant SK as shard-k Leader (on n1)
+    participant Coal as n1 Heartbeat Coalescer
+    participant Net as GrpcTransport (1 HTTP/2 RPC)
+    participant N2 as Server n2 (MultiGroupTransport)
+
+    S0->>Coal: Empty AppendEntries(term=3, prevIdx=120, commit=120) -> n2
+    S1->>Coal: Empty AppendEntries(term=5, prevIdx=84, commit=84) -> n2
+    SK->>Coal: Empty AppendEntries(term=2, prevIdx=410, commit=408) -> n2
+    Note over Coal: Deduplicate per (dest, groupId); flush at flushInterval or maxBatchSize
+
+    Coal->>Net: CoalescedHeartbeatBatchProto (from=n1, to=n2, beats=[shard-0, shard-1, shard-k])
+    Net->>N2: 1 WireEnvelope HTTP/2 Frame
+    N2->>N2: dispatchBatch fans out to shard-0, shard-1, shard-k mailboxes
+```
+
+#### Critical Consensus Safety Invariants in the Coalescer
+
+1. **Zero Delay for Data & Elections**: `RequestVote*`, non-empty `AppendEntriesRequest` (`entries.nonEmpty`), `InstallSnapshot*`, and `TimeoutNowRequest` **bypass** the coalescer immediately.
+2. **Superseding Eviction (`envelopesSuperseded`)**: If `shard-0` queues an idle heartbeat `(prevLogIndex = 120)` for `n2`, and `2ms` later a client write dispatches `AppendEntriesRequest(prevLogIndex = 120, entries = [121])` to `n2`, `MultiGroupTransport` **atomically evicts** the queued heartbeat for `(n2, shard-0)` before sending the data frame — saving wire bytes and guaranteeing the older heartbeat never arrives after entry `121`.
+3. **Window Deduplication**: If a shard emits both a periodic `HeartbeatTimeout` and a `ReadIndex` heartbeat within the same `flushInterval`, the coalescer retains the latest `(term, prevLogIndex, leaderCommit)` for `(dest, groupId)` so one ACK satisfies both `CheckQuorum` and `ReadIndex`.
+
+### Layer 3: Native Binary `MultiRaftWireFrame` (`ProtobufMultiGroupCodec` & `GrpcTransport.multiGroupResource`)
+
+In `raft-transport-grpc`, `ProtobufMultiGroupCodec` encodes Multi-Raft traffic into a three-case Protobuf `MultiRaftWireFrame` over `WireEnvelope`:
+
+| `MultiRaftWireFrame` Variant | When Emitted | Wire Efficiency |
+| :--- | :--- | :--- |
+| **`Single`** (`MultiGroupEnvelopeProto`) | Unicast elections, single-chunk writes, broadcasts | Zero text delimiter parsing; raw binary `ByteString` payloads |
+| **`Batch`** (`MultiGroupBatchProto`) | `RaftTransport.sendBatch` (`Inflights` pipelined replication bursts) | Sends all `maxInflight` chunks for a shard in **1 gRPC `WireEnvelope` call** |
+| **`CoalescedHeartbeat`** (`CoalescedHeartbeatBatchProto`) | Flushed multi-group empty heartbeats or heartbeat ACKs between `(from, to)` | Encodes `from_id` and `to_id` **once** per host pair; strips nested `RaftWirePayload` wrappers (`> 35%` smaller than `N` individual envelopes) |
+
+---
+
+## Complete Production Wiring (`GrpcTransport.multiGroupResource` + `MultiRaftNode`)
+
+```scala
+import scala.concurrent.duration.*
+import cats.effect.{IO, Resource}
+import raft.multigroup.*
+import raft.spi.TransportConfig
+import raft.state.*
+import raft.transport.grpc.{GrpcConfig, GrpcTransport}
+
+def startMultiRaftHost(
+    localId: NodeId,
+    port: Int,
+    peers: Map[NodeId, String]
+): Resource[IO, (GrpcTransport[IO], MultiGroupTransport[IO], MultiRaftNode[IO])] =
+  for
+    pair <- GrpcTransport.multiGroupResource[IO](
+      grpcConfig = GrpcConfig(
+        host = "0.0.0.0",
+        port = port,
+        maxInboundQueueSize = 8192
+      ),
+      transportConfig = TransportConfig(
+        localId = localId,
+        bindAddress = s"0.0.0.0:$port",
+        peers = peers - localId,
+        connectionTimeout = 1.second
+      ),
+      coalescing = CoalescedHeartbeatConfig(
+        enabled = true,
+        flushInterval = 10.millis,
+        maxBatchSize = 256,
+        coalesceResponses = true
+      ),
+      maxGroupQueueSize = 2048
+    )
+    (grpc, mgTransport) = pair
+    coordinator <- MultiRaftNode.resource[IO](localId, mgTransport)
+  yield (grpc, mgTransport, coordinator)
+```
+
+### Shard Operations & Active Leader Rebalancing
+
+`MultiRaftNode[F]` exposes group-scoped linearizable writes, batch writes, quorum/lease reads, and automated shard leadership rebalancing:
+
+```scala
+val preferredPlacement: Map[GroupId, NodeId] = Map(
+  GroupId("shard-0") -> NodeId("n1"),
+  GroupId("shard-1") -> NodeId("n2"),
+  GroupId("shard-2") -> NodeId("n3")
+)
+
+for
+  // Commit a batch of commands to shard-0
+  ids <- coordinator.proposeBatchAndCommitToGroup(
+    GroupId("shard-0"),
+    Seq("k1=v1".getBytes, "k2=v2".getBytes)
+  )
+  // Serve a linearizable quorum read index from shard-0
+  rIdx <- coordinator.readIndexFromGroup(GroupId("shard-0"))
+  // Transfer leadership of any locally led shard whose preferred host differs
+  initiatedTransfers <- coordinator.rebalanceLeadership(preferredPlacement)
+  // Inspect live heartbeat coalescer compression metrics
+  stats <- mgTransport.coalescerStats
+yield (ids, rIdx, initiatedTransfers, stats)
+```
+
+## Summary
+
+| Component | Package / Module | Role |
+| :--- | :--- | :--- |
+| **`GroupId` / `GroupEnvelope`** | `raft.state` / `raft.multigroup` | Zero-cost opaque shard ID and group-tagged envelope |
+| **`CoalescedHeartbeatConfig` / `CoalescerStats`** | `raft.multigroup` (`raft-runtime`) | Per-host heartbeat batching, deduplication, and superseding eviction |
+| **`MultiGroupTransport[F]`** | `raft.multigroup` (`raft-runtime`) | `O(1)` bounded per-group mailboxes + batch wire sender + heartbeat coalescer |
+| **`MultiRaftNode[F]`** | `raft.multigroup` (`raft-runtime`) | Dynamic shard lifecycle, group writes/reads, and `rebalanceLeadership` |
+| **`BinaryGroupAwareCodec`** | `raft.multigroup` (`raft-runtime`) | Transport-agnostic length-prefixed binary `GroupEnvelope` framing |
+| **`ProtobufMultiGroupCodec`** | `raft.transport.grpc` (`raft-transport-grpc`) | Native Protobuf `MultiRaftWireFrame` (`Single`, `Batch`, `CoalescedHeartbeat`) |
+| **`GrpcTransport.multiGroupResource`** | `raft.transport.grpc` (`raft-transport-grpc`) | Turnkey single-port Netty HTTP/2 Multi-Raft server & channel pool |
+
+---
+
+*Next: [Chapter 22 — Sans-I/O `RawNode` & `Ready` Protocol](22-sans-io-rawnode-ready.md) dives into embedding zero-dependency `raft-core` directly inside custom event loops and deterministic simulators.*

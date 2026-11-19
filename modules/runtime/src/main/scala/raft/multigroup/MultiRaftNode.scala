@@ -6,11 +6,12 @@ import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.noop.NoOpLogger
 
 import raft.RaftNode
-import raft.state.{GroupId, NodeId, NodeState}
 import raft.metrics.RaftMetrics
+import raft.state.{GroupId, LogId, NodeId, NodeState}
+import raft.state.NodeState.Leader
 
 /** Coordinator for managing multiple independent Raft consensus groups on a
-  * single physical node.
+  * single physical node (CockroachDB / TiKV Multi-Raft model).
   */
 trait MultiRaftNode[F[_]]:
 
@@ -26,8 +27,40 @@ trait MultiRaftNode[F[_]]:
   /** Return all currently active group identifiers. */
   def listGroups: F[Set[GroupId]]
 
-  /** Submit a command to a specific group's leader. */
+  /** Submit a fire-and-forget command to a specific group's leader. */
   def submitToGroup(groupId: GroupId, data: Array[Byte]): F[Unit]
+
+  /** Propose a command to `groupId` and return its local `(term, index)`. */
+  def proposeToGroup(groupId: GroupId, data: Array[Byte]): F[LogId]
+
+  /** Propose a command to `groupId` and suspend until committed and applied. */
+  def proposeAndCommitToGroup(groupId: GroupId, data: Array[Byte]): F[LogId]
+
+  /** Atomically propose a batch of commands to `groupId` and suspend until all
+    * entries are committed and applied.
+    */
+  def proposeBatchAndCommitToGroup(
+      groupId: GroupId,
+      commands: Seq[Array[Byte]]
+  ): F[Vector[LogId]]
+
+  /** Confirm quorum leadership on `groupId` (§6.4 `ReadIndex`) and return its
+    * linearizable read index.
+    */
+  def readIndexFromGroup(groupId: GroupId): F[Long]
+
+  /** Attempt a zero-RTT lease read on `groupId` (§6.4 `LeaseRead`). */
+  def leaseReadFromGroup(groupId: GroupId): F[Option[Long]]
+
+  /** Initiate graceful leadership transfer on `groupId` to `target` (§3.10). */
+  def transferGroupLeadership(groupId: GroupId, target: NodeId): F[Unit]
+
+  /** Rebalance shard leadership across physical hosts: for every group in
+    * `preferredLeaders` where this node is currently the active `Leader` and
+    * the preferred target is a different voting peer, initiates
+    * `transferLeadership(target)` and returns the count of transfers started.
+    */
+  def rebalanceLeadership(preferredLeaders: Map[GroupId, NodeId]): F[Int]
 
   /** Query the current consensus state of a specific group. */
   def getGroupState(groupId: GroupId): F[Option[NodeState]]
@@ -38,7 +71,8 @@ trait MultiRaftNode[F[_]]:
   /** Shut down all groups and release all allocated resources. */
   def shutdown: F[Unit]
 
-/** Backward-compatible alias extending [[raft.state.RaftError]]. */
+/** Raised when an operation targets a [[GroupId]] not registered on this host.
+  */
 final case class GroupNotFoundException(groupId: GroupId)
     extends RuntimeException(s"Raft group not found: ${groupId.value}")
 
@@ -56,12 +90,34 @@ object MultiRaftNode:
         new MultiRaftNodeImpl[F](localId, transport, groupsRef, resolvedLogger)
       )
 
+  /** Managed [[Resource]] creating, starting, and cleanly shutting down a
+    * [[MultiRaftNode]].
+    */
+  def resource[F[_]: Async](
+      localId: NodeId,
+      transport: MultiGroupTransport[F],
+      loggerOpt: Option[Logger[F]] = None
+  ): Resource[F, MultiRaftNode[F]] =
+    Resource.make(apply(localId, transport, loggerOpt).flatTap(_.start))(
+      _.shutdown
+    )
+
 private final class MultiRaftNodeImpl[F[_]: Async](
     localId: NodeId,
     transport: MultiGroupTransport[F],
     groupsRef: Ref[F, Map[GroupId, (RaftNode[F], F[Unit])]],
     logger: Logger[F]
 ) extends MultiRaftNode[F]:
+
+  private def withGroupNode[A](
+      groupId: GroupId
+  )(fn: RaftNode[F] => F[A]): F[A] =
+    groupsRef.get.flatMap { groups =>
+      groups.get(groupId) match
+        case Some((node, _)) => fn(node)
+        case None            =>
+          Async[F].raiseError(GroupNotFoundException(groupId))
+    }
 
   def createGroup(groupId: GroupId, config: GroupConfig[F]): F[Unit] =
     for
@@ -120,24 +176,66 @@ private final class MultiRaftNodeImpl[F[_]: Async](
     groupsRef.get.map(_.keySet)
 
   def submitToGroup(groupId: GroupId, data: Array[Byte]): F[Unit] =
-    for
-      groups <- groupsRef.get
-      _ <- groups.get(groupId) match
-        case Some((node, _)) => node.submit(data)
-        case None            =>
-          Async[F].raiseError(GroupNotFoundException(groupId))
-    yield ()
+    withGroupNode(groupId)(_.submit(data))
+
+  def proposeToGroup(groupId: GroupId, data: Array[Byte]): F[LogId] =
+    withGroupNode(groupId)(_.propose(data))
+
+  def proposeAndCommitToGroup(groupId: GroupId, data: Array[Byte]): F[LogId] =
+    withGroupNode(groupId)(_.proposeAndCommit(data))
+
+  def proposeBatchAndCommitToGroup(
+      groupId: GroupId,
+      commands: Seq[Array[Byte]]
+  ): F[Vector[LogId]] =
+    withGroupNode(groupId)(_.proposeBatchAndCommit(commands))
+
+  def readIndexFromGroup(groupId: GroupId): F[Long] =
+    withGroupNode(groupId)(_.readIndex)
+
+  def leaseReadFromGroup(groupId: GroupId): F[Option[Long]] =
+    withGroupNode(groupId)(_.leaseRead)
+
+  def transferGroupLeadership(groupId: GroupId, target: NodeId): F[Unit] =
+    withGroupNode(groupId)(_.transferLeadership(target))
+
+  def rebalanceLeadership(preferredLeaders: Map[GroupId, NodeId]): F[Int] =
+    groupsRef.get.flatMap { groups =>
+      preferredLeaders.toList
+        .traverse { case (gid, preferredNode) =>
+          if preferredNode == localId then Async[F].pure(0)
+          else
+            groups.get(gid) match
+              case None            => Async[F].pure(0)
+              case Some((node, _)) =>
+                for
+                  st <- node.getState
+                  cfg <- node.getClusterConfig
+                  transferred <- st match
+                    case l: Leader
+                        if l.transferTarget.isEmpty && cfg.isVoter(
+                          preferredNode
+                        ) =>
+                      node
+                        .transferLeadership(preferredNode)
+                        .as(1)
+                        .handleError(_ => 0)
+                    case _ => Async[F].pure(0)
+                yield transferred
+        }
+        .map(_.sum)
+    }
 
   def getGroupState(groupId: GroupId): F[Option[NodeState]] =
-    for
-      groups <- groupsRef.get
-      state <- groups.get(groupId) match
+    groupsRef.get.flatMap { groups =>
+      groups.get(groupId) match
         case Some((node, _)) => node.getState.map(Some(_))
         case None            => Async[F].pure(None)
-    yield state
+    }
 
   def start: F[Unit] =
-    logger.info(s"MultiRaftNode started on ${localId.value}")
+    transport.startCoalescer *>
+      logger.info(s"MultiRaftNode started on ${localId.value}")
 
   def shutdown: F[Unit] =
     for
@@ -148,4 +246,5 @@ private final class MultiRaftNodeImpl[F[_]: Async](
       _ <- groups.values.toList.traverse_ { case (node, release) =>
         node.shutdown *> release
       }
+      _ <- transport.shutdown
     yield ()

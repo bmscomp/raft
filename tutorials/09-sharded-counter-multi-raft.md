@@ -1,260 +1,310 @@
-# Tutorial 9: Sharded Counter with Multi-Raft
+# Tutorial 9: Sharded Counter with Multi-Raft, Native Protobuf gRPC & Coalesced Heartbeats
 
-*How to scale a simple counter to millions of increments per second by partitioning across multiple Raft groups — using the library's `MultiRaftNode` and `GroupEnvelope` API for the first time.*
+*How to scale a strongly consistent counter beyond single-leader limits by partitioning keys across independent Raft groups — multiplexing all shards over one Netty HTTP/2 connection per host pair, coalescing idle heartbeats, and balancing shard leaders across servers.*
 
 ---
 
 ## The Problem
 
-A single Raft group can process ~10,000 writes per second (limited by consensus round-trips). For use cases like ad impression counting, social media likes, or real-time analytics, this isn't enough.
+A single Raft group serializes all writes through one leader's WAL and state machine. For high-cardinality counters — ad impressions, API quota tracking, or real-time telemetry — one shard eventually saturates a single server's disk IOPS or CPU.
 
-The solution: **sharding**. Partition the counter space across multiple independent Raft groups, each handling a subset of keys. Each group runs its own leader election and log, so write throughput scales linearly with the number of groups.
+The solution is **Multi-Raft sharding**: partition keys across `G` independent Raft groups (`shard-0 .. shard-(G-1)`), host replicas of every shard on `MultiRaftNode[IO]`, multiplex all inter-node traffic over **1 gRPC channel per server pair**, and enable **Coalesced Heartbeats** (`CoalescedHeartbeatConfig`) so idle shards don't flood the network with `O(G)` timer RPCs.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                  Physical Node (runs MultiRaftNode)                  │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │ Group shard-0 │  │ Group shard-1 │  │ Group shard-2 │             │
-│  │  keys: a-h    │  │  keys: i-p    │  │  keys: q-z    │            │
-│  │  Leader here  │  │  Follower    │  │  Leader here  │             │
-│  └──────────────┘  └──────────────┘  └──────────────┘              │
-│                                                                     │
-│  Shared transport layer (MultiGroupTransport)                       │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │ GroupEnvelope(shard-0, msg) → Node2                          │   │
-│  │ GroupEnvelope(shard-1, msg) → Node1                          │   │
-│  │ GroupEnvelope(shard-2, msg) → Node3                          │   │
-│  └──────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
-```
+```mermaid
+flowchart TB
+    subgraph ClientLayer["Application Router"]
+        CH["ConsistentHash Ring (key -> GroupId)"]
+    end
 
-Three physical nodes, each running a `MultiRaftNode` that hosts all shard groups. Each group has its own leader — leadership is distributed across nodes for balanced load.
+    subgraph Host1["Physical Server n1 (GrpcTransport.multiGroupResource)"]
+        M1["MultiRaftNode (shard-0 Leader, shard-1 Follower, shard-2 Follower)"]
+        C1["MultiGroupTransport + CoalescedHeartbeatConfig"]
+    end
 
-## Using the Multi-Raft API
+    subgraph Host2["Physical Server n2 (GrpcTransport.multiGroupResource)"]
+        M2["MultiRaftNode (shard-0 Follower, shard-1 Leader, shard-2 Follower)"]
+        C2["MultiGroupTransport + CoalescedHeartbeatConfig"]
+    end
 
-### Step 1: Create the coordinator
+    subgraph Host3["Physical Server n3 (GrpcTransport.multiGroupResource)"]
+        M3["MultiRaftNode (shard-0 Follower, shard-1 Follower, shard-2 Leader)"]
+        C3["MultiGroupTransport + CoalescedHeartbeatConfig"]
+    end
 
-```scala
-import cats.effect.IO
-import raft.state.{GroupId, NodeId}
-import raft.multigroup.{MultiRaftNode, MultiGroupTransport, GroupConfig}
+    CH -->|"shard-0 keys"| M1
+    CH -->|"shard-1 keys"| M2
+    CH -->|"shard-2 keys"| M3
 
-val localId = NodeId("node-1")
+    M1 --- C1
+    M2 --- C2
+    M3 --- C3
 
-for
-  transport <- MultiGroupTransport.inMemory[IO](localId)
-  coordinator <- MultiRaftNode[IO](localId, transport)
-yield coordinator
+    C1 <-->|"MultiRaftWireFrame (Single / Batch / CoalescedHeartbeat)"| C2
+    C2 <-->|"MultiRaftWireFrame (Single / Batch / CoalescedHeartbeat)"| C3
+    C1 <-->|"MultiRaftWireFrame (Single / Batch / CoalescedHeartbeat)"| C3
 ```
 
-### Step 2: Create shard groups
+---
 
-```scala
-val numShards = 8
+## Step 1: Deterministic Counter State Machine
 
-def createShards(coordinator: MultiRaftNode[IO]): IO[Unit] =
-  (0 until numShards).toList.traverse_ { shardId =>
-    val groupId = GroupId(s"counter-shard-$shardId")
-    val config = GroupConfig[IO](
-      raftConfig = raftConfig,
-      cluster = clusterConfig,
-      logStore = InMemLogStore[IO],
-      stableStore = InMemStableStore[IO],
-      stateMachine = new CounterStateMachine(Ref.unsafe(CounterState.empty)),
-      timerService = InMemTimerService[IO],
-      metrics = RaftMetrics.noop[IO]
-    )
-    coordinator.createGroup(groupId, config)
-  }
-```
-
-### Step 3: Route commands to the correct shard
-
-```scala
-def shardForKey(key: String): GroupId =
-  val hash = math.abs(key.hashCode % numShards)
-  GroupId(s"counter-shard-$hash")
-
-def increment(coordinator: MultiRaftNode[IO], key: String, delta: Long): IO[Unit] =
-  val groupId = shardForKey(key)
-  val cmd = CounterCommand.Increment(key, delta)
-  coordinator.submitToGroup(groupId, CounterCommand.encode(cmd))
-
-def getCount(coordinator: MultiRaftNode[IO], key: String): IO[Long] =
-  val groupId = shardForKey(key)
-  for
-    maybeNode <- coordinator.getGroup(groupId)
-    node      <- IO.fromOption(maybeNode)(
-                   new RuntimeException(s"Shard ${groupId.value} not found"))
-    // Read from the shard's state machine
-    count     <- readFromStateMachine(node, key)
-  yield count
-```
-
-### The GroupEnvelope wire format
-
-When Node 1 sends a message for shard-2 to Node 3, the transport wraps it:
-
-```scala
-import raft.multigroup.GroupEnvelope
-import raft.message.RaftMessage
-
-// The transport automatically creates this envelope:
-val envelope = GroupEnvelope(
-  groupId = GroupId("counter-shard-2"),
-  from = NodeId("node-1"),
-  message = appendEntriesRequest  // standard Raft RPC
-)
-
-// On Node 3, the MultiGroupTransport demultiplexes:
-// 1. Extract groupId from the envelope
-// 2. Route the message to the correct RaftNode within MultiRaftNode
-// 3. The RaftNode processes it as a normal Raft message
-```
-
-This is the CockroachDB/TiKV pattern: **one TCP connection per node pair, multiplexed across all groups**.
-
-## Command and State Machine
+Each shard runs its own isolated `CounterStateMachine` implementing the streaming `StateMachine[IO, Unit]` SPI:
 
 ```scala
 import java.nio.charset.StandardCharsets
+import cats.effect.{IO, Ref}
+import fs2.{Chunk, Stream}
+import raft.spi.StateMachine
+import raft.state.Log
 
 enum CounterCommand:
   case Increment(key: String, delta: Long)
   case Decrement(key: String, delta: Long)
   case Reset(key: String)
-  case Get(key: String)
 
 object CounterCommand:
   def encode(cmd: CounterCommand): Array[Byte] = cmd match
     case Increment(k, d) => s"INC|$k|$d".getBytes(StandardCharsets.UTF_8)
     case Decrement(k, d) => s"DEC|$k|$d".getBytes(StandardCharsets.UTF_8)
     case Reset(k)        => s"RST|$k".getBytes(StandardCharsets.UTF_8)
-    case Get(k)          => s"GET|$k".getBytes(StandardCharsets.UTF_8)
 
-  def decode(data: Array[Byte]): CounterCommand =
-    val parts = new String(data, StandardCharsets.UTF_8).split("\\|")
-    parts(0) match
-      case "INC" => Increment(parts(1), parts(2).toLong)
-      case "DEC" => Decrement(parts(1), parts(2).toLong)
-      case "RST" => Reset(parts(1))
-      case "GET" => Get(parts(1))
+  def decode(data: Array[Byte]): Option[CounterCommand] =
+    new String(data, StandardCharsets.UTF_8).split("\\|", 3) match
+      case Array("INC", k, d) => d.toLongOption.map(Increment(k, _))
+      case Array("DEC", k, d) => d.toLongOption.map(Decrement(k, _))
+      case Array("RST", k)    => Some(Reset(k))
+      case _                  => None
 
-case class CounterState(counters: Map[String, Long])
-object CounterState:
-  val empty = CounterState(Map.empty)
+final class CounterStateMachine(stateRef: Ref[IO, Map[String, Long]])
+    extends StateMachine[IO, Unit]:
 
-class CounterStateMachine(stateRef: Ref[IO, CounterState])
-    extends StateMachine[IO, String]:
+  def apply(log: Log): IO[Unit] =
+    CounterCommand.decode(log.data) match
+      case Some(CounterCommand.Increment(key, delta)) =>
+        stateRef.update(m => m.updated(key, m.getOrElse(key, 0L) + delta))
+      case Some(CounterCommand.Decrement(key, delta)) =>
+        stateRef.update(m => m.updated(key, m.getOrElse(key, 0L) - delta))
+      case Some(CounterCommand.Reset(key)) =>
+        stateRef.update(_.updated(key, 0L))
+      case None =>
+        IO.unit
 
-  def apply(log: Log): IO[String] =
-    val cmd = CounterCommand.decode(log.data)
-    cmd match
-      case CounterCommand.Increment(key, delta) =>
-        stateRef.modify { state =>
-          val current = state.counters.getOrElse(key, 0L)
-          val updated = state.copy(counters = state.counters + (key -> (current + delta)))
-          (updated, s"OK:${current + delta}")
-        }
-
-      case CounterCommand.Decrement(key, delta) =>
-        stateRef.modify { state =>
-          val current = state.counters.getOrElse(key, 0L)
-          val updated = state.copy(counters = state.counters + (key -> (current - delta)))
-          (updated, s"OK:${current - delta}")
-        }
-
-      case CounterCommand.Reset(key) =>
-        stateRef.modify { state =>
-          (state.copy(counters = state.counters + (key -> 0L)), "OK:0")
-        }
-
-      case CounterCommand.Get(key) =>
-        stateRef.get.map { state =>
-          s"VALUE:${state.counters.getOrElse(key, 0L)}"
-        }
-
-  def snapshot: IO[Array[Byte]] =
-    stateRef.get.map { state =>
-      state.counters.map { (k, v) => s"$k|$v" }
+  def snapshot: IO[Stream[IO, Byte]] =
+    stateRef.get.map { m =>
+      val bytes = m.toSeq
+        .sortBy(_._1)
+        .map { case (k, v) => s"$k|$v" }
         .mkString("\n")
         .getBytes(StandardCharsets.UTF_8)
+      Stream.chunk(Chunk.array(bytes)).covary[IO]
     }
 
-  def restore(data: Array[Byte]): IO[Unit] =
-    val lines = new String(data, StandardCharsets.UTF_8).split("\n")
-    val counters = lines.filter(_.nonEmpty).map { line =>
-      val parts = line.split("\\|")
-      parts(0) -> parts(1).toLong
-    }.toMap
-    stateRef.set(CounterState(counters))
+  def restore(data: Stream[IO, Byte]): IO[Unit] =
+    data.compile.to(Array).flatMap { bytes =>
+      val text = new String(bytes, StandardCharsets.UTF_8)
+      val parsed =
+        if text.isEmpty then Map.empty[String, Long]
+        else
+          text
+            .split("\n")
+            .toList
+            .flatMap { line =>
+              line.split("\\|", 2) match
+                case Array(k, v) => v.toLongOption.map(k -> _)
+                case _           => None
+            }
+            .toMap
+      stateRef.set(parsed)
+    }
+
+  def get(key: String): IO[Long] =
+    stateRef.get.map(_.getOrElse(key, 0L))
 ```
 
-## Cross-Shard Aggregation
+---
 
-To get the total count across all shards (e.g., "total page views"):
+## Step 2: Booting a Multiplexed Multi-Raft Host with Coalesced Heartbeats
+
+### Option A: In-Memory Cluster (Unit & Integration Tests)
+
+`MultiGroupTransport.createInMemoryCluster` wires `N` virtual hosts together with optional `CoalescedHeartbeatConfig` in a single `Resource`:
 
 ```scala
-def totalAcrossShards(
-  coordinator: MultiRaftNode[IO],
-  key: String
-): IO[Long] =
+import scala.concurrent.duration.*
+import cats.effect.Resource
+import raft.multigroup.{CoalescedHeartbeatConfig, MultiGroupTransport, MultiRaftNode}
+import raft.state.NodeId
+
+val nodes = List(NodeId("n1"), NodeId("n2"), NodeId("n3"))
+
+val testCluster: Resource[IO, Map[NodeId, MultiRaftNode[IO]]] =
   for
-    groups <- coordinator.listGroups
-    counts <- groups.toList.traverse { groupId =>
-      coordinator.getGroup(groupId).flatMap {
-        case Some(node) => readFromStateMachine(node, key).handleError(_ => 0L)
-        case None       => IO.pure(0L)
-      }
-    }
-  yield counts.sum
+    transports <- MultiGroupTransport.createInMemoryCluster[IO](
+      nodeIds = nodes,
+      coalescing = CoalescedHeartbeatConfig(
+        enabled = true,
+        flushInterval = 10.millis,
+        maxBatchSize = 128,
+        coalesceResponses = true
+      )
+    )
+    coordinators <- nodes
+      .traverse(id => MultiRaftNode.resource[IO](id, transports(id)).map(id -> _))
+      .map(_.toMap)
+  yield coordinators
 ```
 
-> **Consistency note**: This cross-shard read is **not linearizable** — each shard is read independently, and their states may be at different points in time. For most analytics use cases, this eventual consistency is acceptable. For strict cross-shard consistency, you'd need a distributed transaction protocol on top of Raft.
+### Option B: Production Netty gRPC + `ProtobufMultiGroupCodec`
 
-## Shard Rebalancing
+In production, `GrpcTransport.multiGroupResource` binds **one TCP port per server** and automatically packs coalesced heartbeats into compact `CoalescedHeartbeatBatchProto` frames and pipelined write bursts into `MultiGroupBatchProto` frames:
 
-When scaling from 8 to 16 shards, use consistent hashing to minimize key movement:
+```scala
+import raft.spi.TransportConfig
+import raft.transport.grpc.{GrpcConfig, GrpcTransport}
+
+def productionHost(
+    localId: NodeId,
+    port: Int,
+    peers: Map[NodeId, String]
+): Resource[IO, MultiRaftNode[IO]] =
+  for
+    pair <- GrpcTransport.multiGroupResource[IO](
+      grpcConfig = GrpcConfig(host = "0.0.0.0", port = port),
+      transportConfig = TransportConfig(
+        localId = localId,
+        bindAddress = s"0.0.0.0:$port",
+        peers = peers - localId
+      ),
+      coalescing = CoalescedHeartbeatConfig(
+        enabled = true,
+        flushInterval = 10.millis,
+        maxBatchSize = 256,
+        coalesceResponses = true
+      )
+    )
+    (_, mgTransport) = pair
+    coordinator <- MultiRaftNode.resource[IO](localId, mgTransport)
+  yield coordinator
+```
+
+---
+
+## Step 3: Provisioning Shards & Balancing Leadership
+
+Provision `numShards` groups on each host and call `rebalanceLeadership` so shard leaders spread evenly across servers:
+
+```scala
+import raft.impl.{DefaultTimerService, InMemLogStore, InMemSnapshotStore, InMemStableStore}
+import raft.multigroup.GroupConfig
+import raft.state.{BatchConfig, ClusterConfig, GroupId, PipelineConfig, RaftConfig}
+
+val numShards = 6
+val clusterCfg = ClusterConfig(nodes.toSet)
+
+def createShardsOnHost(
+    localId: NodeId,
+    coordinator: MultiRaftNode[IO]
+): IO[Map[GroupId, CounterStateMachine]] =
+  (0 until numShards).toList
+    .traverse { shardIdx =>
+      val gid = GroupId(s"counter-shard-$shardIdx")
+      for
+        timerSvc <- DefaultTimerService[IO]
+        logStore <- InMemLogStore[IO]()
+        stableStore <- InMemStableStore[IO]()
+        snapStore <- InMemSnapshotStore[IO]()
+        sm <- Ref.of[IO, Map[String, Long]](Map.empty).map(new CounterStateMachine(_))
+        raftCfg = RaftConfig(
+          localId = localId,
+          batching = BatchConfig(enabled = true, maxSize = 64, maxWait = 3.millis),
+          pipelining = PipelineConfig(enabled = true, maxInflight = 6)
+        )
+        _ <- coordinator.createGroup(
+          gid,
+          GroupConfig(
+            raftConfig = raftCfg,
+            cluster = clusterCfg,
+            logStore = logStore,
+            stableStore = stableStore,
+            stateMachine = sm,
+            timerService = timerSvc,
+            snapshotStore = Some(snapStore)
+          )
+        )
+      yield gid -> sm
+    }
+    .map(_.toMap)
+
+// Round-robin preferred leader assignment: 2 shard leaders per physical node!
+val preferredLeaders: Map[GroupId, NodeId] =
+  (0 until numShards).map { i =>
+    GroupId(s"counter-shard-$i") -> nodes(i % nodes.size)
+  }.toMap
+```
+
+---
+
+## Step 4: Consistent-Hash Routing, Linearizable Writes & Reads
 
 ```scala
 import java.util.TreeMap
 
-class ConsistentHash(numShards: Int, virtualNodes: Int = 150):
+final class ConsistentHashRouter(numShards: Int, virtualNodes: Int = 150):
   private val ring = new TreeMap[Int, GroupId]()
-
   for shard <- 0 until numShards; vn <- 0 until virtualNodes do
-    val key = s"counter-shard-$shard-vn-$vn"
-    ring.put(key.hashCode, GroupId(s"counter-shard-$shard"))
+    val token = s"counter-shard-$shard-vn-$vn".hashCode
+    val _ = ring.put(token, GroupId(s"counter-shard-$shard"))
 
   def shardForKey(key: String): GroupId =
-    val hash = key.hashCode
-    val entry = ring.ceilingEntry(hash)
-    if entry != null then entry.getValue
-    else ring.firstEntry().getValue
+    val entry = ring.ceilingEntry(key.hashCode)
+    if entry != null then entry.getValue else ring.firstEntry().getValue
+
+def incrementLinearizable(
+    router: ConsistentHashRouter,
+    leaderCoordinator: MultiRaftNode[IO],
+    key: String,
+    delta: Long
+): IO[Unit] =
+  val gid = router.shardForKey(key)
+  val payload = CounterCommand.encode(CounterCommand.Increment(key, delta))
+  leaderCoordinator.proposeAndCommitToGroup(gid, payload).void
+
+def readCounterLinearizable(
+    router: ConsistentHashRouter,
+    leaderCoordinator: MultiRaftNode[IO],
+    localShards: Map[GroupId, CounterStateMachine],
+    key: String
+): IO[Long] =
+  val gid = router.shardForKey(key)
+  leaderCoordinator.readIndexFromGroup(gid) *> localShards(gid).get(key)
 ```
-
-When adding shard 8-15, only ~50% of keys need to move (compared to ~87.5% with modulo hashing).
-
-## Failure Scenarios
-
-### One shard's leader crashes
-
-Only that shard's writes are affected. The other 7 shards continue operating independently. After election (~2-4 seconds), the shard resumes with a new leader. This is the key benefit of Multi-Raft: **fault isolation**.
-
-### An entire physical node fails
-
-All groups hosted on that node lose a replica. Groups where the failed node was the leader elect new leaders. Groups where it was a follower continue with reduced replication. As long as a majority survives per group, all groups remain available.
-
-## Production Considerations
-
-- **Shard count**: Start with 2× your expected node count. 3 nodes → 8 shards. 5 nodes → 16 shards.
-- **Hot shards**: If one key receives disproportionate traffic, it bottlenecks its shard. Use per-key sub-sharding or batch local increments before committing.
-- **Group lifecycle**: Use `coordinator.removeGroup` to cleanly shut down a shard during rebalancing, and `coordinator.createGroup` to start new ones.
-- **Connection efficiency**: `MultiGroupTransport` shares connections. 3 nodes with 16 shards = 3 connections, not 48.
 
 ---
 
-*Next: [Tutorial 10 — Exactly-Once Delivery with Client Sessions](10-client-sessions.md) — the missing piece for truly safe client interactions with your Raft cluster.*
+## How Coalesced Heartbeats Protect Tail Latency Under Scale
+
+```mermaid
+sequenceDiagram
+    participant Shards as 64 Shard Leaders on n1
+    participant Coal as CoalescedHeartbeatConfig (10ms)
+    participant Wire as Netty HTTP/2 Channel (n1 -> n2)
+
+    Shards->>Coal: 64 idle HeartbeatTimeout ticks
+    Note over Coal: Deduplicates per (n2, GroupId)
+    Shards->>Wire: Client write on shard-7 (entries=[idx 42])
+    Note over Coal: Evicts stale buffered heartbeat for (n2, shard-7)!
+    Wire->>Wire: Immediately transmits shard-7 data AppendEntries (0ms delay)
+    Coal->>Wire: Flushes remaining 63 idle heartbeats in 1 CoalescedHeartbeatBatchProto!
+```
+
+## Production Checklist
+
+- **Shard Sizing**: Start with `2x`–`8x` shards per physical node so leadership spreads evenly across CPU cores and disks.
+- **Per-Shard WAL Isolation**: Give each shard its own `MmapWalEngine` directory (`baseDir.resolve(shardId.value)`) or partition compaction schedules so snapshot creation doesn't spike simultaneously on all shards.
+- **Monitor `mgTransport.coalescerStats`**: Verify `envelopesCoalesced / batchesFlushed` matches your active leader count per peer host, confirming heartbeats are coalescing into single frames.
+
+---
+
+*Next: [Tutorial 10 — Exactly-Once Delivery with Client Sessions](10-client-sessions.md) — preventing duplicate counter increments when clients retry across leader failovers.*

@@ -159,3 +159,47 @@ enum EntryType {
   NO_OP = 1;
   CONFIG_CHANGE = 2;
 }
+
+// === Multi-Raft Native Binary Multiplexing & Coalesced Heartbeats ===
+
+message MultiGroupEnvelopeProto {
+  string group_id = 1;
+  string from_id = 2;
+  bool has_to_id = 3;
+  string to_id = 4;
+  RaftWirePayload payload = 5;
+}
+
+message MultiGroupBatchProto {
+  repeated MultiGroupEnvelopeProto envelopes = 1;
+}
+
+message CoalescedHeartbeatBeatProto {
+  string group_id = 1;
+  int64 term = 2;
+  string leader_id = 3;
+  int64 prev_log_index = 4;
+  int64 prev_log_term = 5;
+  int64 leader_commit = 6;
+  bool success = 7;
+  int64 match_index = 8;
+  bool has_conflict_index = 9;
+  int64 conflict_index = 10;
+  bool has_conflict_term = 11;
+  int64 conflict_term = 12;
+}
+
+message CoalescedHeartbeatBatchProto {
+  string from_id = 1;
+  string to_id = 2;
+  bool is_response = 3;
+  repeated CoalescedHeartbeatBeatProto beats = 4;
+}
+
+message MultiRaftWireFrame {
+  oneof frame {
+    MultiGroupEnvelopeProto single = 1;
+    MultiGroupBatchProto batch = 2;
+    CoalescedHeartbeatBatchProto coalesced_heartbeat = 3;
+  }
+}

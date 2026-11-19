@@ -17,6 +17,9 @@ import raft.transport.grpc.proto as pb
 object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
 
   def encode(msg: RaftMessage): Array[Byte] =
+    toProtoPayload(msg).toByteArray
+
+  private[grpc] def toProtoPayload(msg: RaftMessage): pb.RaftWirePayload =
     val inner: pb.RaftWirePayload.Message = msg match
       case m: RaftMessage.AppendEntriesRequest =>
         pb.RaftWirePayload.Message.AppendEntriesReq(
@@ -168,7 +171,7 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
           pb.TimerTick(pb.TimerKind.CHECK_QUORUM_TIMEOUT)
         )
 
-    pb.RaftWirePayload(inner).toByteArray
+    pb.RaftWirePayload(inner)
 
   def decode(raw: Array[Byte]): Either[CodecError, RaftMessage] =
     if raw.isEmpty then
@@ -176,7 +179,7 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
     else
       try
         val payload = pb.RaftWirePayload.parseFrom(raw)
-        decodePayload(payload)
+        fromProtoPayload(payload)
       catch
         case NonFatal(e) =>
           Left(
@@ -186,7 +189,7 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
             )
           )
 
-  private def decodePayload(
+  private[grpc] def fromProtoPayload(
       payload: pb.RaftWirePayload
   ): Either[CodecError, RaftMessage] =
     payload.message match
