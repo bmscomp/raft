@@ -13,7 +13,7 @@ import org.typelevel.log4cats.noop.NoOpLogger
 
 import raft.compaction.{CompactionManager, SnapshotTransfer}
 import raft.effect.Effect as Eff
-import raft.logic.RaftLogic
+import raft.logic.{Inflights, Progress, ProgressState, RaftLogic}
 import raft.message.*
 import raft.message.RaftMessage.*
 import raft.metrics.RaftMetrics
@@ -54,6 +54,19 @@ trait RaftNode[F[_]]:
     * down before commitment, truncates the entry, or shuts down.
     */
   def proposeAndCommit(data: Array[Byte]): F[LogId]
+
+  /** Atomically propose a batch of client command payloads in a single local
+    * log append (`group commit`) and return their assigned `(term, index)`
+    * coordinates.
+    */
+  def proposeBatch(commands: Seq[Array[Byte]]): F[Vector[LogId]]
+
+  /** Atomically propose a batch of client command payloads in a single local
+    * log append (`group commit`) and suspend until all entries in the batch are
+    * committed by a cluster quorum and applied to the local
+    * [[raft.spi.StateMachine]].
+    */
+  def proposeBatchAndCommit(commands: Seq[Array[Byte]]): F[Vector[LogId]]
 
   /** Submit a client command payload to be replicated across the cluster. */
   def submit(data: Array[Byte]): F[Unit]
@@ -148,6 +161,8 @@ object RaftNode:
         ](Vector.empty)
         leaseUntilRef <- Ref.of[F, FiniteDuration](Duration.Zero)
         snapshotInFlightRef <- Ref.of[F, Set[NodeId]](Set.empty)
+        proposalQueue <- Queue.unbounded[F, QueuedProposal[F]]
+        peerProgressRef <- Ref.of[F, Map[NodeId, Progress]](Map.empty)
         compactionMgrOpt <- snapshotStoreOpt.traverse { store =>
           CompactionManager.create[F](
             config = config.compaction,
@@ -167,6 +182,7 @@ object RaftNode:
           logger = resolvedLogger
         )
         eventLoopFiberRef <- Ref.of[F, Option[Fiber[F, Throwable, Unit]]](None)
+        batcherFiberRef <- Ref.of[F, Option[Fiber[F, Throwable, Unit]]](None)
         electionFiberRef <- Ref.of[F, Option[Fiber[F, Throwable, Unit]]](None)
         heartbeatFiberRef <- Ref.of[F, Option[Fiber[F, Throwable, Unit]]](None)
         checkQuorumFiberRef <- Ref.of[F, Option[Fiber[F, Throwable, Unit]]](
@@ -190,6 +206,8 @@ object RaftNode:
         stateRef = stateRef,
         shutdownRef = shutdownRef,
         msgQueue = msgQueue,
+        proposalQueue = proposalQueue,
+        peerProgressRef = peerProgressRef,
         lastAppliedRef = lastAppliedRef,
         latestSnapMetaRef = latestSnapMetaRef,
         pendingSnapRef = pendingSnapRef,
@@ -201,6 +219,7 @@ object RaftNode:
         leaseUntilRef = leaseUntilRef,
         snapshotInFlightRef = snapshotInFlightRef,
         eventLoopFiberRef = eventLoopFiberRef,
+        batcherFiberRef = batcherFiberRef,
         electionFiberRef = electionFiberRef,
         heartbeatFiberRef = heartbeatFiberRef,
         checkQuorumFiberRef = checkQuorumFiberRef,
@@ -208,6 +227,13 @@ object RaftNode:
         logger = resolvedLogger
       )
     Resource.make(acquire)(_.shutdown)
+
+private final case class QueuedProposal[F[_]](
+    data: Array[Byte],
+    waitForCommit: Boolean,
+    result: Deferred[F, Either[RaftError, LogId]],
+    cancelled: Ref[F, Boolean]
+)
 
 private final class RaftNodeImpl[F[_]: Async](
     config: RaftConfig,
@@ -226,6 +252,8 @@ private final class RaftNodeImpl[F[_]: Async](
     stateRef: Ref[F, NodeState],
     shutdownRef: SignallingRef[F, Boolean],
     msgQueue: Queue[F, RaftMessage],
+    proposalQueue: Queue[F, QueuedProposal[F]],
+    peerProgressRef: Ref[F, Map[NodeId, Progress]],
     lastAppliedRef: Ref[F, Long],
     latestSnapMetaRef: Ref[F, Option[SnapshotMetadata]],
     pendingSnapRef: Ref[F, Option[PendingSnapshot]],
@@ -243,6 +271,7 @@ private final class RaftNodeImpl[F[_]: Async](
     leaseUntilRef: Ref[F, FiniteDuration],
     snapshotInFlightRef: Ref[F, Set[NodeId]],
     eventLoopFiberRef: Ref[F, Option[Fiber[F, Throwable, Unit]]],
+    batcherFiberRef: Ref[F, Option[Fiber[F, Throwable, Unit]]],
     electionFiberRef: Ref[F, Option[Fiber[F, Throwable, Unit]]],
     heartbeatFiberRef: Ref[F, Option[Fiber[F, Throwable, Unit]]],
     checkQuorumFiberRef: Ref[F, Option[Fiber[F, Throwable, Unit]]],
@@ -250,14 +279,24 @@ private final class RaftNodeImpl[F[_]: Async](
     logger: Logger[F]
 ) extends RaftNode[F]:
 
+  private val effectiveMaxInflight: Int =
+    if config.pipelining.enabled then config.pipelining.maxInflight else 1
+
+  private def dispatchPeers[A](items: List[A])(fn: A => F[Unit]): F[Unit] =
+    if config.parallelReplicationEnabled then items.parTraverse_(fn)
+    else items.traverse_(fn)
+
   def start: F[Unit] =
     for
       _ <- cancelFiber(eventLoopFiberRef)
+      _ <- cancelFiber(batcherFiberRef)
       _ <- cancelFiber(electionFiberRef)
       _ <- cancelFiber(heartbeatFiberRef)
       _ <- cancelFiber(checkQuorumFiberRef)
       _ <- cancelFiber(transferFiberRef)
       _ <- drainQueue
+      _ <- drainProposalQueue(RaftError.ProposalDropped("Node restarting"))
+      _ <- peerProgressRef.set(Map.empty)
       _ <- shutdownRef.set(false)
       _ <- leaseUntilRef.set(Duration.Zero)
       _ <- logger.info(s"Starting RAFT node ${config.localId.value}")
@@ -267,85 +306,274 @@ private final class RaftNodeImpl[F[_]: Async](
       _ <- resetElectionTimer
       fiber <- runEventLoop.start
       _ <- eventLoopFiberRef.set(Some(fiber))
+      _ <-
+        if config.batching.enabled then
+          runBatcherLoop.start.flatMap(bf => batcherFiberRef.set(Some(bf)))
+        else Async[F].unit
     yield ()
 
   def propose(data: Array[Byte]): F[LogId] =
-    mutex.lock.surround {
-      stateRef.get.flatMap {
-        case l: Leader if l.transferTarget.isDefined =>
-          Async[F].raiseError(
-            RaftError.LeadershipTransferInProgress(l.transferTarget.get)
-          )
-        case l: Leader =>
-          for
-            lastCoord <- effectiveLastLog
-            lastIdx = lastCoord._1
-            newIndex = lastIdx + 1L
-            entry = Log.command(newIndex, l.term, data)
-            _ <- logStore.append(Seq(entry))
-            _ <- metrics.onEntriesAppended(config.localId, 1)
-            _ <- logger.debug(s"Leader appended command at index $newIndex")
-            cluster <- clusterRef.get
-            _ <-
-              if cluster.hasQuorum(Set(config.localId)) then
-                val committed = LogIndex.unsafeFrom(newIndex)
-                stateRef.set(l.withCommitIndex(newIndex)) *>
-                  applyCommittedEntries(committed) *>
-                  metrics.onEntriesCommitted(config.localId, newIndex)
-              else replicateAllPeers(l, LogIndex.unsafeFrom(newIndex))
-          yield LogId(l.term, newIndex)
-        case f: Follower =>
-          Async[F].raiseError(RaftError.NotLeader(f.leaderId))
-        case _: Candidate | _: PreCandidate =>
-          Async[F].raiseError(RaftError.ElectionInProgress)
-      }
-    }
+    if config.batching.enabled then enqueueProposal(data, waitForCommit = false)
+    else
+      mutex.lock
+        .surround(appendCommandsLocked(Vector(data), Map.empty))
+        .map(_.head)
 
   def proposeAndCommit(data: Array[Byte]): F[LogId] =
-    Async[F].uncancelable { poll =>
-      mutex.lock
-        .surround {
-          stateRef.get.flatMap {
-            case l: Leader if l.transferTarget.isDefined =>
-              Async[F].raiseError(
-                RaftError.LeadershipTransferInProgress(l.transferTarget.get)
-              )
-            case l: Leader =>
-              for
-                waiter <- Deferred[F, Either[RaftError, LogId]]
-                lastCoord <- effectiveLastLog
-                lastIdx = lastCoord._1
-                newIndex = lastIdx + 1L
-                entry = Log.command(newIndex, l.term, data)
-                _ <- logStore.append(Seq(entry))
-                _ <- pendingProposalsRef.update(
-                  _.updated(newIndex, (l.term, waiter))
-                )
-                _ <- metrics.onEntriesAppended(config.localId, 1)
-                cluster <- clusterRef.get
-                _ <-
-                  if cluster.hasQuorum(Set(config.localId)) then
-                    val committed = LogIndex.unsafeFrom(newIndex)
-                    stateRef.set(l.withCommitIndex(newIndex)) *>
-                      applyCommittedEntries(committed) *>
-                      metrics.onEntriesCommitted(config.localId, newIndex)
-                  else replicateAllPeers(l, LogIndex.unsafeFrom(newIndex))
-              yield (newIndex, waiter)
-            case f: Follower =>
-              Async[F].raiseError(RaftError.NotLeader(f.leaderId))
-            case _: Candidate | _: PreCandidate =>
-              Async[F].raiseError(RaftError.ElectionInProgress)
-          }
-        }
-        .flatMap { case (idx, waiter) =>
-          poll(waiter.get)
-            .onCancel(pendingProposalsRef.update(_ - idx))
-            .flatMap(Async[F].fromEither)
-        }
-    }
+    if config.batching.enabled then enqueueProposal(data, waitForCommit = true)
+    else proposeBatchAndCommitDirect(Vector(data)).map(_.head)
+
+  def proposeBatch(commands: Seq[Array[Byte]]): F[Vector[LogId]] =
+    val vec = commands.toVector
+    if vec.isEmpty || !config.batching.enabled then
+      mutex.lock.surround(appendCommandsLocked(vec, Map.empty))
+    else enqueueBatchProposals(vec, waitForCommit = false)
+
+  def proposeBatchAndCommit(commands: Seq[Array[Byte]]): F[Vector[LogId]] =
+    val vec = commands.toVector
+    if vec.isEmpty || !config.batching.enabled then
+      proposeBatchAndCommitDirect(vec)
+    else enqueueBatchProposals(vec, waitForCommit = true)
 
   def submit(data: Array[Byte]): F[Unit] =
     propose(data).void
+
+  private def checkLeaderFast: F[Unit] =
+    stateRef.get.flatMap {
+      case l: Leader if l.transferTarget.isDefined =>
+        Async[F].raiseError(
+          RaftError.LeadershipTransferInProgress(l.transferTarget.get)
+        )
+      case _: Leader   => Async[F].unit
+      case f: Follower => Async[F].raiseError(RaftError.NotLeader(f.leaderId))
+      case _: Candidate | _: PreCandidate =>
+        Async[F].raiseError(RaftError.ElectionInProgress)
+    }
+
+  private def enqueueProposal(
+      data: Array[Byte],
+      waitForCommit: Boolean
+  ): F[LogId] =
+    Async[F].uncancelable { poll =>
+      checkLeaderFast *> (
+        for
+          waiter <- Deferred[F, Either[RaftError, LogId]]
+          cancelled <- Ref.of[F, Boolean](false)
+          _ <- proposalQueue.offer(
+            QueuedProposal(data, waitForCommit, waiter, cancelled)
+          )
+          res <- poll(waiter.get).onCancel(
+            cancelled.set(true) *>
+              (if waitForCommit then
+                 pendingProposalsRef.update(_.filterNot(_._2._2 eq waiter))
+               else Async[F].unit)
+          )
+          logId <- Async[F].fromEither(res)
+        yield logId
+      )
+    }
+
+  private def enqueueBatchProposals(
+      commands: Vector[Array[Byte]],
+      waitForCommit: Boolean
+  ): F[Vector[LogId]] =
+    Async[F].uncancelable { poll =>
+      checkLeaderFast *> (
+        for
+          items <- commands.traverse { cmd =>
+            for
+              waiter <- Deferred[F, Either[RaftError, LogId]]
+              cancelled <- Ref.of[F, Boolean](false)
+            yield QueuedProposal(cmd, waitForCommit, waiter, cancelled)
+          }
+          _ <- items.traverse_(proposalQueue.offer)
+          results <- poll(items.traverse(_.result.get)).onCancel(
+            items.traverse_(_.cancelled.set(true)) *>
+              (if waitForCommit then
+                 val waitersSet = items.map(_.result).toSet
+                 pendingProposalsRef.update(
+                   _.filterNot(kv => waitersSet.contains(kv._2._2))
+                 )
+               else Async[F].unit)
+          )
+          logIds <- results.traverse(Async[F].fromEither)
+        yield logIds
+      )
+    }
+
+  private def proposeBatchAndCommitDirect(
+      commands: Vector[Array[Byte]]
+  ): F[Vector[LogId]] =
+    Async[F].uncancelable { poll =>
+      mutex.lock
+        .surround {
+          if commands.isEmpty then
+            appendCommandsLocked(Vector.empty, Map.empty)
+              .as(
+                (
+                  Vector.empty[Long],
+                  Vector.empty[Deferred[F, Either[RaftError, LogId]]]
+                )
+              )
+          else
+            for
+              waiters <- commands
+                .traverse(_ => Deferred[F, Either[RaftError, LogId]])
+              waiterMap = waiters.zipWithIndex.map { case (d, i) =>
+                i -> d
+              }.toMap
+              logIds <- appendCommandsLocked(commands, waiterMap)
+            yield (logIds.map(_.index), waiters)
+        }
+        .flatMap { case (indices, waiters) =>
+          if waiters.isEmpty then Async[F].pure(Vector.empty)
+          else
+            val idxSet = indices.toSet
+            poll(waiters.traverse(_.get))
+              .onCancel(
+                pendingProposalsRef
+                  .update(_.filterNot(kv => idxSet.contains(kv._1)))
+              )
+              .flatMap(_.traverse(Async[F].fromEither))
+        }
+    }
+
+  private def appendCommandsLocked(
+      commands: Vector[Array[Byte]],
+      commitWaiters: Map[Int, Deferred[F, Either[RaftError, LogId]]]
+  ): F[Vector[LogId]] =
+    stateRef.get.flatMap {
+      case l: Leader if l.transferTarget.isDefined =>
+        Async[F].raiseError(
+          RaftError.LeadershipTransferInProgress(l.transferTarget.get)
+        )
+      case l: Leader =>
+        if commands.isEmpty then Async[F].pure(Vector.empty)
+        else
+          for
+            lastCoord <- effectiveLastLog
+            baseIdx = lastCoord._1
+            entries = commands.zipWithIndex.map { case (bytes, offset) =>
+              Log.command(baseIdx + offset + 1L, l.term, bytes)
+            }
+            indexedWaiters = commitWaiters.map { case (offset, waiter) =>
+              (baseIdx + offset + 1L) -> (l.term, waiter)
+            }
+            _ <- logStore.append(entries)
+            _ <-
+              if indexedWaiters.nonEmpty then
+                pendingProposalsRef.update(_ ++ indexedWaiters)
+              else Async[F].unit
+            _ <- metrics.onEntriesAppended(config.localId, entries.size)
+            lastBatchIdx = baseIdx + entries.size.toLong
+            _ <- logger.debug(
+              s"Leader appended batch of ${entries.size} command(s) up to index $lastBatchIdx"
+            )
+            cluster <- clusterRef.get
+            _ <-
+              if cluster.hasQuorum(Set(config.localId)) then
+                val committed = LogIndex.unsafeFrom(lastBatchIdx)
+                stateRef.set(l.withCommitIndex(lastBatchIdx)) *>
+                  applyCommittedEntries(committed) *>
+                  metrics.onEntriesCommitted(config.localId, lastBatchIdx)
+              else replicateAllPeers(l, LogIndex.unsafeFrom(lastBatchIdx))
+          yield entries.map(e => LogId(l.term, e.index))
+      case f: Follower =>
+        Async[F].raiseError(RaftError.NotLeader(f.leaderId))
+      case _: Candidate | _: PreCandidate =>
+        Async[F].raiseError(RaftError.ElectionInProgress)
+    }
+
+  private def runBatcherLoop: F[Unit] =
+    val step: F[Unit] =
+      for
+        first <- proposalQueue.take
+        maxBatch = config.batching.maxSize
+        readyNow <-
+          if maxBatch > 1 then proposalQueue.tryTakeN(Some(maxBatch - 1))
+          else Async[F].pure(Nil)
+        initial = first +: readyNow.toVector
+        batch <-
+          if initial.size >= maxBatch || config.batching.maxWait <= Duration.Zero
+          then Async[F].pure(initial)
+          else
+            Clock[F].monotonic.flatMap { now =>
+              collectMoreUntilDeadline(initial, now + config.batching.maxWait)
+            }
+        _ <- flushQueuedBatch(batch)
+      yield ()
+
+    Stream
+      .repeatEval(step)
+      .interruptWhen(shutdownRef)
+      .compile
+      .drain
+
+  private def collectMoreUntilDeadline(
+      buf: Vector[QueuedProposal[F]],
+      deadline: FiniteDuration
+  ): F[Vector[QueuedProposal[F]]] =
+    val maxBatch = config.batching.maxSize
+    if buf.size >= maxBatch then Async[F].pure(buf)
+    else
+      proposalQueue.tryTakeN(Some(maxBatch - buf.size)).flatMap { readyNow =>
+        val updated = buf ++ readyNow
+        if updated.size >= maxBatch then Async[F].pure(updated)
+        else
+          Clock[F].monotonic.flatMap { now =>
+            val remaining = deadline - now
+            if remaining <= Duration.Zero then Async[F].pure(updated)
+            else
+              Async[F]
+                .timeoutTo(
+                  proposalQueue.take.map(Some(_)),
+                  remaining,
+                  Async[F].pure(None)
+                )
+                .flatMap {
+                  case Some(nextItem) =>
+                    collectMoreUntilDeadline(updated :+ nextItem, deadline)
+                  case None =>
+                    proposalQueue
+                      .tryTakeN(Some(maxBatch - updated.size))
+                      .map(updated ++ _)
+                }
+          }
+      }
+
+  private def flushQueuedBatch(items: Vector[QueuedProposal[F]]): F[Unit] =
+    items.filterA(it => it.cancelled.get.map(!_)).flatMap { activeItems =>
+      if activeItems.isEmpty then Async[F].unit
+      else
+        val commands = activeItems.map(_.data)
+        val commitWaiters = activeItems.zipWithIndex.collect {
+          case (it, idx) if it.waitForCommit => idx -> it.result
+        }.toMap
+        mutex.lock
+          .surround(appendCommandsLocked(commands, commitWaiters))
+          .attempt
+          .flatMap {
+            case Right(logIds) =>
+              activeItems.zip(logIds).traverse_ { case (it, logId) =>
+                if !it.waitForCommit then it.result.complete(Right(logId)).void
+                else Async[F].unit
+              }
+            case Left(raftErr: RaftError) =>
+              activeItems
+                .traverse_(it => it.result.complete(Left(raftErr)).void)
+            case Left(other) =>
+              val dropErr = RaftError.ProposalDropped(
+                Option(other.getMessage).getOrElse("Batch append failed")
+              )
+              activeItems
+                .traverse_(it => it.result.complete(Left(dropErr)).void)
+          }
+    }
+
+  private def drainProposalQueue(err: RaftError): F[Unit] =
+    proposalQueue.tryTakeN(None).flatMap { items =>
+      items.traverse_(it => it.result.complete(Left(err)).void)
+    }
 
   def readIndex: F[Long] =
     Async[F].uncancelable { poll =>
@@ -459,6 +687,7 @@ private final class RaftNodeImpl[F[_]: Async](
                 )
                 _ <- logStore.append(Seq(entry))
                 _ <- clusterRef.set(effectiveCfg)
+                _ <- reconcilePeerProgress(effectiveCfg, newIndex)
                 addedPeers =
                   (effectiveCfg.allNodes - config.localId) -- l.nextIndex.keySet
                 updatedLeader = addedPeers.foldLeft(l) { (acc, peer) =>
@@ -535,11 +764,11 @@ private final class RaftNodeImpl[F[_]: Async](
                           cur.nextIndex.getOrElse(target, lastIdx + 1L)
                         val sendMissing =
                           if lastIdx > 0L && nextIdx <= lastIdx then
-                            replicatePeerRange(
+                            pumpPeerReplication(
                               cur,
                               target,
-                              nextIdx,
-                              LogIndex.unsafeFrom(lastIdx)
+                              LogIndex.unsafeFrom(lastIdx),
+                              forceUnpause = true
                             )
                           else Async[F].unit
                         sendMissing *> scheduleTransferTimeout(cur.term, target)
@@ -563,11 +792,14 @@ private final class RaftNodeImpl[F[_]: Async](
     for
       _ <- logger.info(s"Shutting down RAFT node ${config.localId.value}")
       _ <- shutdownRef.set(true)
+      _ <- cancelFiber(batcherFiberRef)
       _ <- cancelFiber(electionFiberRef)
       _ <- cancelFiber(heartbeatFiberRef)
       _ <- cancelFiber(checkQuorumFiberRef)
       _ <- cancelFiber(transferFiberRef)
       _ <- cancelFiber(eventLoopFiberRef)
+      _ <- peerProgressRef.set(Map.empty)
+      _ <- drainProposalQueue(RaftError.ProposalDropped("Node shutting down"))
       _ <- failAllPending(RaftError.ProposalDropped("Node shutting down"))
     yield ()
 
@@ -732,6 +964,13 @@ private final class RaftNodeImpl[F[_]: Async](
               clusterOpt = Some(cluster)
             )
             _ <- stateRef.set(transition.state)
+            _ <- updatePeerProgressAfterTransition(
+              msg,
+              senderOpt,
+              transition.state,
+              lastLogIndex,
+              cluster
+            )
             _ <- maybeRefreshLeaderLease(msg, transition.state, cluster)
             _ <- maybeRearmCheckQuorum(msg, transition.state)
             _ <- executeEffects(transition.effects)
@@ -941,6 +1180,149 @@ private final class RaftNodeImpl[F[_]: Async](
               }
     }
 
+  private def reconcilePeerProgress(
+      cfg: ClusterConfig,
+      defaultNextIdx: Long
+  ): F[Unit] =
+    val peers = cfg.allNodes - config.localId
+    peerProgressRef.update { current =>
+      peers.map { id =>
+        val isLrn = cfg.isLearner(id)
+        current.get(id) match
+          case Some(existing) => id -> existing.copy(isLearner = isLrn)
+          case None           =>
+            id -> Progress(
+              matched = 0L,
+              nextIdx = math.max(1L, defaultNextIdx),
+              state = ProgressState.Probe,
+              probeSent = false,
+              isLearner = isLrn,
+              inflights = Inflights(effectiveMaxInflight)
+            )
+      }.toMap
+    }
+
+  private def updatePeerProgressAfterTransition(
+      msg: RaftMessage,
+      senderOpt: Option[NodeId],
+      newState: NodeState,
+      lastLogIndex: Long,
+      cluster: ClusterConfig
+  ): F[Unit] =
+    (msg, senderOpt, newState) match
+      case (resp: AppendEntriesResponse, Some(peerId), l: Leader)
+          if resp.term == l.term =>
+        if resp.success then
+          val leaderMatch = l.matchIndex.getOrElse(peerId, 0L)
+          val fallbackNext = l.nextIndex.getOrElse(peerId, leaderMatch + 1L)
+          peerProgressRef.update { cur =>
+            val base = cur.getOrElse(
+              peerId,
+              Progress(
+                matched = 0L,
+                nextIdx = fallbackNext,
+                state = ProgressState.Probe,
+                isLearner = cluster.isLearner(peerId),
+                inflights = Inflights(effectiveMaxInflight)
+              )
+            )
+            val (u0, moved) = base.maybeUpdate(leaderMatch)
+            val u1 = u0.state match
+              case ProgressState.Probe =>
+                if moved || (resp.matchIndex == u0.matched && u0.nextIdx == u0.matched + 1L)
+                then u0.becomeReplicate()
+                else u0
+              case ProgressState.Snapshot(snapIdx) if u0.matched >= snapIdx =>
+                u0.becomeProbe()
+              case _ => u0
+            cur.updated(peerId, u1)
+          }
+        else
+          val backtrackedNext = l.nextIndex.getOrElse(peerId, 1L)
+          val curMatched = l.matchIndex.getOrElse(peerId, 0L)
+          peerProgressRef.update { cur =>
+            val isLrn = cur
+              .get(peerId)
+              .map(_.isLearner)
+              .getOrElse(cluster.isLearner(peerId))
+            cur.updated(
+              peerId,
+              Progress(
+                matched = curMatched,
+                nextIdx = backtrackedNext,
+                state = ProgressState.Probe,
+                probeSent = true,
+                isLearner = isLrn,
+                inflights = Inflights(effectiveMaxInflight)
+              )
+            )
+          } *> metrics.onReplicationFailure(config.localId, peerId)
+
+      case (resp: InstallSnapshotResponse, Some(peerId), l: Leader)
+          if resp.term == l.term && resp.success && resp.matchIndex > 0L =>
+        val updatedMatch = l.matchIndex.getOrElse(peerId, resp.matchIndex)
+        peerProgressRef.update { cur =>
+          val base = cur.getOrElse(
+            peerId,
+            Progress(
+              matched = 0L,
+              nextIdx = updatedMatch + 1L,
+              state = ProgressState.Probe,
+              isLearner = cluster.isLearner(peerId),
+              inflights = Inflights(effectiveMaxInflight)
+            )
+          )
+          val (u0, _) = base.maybeUpdate(updatedMatch)
+          cur.updated(peerId, u0.becomeProbe())
+        }
+
+      case (HeartbeatTimeout, _, l: Leader) =>
+        snapshotInFlightRef.get.flatMap { activeSnaps =>
+          peerProgressRef.update { cur =>
+            l.nextIndex.foldLeft(cur) { case (acc, (peerId, leaderNext)) =>
+              if leaderNext > lastLogIndex then acc
+              else
+                acc.get(peerId) match
+                  case None =>
+                    acc.updated(
+                      peerId,
+                      Progress(
+                        matched = l.matchIndex.getOrElse(peerId, 0L),
+                        nextIdx = leaderNext,
+                        state = ProgressState.Probe,
+                        probeSent = false,
+                        isLearner = cluster.isLearner(peerId),
+                        inflights = Inflights(effectiveMaxInflight)
+                      )
+                    )
+                  case Some(pr) =>
+                    val updatedPr = pr.state match
+                      case ProgressState.Snapshot(_)
+                          if !activeSnaps.contains(peerId) =>
+                        pr.copy(
+                          state = ProgressState.Probe,
+                          nextIdx = leaderNext,
+                          probeSent = false,
+                          inflights = pr.inflights.reset
+                        )
+                      case ProgressState.Probe =>
+                        pr.copy(nextIdx = leaderNext, probeSent = false)
+                      case ProgressState.Replicate
+                          if pr.inflights.isFull || pr.nextIdx > lastLogIndex =>
+                        pr.copy(
+                          state = ProgressState.Probe,
+                          nextIdx = leaderNext,
+                          probeSent = false,
+                          inflights = pr.inflights.reset
+                        )
+                      case _ => pr
+                    acc.updated(peerId, updatedPr)
+            }
+          }
+        }
+
+      case _ => Async[F].unit
+
   /** Replicate missing log entries `[nextIdx .. lastIdx]` (or trigger chunked
     * snapshot transfer) to followers on heartbeat ticks, `AppendEntries` ACKs,
     * or `InstallSnapshot` ACKs.
@@ -956,9 +1338,9 @@ private final class RaftNodeImpl[F[_]: Async](
             effectiveLastLog.flatMap { case (lastIdx, _) =>
               if lastIdx > 0L then
                 val targetLast = LogIndex.unsafeFrom(lastIdx)
-                l.nextIndex.toList.parTraverse_ { case (peerId, nextIdx) =>
+                dispatchPeers(l.nextIndex.toList) { case (peerId, nextIdx) =>
                   if nextIdx <= lastIdx then
-                    replicatePeerRange(l, peerId, nextIdx, targetLast)
+                    pumpPeerReplication(l, peerId, targetLast)
                   else Async[F].unit
                 }
               else Async[F].unit
@@ -969,10 +1351,9 @@ private final class RaftNodeImpl[F[_]: Async](
                 effectiveLastLog.flatMap { case (lastIdx, _) =>
                   val nextIdx = l.nextIndex.getOrElse(peerId, lastIdx + 1L)
                   if lastIdx > 0L && nextIdx <= lastIdx then
-                    replicatePeerRange(
+                    pumpPeerReplication(
                       l,
                       peerId,
-                      nextIdx,
                       LogIndex.unsafeFrom(lastIdx)
                     )
                   else Async[F].unit
@@ -985,10 +1366,9 @@ private final class RaftNodeImpl[F[_]: Async](
                 effectiveLastLog.flatMap { case (lastIdx, _) =>
                   val nextIdx = l.nextIndex.getOrElse(peerId, lastIdx + 1L)
                   if lastIdx > 0L && nextIdx <= lastIdx then
-                    replicatePeerRange(
+                    pumpPeerReplication(
                       l,
                       peerId,
-                      nextIdx,
                       LogIndex.unsafeFrom(lastIdx)
                     )
                   else Async[F].unit
@@ -1008,60 +1388,116 @@ private final class RaftNodeImpl[F[_]: Async](
       peers: Set[NodeId],
       lastIdx: LogIndex
   ): F[Unit] =
-    peers.toList.parTraverse_ { peerId =>
-      val nextIdx = leader.nextIndex.getOrElse(peerId, lastIdx.value)
-      replicatePeerRange(leader, peerId, math.max(1L, nextIdx), lastIdx)
+    dispatchPeers(peers.toList) { peerId =>
+      pumpPeerReplication(leader, peerId, lastIdx)
     }
 
-  private def replicatePeerRange(
+  /** Dispatch 1 probe batch (in `Probe` or stop-and-wait mode) or up to
+    * `Inflights` window capacity back-to-back pipelined `AppendEntriesRequest`
+    * batches (when `config.pipelining.enabled` and peer is in `Replicate`).
+    */
+  private def pumpPeerReplication(
       leader: Leader,
       peerId: NodeId,
-      fromIndex: Long,
-      lastIdx: LogIndex
+      lastIdx: LogIndex,
+      forceUnpause: Boolean = false
   ): F[Unit] =
-    val safeFrom = math.max(1L, fromIndex)
-    if safeFrom > lastIdx.value then Async[F].unit
+    for
+      cluster <- clusterRef.get
+      progressMap <- peerProgressRef.get
+      defaultNext = math.max(
+        1L,
+        leader.nextIndex.getOrElse(peerId, lastIdx.value)
+      )
+      basePr = progressMap.getOrElse(
+        peerId,
+        Progress(
+          matched = leader.matchIndex.getOrElse(peerId, 0L),
+          nextIdx = defaultNext,
+          state = ProgressState.Probe,
+          isLearner = cluster.isLearner(peerId),
+          inflights = Inflights(effectiveMaxInflight)
+        )
+      )
+      pr =
+        if forceUnpause then
+          basePr.copy(
+            state = ProgressState.Probe,
+            probeSent = false,
+            nextIdx = math.min(basePr.nextIdx, defaultNext),
+            inflights = basePr.inflights.reset
+          )
+        else basePr
+      safeFrom = math.max(1L, pr.nextIdx)
+      _ <-
+        if pr.isPaused || safeFrom > lastIdx.value then Async[F].unit
+        else
+          for
+            snapMetaOpt <- latestSnapMetaRef.get
+            firstEntryOpt <- logStore.get(LogIndex.unsafeFrom(safeFrom))
+            prevIdx = safeFrom - 1L
+            prevTermOpt <- termAtWithSnapshot(prevIdx)
+            needsSnapshot =
+              (firstEntryOpt.isEmpty || prevTermOpt.isEmpty) &&
+                snapMetaOpt.exists(_.lastIncludedIndex >= safeFrom)
+            _ <-
+              if needsSnapshot then
+                val snapIdx =
+                  snapMetaOpt.map(_.lastIncludedIndex).getOrElse(safeFrom)
+                peerProgressRef.update(
+                  _.updated(peerId, pr.becomeSnapshot(snapIdx))
+                ) *> triggerSnapshotTransfer(peerId, leader.term)
+              else
+                buildPipelinedBatches(leader, pr, lastIdx.value, Vector.empty)
+                  .flatMap { case (updatedPr, requests) =>
+                    if requests.isEmpty then Async[F].unit
+                    else
+                      peerProgressRef.update(_.updated(peerId, updatedPr)) *> (
+                        if requests.size == 1 then
+                          transport.send(peerId, requests.head)
+                        else transport.sendBatch(peerId, requests)
+                      )
+                  }
+          yield ()
+    yield ()
+
+  private def buildPipelinedBatches(
+      leader: Leader,
+      curPr: Progress,
+      lastIdx: Long,
+      acc: Vector[RaftMessage]
+  ): F[(Progress, Vector[RaftMessage])] =
+    val batchStart = math.max(1L, curPr.nextIdx)
+    if curPr.isPaused || batchStart > lastIdx then Async[F].pure((curPr, acc))
     else
+      val batchEnd = math.min(
+        lastIdx,
+        batchStart + config.maxEntriesPerRequest.toLong - 1L
+      )
+      val prevIdx = batchStart - 1L
       for
-        snapMetaOpt <- latestSnapMetaRef.get
-        firstEntryOpt <- logStore.get(LogIndex.unsafeFrom(safeFrom))
-        prevIdx = safeFrom - 1L
         prevTermOpt <- termAtWithSnapshot(prevIdx)
-        needsSnapshot =
-          (firstEntryOpt.isEmpty || prevTermOpt.isEmpty) &&
-            snapMetaOpt.exists(_.lastIncludedIndex >= safeFrom)
-        _ <-
-          if needsSnapshot then triggerSnapshotTransfer(peerId, leader.term)
+        entries <- logStore.getRange(
+          LogIndex.unsafeFrom(batchStart),
+          LogIndex.unsafeFrom(batchEnd)
+        )
+        res <-
+          if entries.isEmpty then Async[F].pure((curPr, acc))
           else
-            val batchEnd = LogIndex.unsafeFrom(
-              math.min(
-                lastIdx.value,
-                safeFrom + config.maxEntriesPerRequest.toLong - 1L
+            val req = AppendEntriesRequest(
+              term = leader.term,
+              leaderId = config.localId,
+              prevLogIndex = prevIdx,
+              prevLogTerm = prevTermOpt.getOrElse(0L),
+              entries = entries,
+              leaderCommit = math.min(
+                leader.commitIndex,
+                prevIdx + entries.size.toLong
               )
             )
-            val prevTerm = prevTermOpt.getOrElse(0L)
-            for
-              entries <- logStore.getRange(
-                LogIndex.unsafeFrom(safeFrom),
-                batchEnd
-              )
-              _ <-
-                if entries.nonEmpty then
-                  val req = AppendEntriesRequest(
-                    term = leader.term,
-                    leaderId = config.localId,
-                    prevLogIndex = prevIdx,
-                    prevLogTerm = prevTerm,
-                    entries = entries,
-                    leaderCommit = math.min(
-                      leader.commitIndex,
-                      prevIdx + entries.size.toLong
-                    )
-                  )
-                  transport.send(peerId, req)
-                else Async[F].unit
-            yield ()
-      yield ()
+            val nextPr = curPr.optimisticUpdate(entries.last.index)
+            buildPipelinedBatches(leader, nextPr, lastIdx, acc :+ req)
+      yield res
 
   private def triggerSnapshotTransfer(
       peerId: NodeId,
@@ -1126,7 +1562,7 @@ private final class RaftNodeImpl[F[_]: Async](
         val allSends =
           s :: moreSends.collect { case sm: Eff.SendMessage => sm }
         val byPeer = allSends.groupBy(_.to).toList
-        byPeer.parTraverse_ { case (peer, msgs) =>
+        dispatchPeers(byPeer) { case (peer, msgs) =>
           msgs.traverse_(m => transport.send(peer, m.message))
         } *> executeEffects(rest)
       case head :: tail =>
@@ -1325,7 +1761,10 @@ private final class RaftNodeImpl[F[_]: Async](
           )
 
       case Eff.ApplyClusterConfig(newConfig, _, _) =>
-        clusterRef.set(newConfig)
+        clusterRef.set(newConfig) *>
+          effectiveLastLog.flatMap { case (lastIdx, _) =>
+            reconcilePeerProgress(newConfig, lastIdx + 1L)
+          }
 
   private def handleLeaderStepDown: F[Unit] =
     for
@@ -1333,10 +1772,12 @@ private final class RaftNodeImpl[F[_]: Async](
       _ <- cancelFiber(heartbeatFiberRef)
       _ <- cancelFiber(checkQuorumFiberRef)
       _ <- cancelFiber(transferFiberRef)
+      _ <- peerProgressRef.set(Map.empty)
       _ <- leaseUntilRef.set(Duration.Zero)
       err = st match
         case f: Follower => RaftError.NotLeader(f.leaderId)
         case _           => RaftError.NotLeader(None)
+      _ <- drainProposalQueue(err)
       _ <- failPendingLeaderRequests(err)
       _ <- metrics.onStepDown(config.localId, st.term)
     yield ()
@@ -1473,6 +1914,17 @@ private final class RaftNodeImpl[F[_]: Async](
       noOpIndex = lastLogIndex + 1L
       noOpEntry = Log.noOp(noOpIndex, term)
       _ <- logStore.append(Seq(noOpEntry))
+      initProgress = followers.map { id =>
+        id -> Progress(
+          matched = 0L,
+          nextIdx = noOpIndex,
+          state = ProgressState.Probe,
+          probeSent = false,
+          isLearner = cluster.isLearner(id),
+          inflights = Inflights(effectiveMaxInflight)
+        )
+      }.toMap
+      _ <- peerProgressRef.set(initProgress)
       _ <- stateRef.update {
         case l: Leader =>
           l.initializeIndices(followers, lastLogIndex)
@@ -1598,6 +2050,7 @@ private final class RaftNodeImpl[F[_]: Async](
                 )
                 _ <- logStore.append(Seq(cNewEntry))
                 _ <- clusterRef.set(finalCfg)
+                _ <- reconcilePeerProgress(finalCfg, cNewIdx)
                 _ <-
                   if config.checkQuorumEnabled then resetCheckQuorumTimer
                   else Async[F].unit

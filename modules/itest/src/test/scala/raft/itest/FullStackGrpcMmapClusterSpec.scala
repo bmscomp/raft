@@ -125,7 +125,10 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
       clusterCfg: ClusterConfig,
       compaction: CompactionConfig,
       segmentSize: Long,
-      autoStart: Boolean
+      autoStart: Boolean,
+      batching: BatchConfig = BatchConfig(),
+      pipelining: PipelineConfig = PipelineConfig(),
+      maxEntriesPerRequest: Int = 100
   ): Resource[IO, LiveNode] =
     for
       engine <- MmapWalEngine.resource[IO](dataDir, segmentSize = segmentSize)
@@ -157,6 +160,9 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
         electionTimeoutMin = 300.millis,
         electionTimeoutMax = 600.millis,
         heartbeatInterval = 45.millis,
+        maxEntriesPerRequest = maxEntriesPerRequest,
+        batching = batching,
+        pipelining = pipelining,
         compaction = compaction
       )
       rn <- RaftNode[IO](
@@ -662,6 +668,70 @@ class FullStackGrpcMmapClusterSpec extends AnyFlatSpec with Matchers:
           }
           checkResult.stats.opsChecked should be >= 35
         }
+      }
+    yield ()).use_.guarantee(IO(deleteRecursive(baseDir)))
+
+    prog.timeout(90.seconds).unsafeRunSync()
+  }
+
+  it should "coalesce concurrent group-commit proposals and pipeline AppendEntries over live gRPC + MmapWalEngine" in {
+    val baseDir = Files.createTempDirectory("raft-itest-batch-pipe-")
+    val ids = List(n1, n2, n3)
+    val clusterCfg = ClusterConfig(ids.toSet)
+
+    val prog = (for
+      nodes <- ids.traverse { id =>
+        buildNodeResource(
+          id = id,
+          dataDir = baseDir.resolve(id.value),
+          port = 0,
+          initialPeers = Map.empty,
+          clusterCfg = clusterCfg,
+          compaction = CompactionConfig(),
+          segmentSize = 4096L,
+          autoStart = false,
+          batching = BatchConfig(
+            enabled = true,
+            maxSize = 25,
+            maxWait = 10.millis
+          ),
+          pipelining = PipelineConfig(enabled = true, maxInflight = 6),
+          maxEntriesPerRequest = 8
+        )
+      }
+      peerAddrs = nodes.map(n => n.id -> n.address).toMap
+      _ <- Resource.eval(
+        nodes.traverse_(n => n.grpc.updatePeers(peerAddrs - n.id)) *>
+          nodes.traverse_(_.raftNode.start)
+      )
+      _ <- Resource.eval {
+        for
+          // Warmup commit so followers enter ProgressState.Replicate
+          _ <- proposeWithRetry(nodes, utf8("bp-init=ready"))
+          leader <- awaitLeader(nodes)
+
+          // 1) Explicit proposeBatchAndCommit of 16 entries (pipelined across 2 chunks of 8 per follower, 1 MmapWalEngine msync)
+          explicitIds <- leader.raftNode.proposeBatchAndCommit(
+            (1 to 16).map(i => utf8(s"bp-exp-$i=val-$i"))
+          )
+          _ = explicitIds should have size 16
+
+          // 2) 32 concurrent client fibers coalesced via BatchConfig(maxSize=25, maxWait=10ms)
+          concurrentIds <- (1 to 32).toList.parTraverse { i =>
+            proposeWithRetry(nodes, utf8(s"bp-conc-$i=cval-$i"))
+          }
+          _ = concurrentIds.map(_.index).distinct should have size 32
+
+          expected =
+            Map("bp-init" -> "ready") ++
+              (1 to 16).map(i => s"bp-exp-$i" -> s"val-$i") ++
+              (1 to 32).map(i => s"bp-conc-$i" -> s"cval-$i")
+
+          _ <- awaitCondition(
+            nodes.forallM(n => n.stateMachine.currentMap.map(_ == expected)),
+            retries = 400
+          )
+        yield ()
       }
     yield ()).use_.guarantee(IO(deleteRecursive(baseDir)))
 

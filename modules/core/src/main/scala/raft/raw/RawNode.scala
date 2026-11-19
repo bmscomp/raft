@@ -43,11 +43,14 @@ final class RawNode(
   private var lastEmittedSoftState: SoftState =
     SoftState(None, roleState)
 
+  private def effectiveMaxInflight: Int =
+    if config.pipelining.enabled then config.pipelining.maxInflight else 1
+
   private var tracker: ProgressTracker = ProgressTracker.forLeader(
     config.localId,
     initCluster,
     storage.lastIndex,
-    config.pipelining.maxInflight
+    effectiveMaxInflight
   )
 
   // Unstable log overlay (entries generated since last `advance`, before host persists)
@@ -170,6 +173,34 @@ final class RawNode(
             val idx = appendLeaderEntry(LogType.Command, data, l.term)
             bcastAppend()
             Right(idx)
+      case f: Follower =>
+        Left(RaftError.NotLeader(f.leaderId))
+      case _ =>
+        Left(RaftError.ElectionInProgress)
+
+  /** Atomically propose a batch of client command payloads in a single log
+    * append and replication pass (group-commit batching).
+    *
+    * All commands in `commands` receive contiguous log indices in the leader's
+    * current term, appear together in a single [[Ready.entries]] slice for one
+    * WAL `fsync`, and trigger replication once for the entire batch.
+    */
+  def proposeBatch(
+      commands: Seq[Array[Byte]]
+  ): Either[RaftError, Vector[Long]] =
+    roleState match
+      case l: Leader =>
+        l.transferTarget match
+          case Some(target) =>
+            Left(RaftError.LeadershipTransferInProgress(target))
+          case None =>
+            if commands.isEmpty then Right(Vector.empty)
+            else
+              val indices = commands.iterator
+                .map(cmd => appendLeaderEntry(LogType.Command, cmd, l.term))
+                .toVector
+              bcastAppend()
+              Right(indices)
       case f: Follower =>
         Left(RaftError.NotLeader(f.leaderId))
       case _ =>
@@ -614,7 +645,7 @@ final class RawNode(
       config.localId,
       tracker.config,
       baseLast,
-      config.pipelining.maxInflight
+      effectiveMaxInflight
     )
     val peers = tracker.config.allNodes - config.localId
     val nextMap = peers.map(_ -> (baseLast + 2L)).toMap
@@ -688,65 +719,72 @@ final class RawNode(
     }
 
   private def sendAppend(peer: NodeId, forceSendEmpty: Boolean): Unit =
-    tracker.progress.get(peer).foreach { pr =>
-      if !pr.isPaused || forceSendEmpty then
-        val prevIdx = pr.nextIdx - 1L
-        val prevTermOpt = termAt(prevIdx)
-        val firstAvail = storage.firstIndex
+    var keepSending = true
+    var allowEmptyOnce = forceSendEmpty
+    while keepSending do
+      keepSending = false
+      tracker.progress.get(peer).foreach { pr =>
+        if !pr.isPaused || allowEmptyOnce then
+          val prevIdx = pr.nextIdx - 1L
+          val prevTermOpt = termAt(prevIdx)
+          val firstAvail = storage.firstIndex
 
-        if (pr.nextIdx < firstAvail || prevTermOpt.isEmpty) &&
-          storage.snapshotMetadata.isDefined
-        then
-          // Follower lags behind compacted log; transition to Snapshot state
-          storage.snapshotMetadata.foreach { snap =>
-            tracker = tracker.updateProgress(
-              peer,
-              _.becomeSnapshot(snap.lastIncludedIndex)
+          if (pr.nextIdx < firstAvail || prevTermOpt.isEmpty) &&
+            storage.snapshotMetadata.isDefined
+          then
+            // Follower lags behind compacted log; transition to Snapshot state
+            storage.snapshotMetadata.foreach { snap =>
+              tracker = tracker.updateProgress(
+                peer,
+                _.becomeSnapshot(snap.lastIncludedIndex)
+              )
+              sendOrigin(
+                peer,
+                InstallSnapshotRequest(
+                  term = currentTerm,
+                  leaderId = config.localId,
+                  lastIncludedIndex = snap.lastIncludedIndex,
+                  lastIncludedTerm = snap.lastIncludedTerm,
+                  offset = 0L,
+                  data = SnapshotMetadata.encodePayload(snap.config, snap.data),
+                  done = true
+                ),
+                prePersist = true
+              )
+            }
+          else
+            val prevTerm = prevTermOpt.getOrElse(0L)
+            val upper = math.min(
+              lastLogIndex + 1L,
+              pr.nextIdx + config.maxEntriesPerRequest.toLong
             )
-            sendOrigin(
-              peer,
-              InstallSnapshotRequest(
-                term = currentTerm,
-                leaderId = config.localId,
-                lastIncludedIndex = snap.lastIncludedIndex,
-                lastIncludedTerm = snap.lastIncludedTerm,
-                offset = 0L,
-                data = SnapshotMetadata.encodePayload(snap.config, snap.data),
-                done = true
-              ),
-              prePersist = true
-            )
-          }
-        else
-          val prevTerm = prevTermOpt.getOrElse(0L)
-          val upper = math.min(
-            lastLogIndex + 1L,
-            pr.nextIdx + config.maxEntriesPerRequest.toLong
-          )
-          val ents =
-            if tracker.config.witnesses.contains(peer) || pr.isPaused then
-              Vector.empty
-            else entriesBetween(pr.nextIdx, upper)
+            val ents =
+              if tracker.config.witnesses.contains(peer) || pr.isPaused then
+                Vector.empty
+              else entriesBetween(pr.nextIdx, upper)
 
-          if ents.nonEmpty || forceSendEmpty then
-            val updatedPr =
-              if ents.nonEmpty then pr.optimisticUpdate(ents.last.index)
-              else pr
-            tracker = tracker.updateProgress(peer, _ => updatedPr)
-            syncLeaderMapsFromTracker()
-            sendOrigin(
-              peer,
-              AppendEntriesRequest(
-                term = currentTerm,
-                leaderId = config.localId,
-                prevLogIndex = prevIdx,
-                prevLogTerm = prevTerm,
-                entries = ents,
-                leaderCommit = commitIdx
-              ),
-              prePersist = true
-            )
-    }
+            if ents.nonEmpty || allowEmptyOnce then
+              allowEmptyOnce = false
+              val updatedPr =
+                if ents.nonEmpty then pr.optimisticUpdate(ents.last.index)
+                else pr
+              tracker = tracker.updateProgress(peer, _ => updatedPr)
+              syncLeaderMapsFromTracker()
+              sendOrigin(
+                peer,
+                AppendEntriesRequest(
+                  term = currentTerm,
+                  leaderId = config.localId,
+                  prevLogIndex = prevIdx,
+                  prevLogTerm = prevTerm,
+                  entries = ents,
+                  leaderCommit = commitIdx
+                ),
+                prePersist = true
+              )
+              if ents.nonEmpty && !updatedPr.isPaused && updatedPr.nextIdx <= lastLogIndex
+              then keepSending = true
+      }
 
   private def handleRequestVote(from: NodeId, req: RequestVoteRequest): Unit =
     val logUpToDate =
@@ -1016,7 +1054,7 @@ final class RawNode(
                   case ProgressState.Probe =>
                     if moved then updated0.becomeReplicate() else updated0
                   case ProgressState.Replicate
-                      if !moved && updated0.matched < lastLogIndex =>
+                      if !moved && resp.matchIndex == updated0.matched && updated0.matched < lastLogIndex =>
                     updated0.becomeProbe()
                   case ProgressState.Snapshot(snapIdx) =>
                     if updated0.matched >= snapIdx then updated0.becomeProbe()
