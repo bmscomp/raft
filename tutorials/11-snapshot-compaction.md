@@ -208,9 +208,20 @@ sequenceDiagram
     L->>F: "AppendEntries(prevLogIndex=idx, prevLogTerm=snapTerm, entries=[idx+1..])"
 ```
 
-Two subtle protocol invariants handled automatically by this pipeline:
+Two subtle protocol invariants and one storage durability pipeline handled automatically:
 1. **`leaderTerm` vs. `lastIncludedTerm`**: `InstallSnapshotRequest.term` carries the leader's **current** term (`leader.term`), while `lastIncludedTerm` carries the historical term of the compacted entry. Sending `lastIncludedTerm` in `term` would cause followers in higher terms to reject valid snapshots!
 2. **Non-Blocking Background Transfer**: `RaftNode` tracks per-peer in-flight transfers (`snapshotInFlightRef`) and streams chunks on a background fiber outside the consensus `Mutex[F]`, so multi-megabyte snapshot transfers never stall heartbeats or client proposals for healthy followers.
+3. **Streaming `"RSNP"` v2 On-Disk Durability (`MmapWalEngine`)**: When persisted via `StorageBackedSnapshotStore`, `MmapWalEngine.saveSnapshot` streams `Snapshot.data` chunks directly into `snapshot-%020d.tmp` with a `"RSNP"` v2 header (`magic + version + lastIndex + lastTerm + payloadBytes + RCFG v2 ClusterConfig + headerCrc32`) and trailing `dataCrc32` — **zero contiguous `Array[Byte]` heap materialization** — calls `FileChannel.force(true)` on both the `.tmp` file and `snapshots/` directory around `ATOMIC_MOVE`, and verifies the payload `CRC32` lazily via `fs2.io.file.Files[F].readRange` on restore.
+
+```mermaid
+flowchart LR
+    SM["StateMachine.snapshot (fs2.Stream)"] --> TMP["FileChannel write to snapshot-%020d.tmp"]
+    TMP --> CRC["Write RSNP v2 Header CRC32 + Trailing Payload CRC32"]
+    CRC --> FSYNC1["tmpChannel.force(true)"]
+    FSYNC1 --> MOVE["ATOMIC_MOVE -> snapshot-%020d.bin"]
+    MOVE --> FSYNC2["snapshotDir.force(true) + Prune Superseded .bin"]
+    FSYNC2 --> LOAD["Lazy fs2.io.file readRange + End-of-Stream CRC32 Check"]
+```
 
 ## Compaction Safety Rules
 

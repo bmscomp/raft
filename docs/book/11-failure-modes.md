@@ -569,27 +569,30 @@ Raft's safety proofs assume durable storage is faithful: once `PersistHardState`
 3. **Lexicographic snapshot sorting cliff (`index >= 1,000,000`)**: Formatting snapshot filenames with 6-digit padding (`snapshot-%06d.bin`) and sorting filenames as strings works up to `snapshot-999999.bin`. At index `1,000,000`, `"snapshot-1000000.bin" < "snapshot-999999.bin"` in ASCII order (`'1' < '9'`), causing recovery to load a stale snapshot and discard committed state!
 4. **Concurrent WAL & snapshot mutation races**: Background log compaction (`discardBefore`), snapshot GC, and active `appendEntries` mutating shared `MemorySegment` offsets without a `Mutex[F]` corrupt segment write pointers under load.
 
-### How `raft-storage-mmap` Defends Against All Four
+### How `raft-storage-mmap` Defends Against All Six Storage Failure Vectors
 
 ```mermaid
 flowchart TD
     OPEN["MmapWalEngine.open(dataDir)"] --> HS["MmapHardState.read (280 bytes)"]
-    HS -->|"Zero-check or CRC32[0..268) + bounds"| HS_OK["Verified HardState(term, votedFor)"]
-    HS -->|"CRC mismatch / invalid votedForLen"| CORRUPT["Fail fast: RaftError.StorageCorruption"]
+    HS -->|"Zero-check or CRC32 + bounds"| HS_OK["Verified HardState (term, votedFor, commitIndex)"]
+    HS -->|"CRC mismatch / invalid bounds"| CORRUPT["Fail fast: RaftError.StorageCorruption"]
 
-    HS_OK --> CKPT["Read index.ckpt (WIDX v1 + CRC32)"]
-    CKPT -->|"Valid WIDX + CRC32"| TAIL["Incremental replay of .wal entries > ckptLastIdx"]
-    CKPT -->|"Missing / Torn / Bad CRC32"| REBUILD["Delete corrupt index.ckpt & full replay from .wal segments"]
+    HS_OK --> WAL["MmapSegment.openForRecovery (per .wal segment)"]
+    WAL -->|"Valid records"| IDX["2-Level Paged WalIndexState (64-bit Long-safe)"]
+    WAL -->|"Uncommitted torn tail (> commitIndex)"| HEAL["Self-heal: truncateAt(validOffset) + msync"]
+    WAL -->|"Mid-log / committed bit-rot (<= commitIndex)"| CORRUPT_WAL["Fail fast: CorruptedEntryException"]
+    HEAL --> IDX
 
-    TAIL --> SNAP["Numeric parseSnapshotIndex (snapshot-%020d.bin)"]
-    REBUILD --> SNAP
-    SNAP --> READY["Mutex[F]-guarded MmapWalEngine Ready"]
+    IDX --> SNAP["Streaming RSNP v2 Snapshots (snapshot-%020d.bin)"]
+    SNAP -->|"Header CRC32 + streaming payload CRC32 + dir fsync"| READY["EngineState + SegmentLease[F] Ready"]
 ```
 
-1. **Verified `MmapHardState`**: Zero-fills unused `votedFor` bytes `[12 + len .. 268)` on every `write`, `msync`s via `mapped.force()`, and verifies `CRC32([0..268))` plus `term >= 0` and `0 <= votedForLen <= 256` on every `read`.
-2. **Self-healing `"WIDX"` Checkpoints**: `index.ckpt` is only an acceleration cache over immutable `.wal` segments. `MmapWalEngine` writes `index.ckpt.tmp` with a `"WIDX"` magic header, version byte, and trailing CRC32 before `ATOMIC_MOVE`. If `WalIndex.deserializeChecked` detects truncation or checksum failure on startup, `MmapWalEngine` deletes the corrupt checkpoint and reconstructs the exact index by replaying `.wal` segments.
-3. **20-Digit Numeric Snapshot Ordering**: Snapshots are written as `snapshot-%020d.bin` (covering up to `Long.MaxValue = 9,223,372,036,854,775,807`) and selected via numeric `parseSnapshotIndex` (`maxByOption`), remaining backward-compatible with legacy 6-digit files.
-4. **Serialized `Mutex[F]` Engine Access**: Every mutating WAL, hard-state, truncation, compaction, and snapshot operation acquires `writeMutex: Mutex[F]`, eliminating impure in-place mutations inside `Ref.update`.
+1. **Verified `MmapHardState`**: Zero-fills unused `votedFor` bytes `[12 + len .. 268)` on every `write`, `msync`s via `mapped.force()`, and verifies `CRC32` over `[0..268) ++ [272..280)` (`commitIndex`) plus `term >= 0` and `0 <= votedForLen <= 256` on every `read`.
+2. **Torn-Tail Self-Healing vs. Committed Bit-Rot Detection**: When a process receives `SIGKILL -9` or loses power mid-append, the active `.wal` segment may end with a zeroed `recordLen`, truncated record framing, or unflushed trailing CRC32. `MmapSegment.openForRecovery` distinguishes uncommitted torn tail records (`index > hardState.commitIndex` with no valid subsequent record) — truncating and `msync`ing the active segment cleanly — from bit-rot of complete records or corruption at `index <= hardState.commitIndex`, which fails fast with `CorruptedEntryException`.
+3. **Reference-Counted `SegmentLease[F]` Over FFM `Arena`s**: Concurrent `readEntry`, `readRange`, and zero-allocation `termAt` (`MmapSegment.readTerm`) pin segments lock-free via `SegmentLease[F].withReader`. When `truncateFrom`, `discardBefore`, `clearLog`, or `close` retires a segment, `arena.close()` and `.wal` deletion wait until the last in-flight reader releases its pin — eliminating FFM `IllegalStateException` races.
+4. **Immutable 64-Bit Paged `WalIndexState` + Self-Healing `"WIDX"` Checkpoints**: Maps arbitrary 64-bit `LogIndex` values (`> Int.MaxValue`) via a persistent 2-level radix index (`4,096`-entry super-pages of `64`-entry chunks) with zero `synchronized` blocks. Torn `index.ckpt` files are discarded and rebuilt from `.wal` segments.
+5. **Streaming `"RSNP"` v2 Checksummed Snapshots & Directory `fsync`**: `.bin` snapshots stream directly from `fs2.Stream[F, Byte]` to `FileChannel` with both a header CRC32 and a trailing payload CRC32 verified lazily on `readRange`, calling `force(true)` on both the `.tmp` file and `snapshots/` directory around `ATOMIC_MOVE`.
+6. **20-Digit Numeric Snapshot Ordering**: Snapshots are written as `snapshot-%020d.bin` (safe up to `Long.MaxValue`) and selected via numeric `parseSnapshotIndex`, remaining backward-compatible with legacy 6-digit v1 files.
 
 ---
 
