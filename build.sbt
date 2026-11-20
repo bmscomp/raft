@@ -38,6 +38,7 @@ lazy val strictMainSettings = Seq(
 )
 
 lazy val publishSettings = Seq(
+  crossPaths := false,
   publishMavenStyle := true,
   publishTo := Some(
     "GitHub Packages" at "https://maven.pkg.github.com/bmscomp/raft"

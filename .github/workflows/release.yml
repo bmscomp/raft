@@ -56,9 +56,9 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ steps.prerelease.outputs.IS_PRERELEASE }}
           files: |
-            modules/core/target/scala-3.3.9/raft-core_*.jar
-            modules/runtime/target/scala-3.3.9/raft-runtime_*.jar
-            modules/storage-mmap/target/scala-3.3.9/raft-storage-mmap_*.jar
-            modules/transport-grpc/target/scala-3.3.9/raft-transport-grpc_*.jar
+            modules/core/target/raft-core-${{ steps.version.outputs.VERSION }}*.jar
+            modules/runtime/target/raft-runtime-${{ steps.version.outputs.VERSION }}*.jar
+            modules/storage-mmap/target/raft-storage-mmap-${{ steps.version.outputs.VERSION }}*.jar
+            modules/transport-grpc/target/raft-transport-grpc-${{ steps.version.outputs.VERSION }}*.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -83,13 +83,13 @@ flowchart TD
 
 ```scala
 // Pure Sans-I/O consensus engine (zero transitive third-party dependencies!)
-libraryDependencies += "com.github.bmscomp" %% "raft-core" % "<version>"
+libraryDependencies += "com.github.bmscomp" % "raft-core" % "<version>"
 
 // Optional Cats Effect + FS2 runtime, FFM WAL, and gRPC Netty transport
 libraryDependencies ++= Seq(
-  "com.github.bmscomp" %% "raft-runtime"        % "<version>",
-  "com.github.bmscomp" %% "raft-storage-mmap"   % "<version>",
-  "com.github.bmscomp" %% "raft-transport-grpc" % "<version>"
+  "com.github.bmscomp" % "raft-runtime"        % "<version>",
+  "com.github.bmscomp" % "raft-storage-mmap"   % "<version>",
+  "com.github.bmscomp" % "raft-transport-grpc" % "<version>"
 )
 ```
 
