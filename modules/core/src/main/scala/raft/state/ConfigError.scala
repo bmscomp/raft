@@ -14,6 +14,7 @@ enum ConfigError:
   case InvalidPositiveInt(field: String, actual: Int)
   case InvalidDuration(field: String, detail: String)
   case InvalidIntervalOrdering(field: String, detail: String)
+  case InvalidField(field: String, detail: String)
 
   def message: String = this match
     case EmptyNodeId =>
@@ -36,6 +37,8 @@ enum ConfigError:
       s"$field is invalid: $detail"
     case InvalidIntervalOrdering(field, detail) =>
       s"$field ordering is invalid: $detail"
+    case InvalidField(field, detail) =>
+      s"$field is invalid: $detail"
 
 /** Zero-dependency error-accumulating applicative functor (`ValidatedNel`-like)
   * for validating composite configurations without throwing exceptions on the
@@ -91,3 +94,8 @@ object Validated:
       vb: Validated[E, B]
   )(fn: (A, B) => C): Validated[E, C] =
     va.zip(vb).map { case (a, b) => fn(a, b) }
+
+  def sequence_[E](checks: Seq[Validated[E, Unit]]): Validated[E, Unit] =
+    checks.foldLeft(valid(()): Validated[E, Unit]) { (acc, c) =>
+      acc.zip(c).map(_ => ())
+    }

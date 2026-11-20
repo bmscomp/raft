@@ -1,10 +1,11 @@
 package raft.transport.grpc
 
+import scala.annotation.tailrec
 import scala.util.control.NonFatal
 
 import com.google.protobuf.ByteString
 import raft.message.{CodecError, RaftMessage, SimpleMessageCodec}
-import raft.state.{Log, LogType, NodeId}
+import raft.state.{Bytes, Log, LogType, NodeId}
 import raft.transport.grpc.proto as pb
 
 /** Native binary Protobuf [[SimpleMessageCodec]] for all [[RaftMessage]]
@@ -75,7 +76,7 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
             lastIncludedIndex = m.lastIncludedIndex,
             lastIncludedTerm = m.lastIncludedTerm,
             offset = m.offset,
-            data = ByteString.copyFrom(m.data),
+            data = ByteString.copyFrom(m.payload.asReadOnlyByteBuffer),
             done = m.done
           )
         )
@@ -244,13 +245,13 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
 
       case pb.RaftWirePayload.Message.InstallSnapshotReq(m) =>
         Right(
-          RaftMessage.InstallSnapshotRequest(
+          new RaftMessage.InstallSnapshotRequest(
             term = m.term,
             leaderId = NodeId(m.leaderId),
             lastIncludedIndex = m.lastIncludedIndex,
             lastIncludedTerm = m.lastIncludedTerm,
             offset = m.offset,
-            data = m.data.toByteArray,
+            payload = Bytes.unsafeWrap(m.data.toByteArray),
             done = m.done
           )
         )
@@ -354,36 +355,36 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
     pb.LogEntry(
       index = entry.index,
       term = entry.term,
-      data = ByteString.copyFrom(entry.data),
+      data = ByteString.copyFrom(entry.payload.asReadOnlyByteBuffer),
       entryType = pbType
     )
 
   private def decodeEntries(
       entries: Seq[pb.LogEntry]
   ): Either[CodecError, Vector[Log]] =
-    val builder = Vector.newBuilder[Log]
-    val iter = entries.iterator
-    var err: Option[CodecError] = None
-    while iter.hasNext && err.isEmpty do
-      val e = iter.next()
-      e.entryType match
-        case pb.EntryType.COMMAND =>
-          builder += Log(e.index, e.term, LogType.Command, e.data.toByteArray)
-        case pb.EntryType.NO_OP =>
-          builder += Log(e.index, e.term, LogType.NoOp, e.data.toByteArray)
-        case pb.EntryType.CONFIG_CHANGE =>
-          builder += Log(
-            e.index,
-            e.term,
-            LogType.Configuration,
-            e.data.toByteArray
-          )
-        case other =>
-          err = Some(
-            CodecError.InvalidField(
-              "LogEntry.entryType",
-              "COMMAND|NO_OP|CONFIG_CHANGE",
-              other.toString
+    val vec = entries.toVector
+    @tailrec
+    def loop(idx: Int, acc: Vector[Log]): Either[CodecError, Vector[Log]] =
+      if idx >= vec.length then Right(acc)
+      else
+        val e = vec(idx)
+        val payload = Bytes.unsafeWrap(e.data.toByteArray)
+        e.entryType match
+          case pb.EntryType.COMMAND =>
+            loop(idx + 1, acc :+ Log(e.index, e.term, LogType.Command, payload))
+          case pb.EntryType.NO_OP =>
+            loop(idx + 1, acc :+ Log(e.index, e.term, LogType.NoOp, payload))
+          case pb.EntryType.CONFIG_CHANGE =>
+            loop(
+              idx + 1,
+              acc :+ Log(e.index, e.term, LogType.Configuration, payload)
             )
-          )
-    err.toLeft(builder.result())
+          case other =>
+            Left(
+              CodecError.InvalidField(
+                "LogEntry.entryType",
+                "COMMAND|NO_OP|CONFIG_CHANGE",
+                other.toString
+              )
+            )
+    loop(0, Vector.empty)
