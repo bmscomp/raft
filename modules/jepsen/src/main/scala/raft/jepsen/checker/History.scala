@@ -102,8 +102,13 @@ case class History(operations: Vector[Operation]):
     */
   def prepareForChecking: History =
     val completedIndices = allCompletions.map(_.index).toSet
-    val infoIndices = operations
-      .filter(_.opType == OpType.Info)
+    val infoOps = operations.filter(_.opType == OpType.Info)
+    val infoIndices = infoOps.map(_.index).toSet
+    // Deterministic pre-append follower rejections ("not-leader") never entered
+    // any Raft log and carry zero side effects; only genuine timeouts / crashes
+    // remain open-ended WGL indeterminate mutations.
+    val notLeaderIndices = infoOps
+      .filter(_.outputValue.contains("not-leader"))
       .map(_.index)
       .toSet
     History(operations.filter { op =>
@@ -111,6 +116,7 @@ case class History(operations: Vector[Operation]):
         case OpType.Info   => false
         case OpType.Invoke =>
           completedIndices.contains(op.index) &&
+          !notLeaderIndices.contains(op.index) &&
           (!infoIndices.contains(op.index) || op.function != OpFunction.Read)
         case OpType.Ok | OpType.Fail => true
     })

@@ -96,7 +96,8 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
       leaseReadEnabled: Boolean = true,
       dropProb: Double = 0.08,
       dupProb: Double = 0.03,
-      maxDelaySteps: Int = 5
+      maxDelaySteps: Int = 5,
+      splitPersistCrashProb: Double = 0.0
   ):
     private val rng = new java.util.Random(seed)
     private val initialCluster =
@@ -131,6 +132,7 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
     var snapshotsInstalled: Int = 0
     var compactionsTriggered: Int = 0
     var transfersInitiated: Int = 0
+    var splitPersistCrashes: Int = 0
 
     // Safety-invariant history trackers
     val leadersByTerm: scala.collection.mutable.Map[Long, NodeId] =
@@ -186,23 +188,35 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
       if !crashed.contains(id) then
         val raw = nodes(id)
         val store = storages(id)
-        while raw.hasReady do
+        while !crashed.contains(id) && raw.hasReady do
           val rd = raw.ready()
-          rd.snapshot.foreach { snapMeta =>
-            applyInstalledSnapshotToStateMachine(id, snapMeta)
-          }
           rd.messages.foreach(m => enqueueMessage(m, chaosEnabled))
-          store.persistReady(rd)
-          rd.persistedMessages.foreach(m => enqueueMessage(m, chaosEnabled))
-          recordApplied(id, rd.committedEntries)
-          verifyReadStates(id, rd.readStates)
+          // Split-persist fault injection (E2E2 / C1): crash AFTER pre-persist
+          // messages hit the wire and BEFORE HardState/entries are persisted!
+          val triggerSplitCrash =
+            chaosEnabled &&
+              splitPersistCrashProb > 0.0 &&
+              crashed.isEmpty &&
+              (rd.hardState.isDefined || rd.entries.nonEmpty) &&
+              rng.nextDouble() < splitPersistCrashProb
+          if triggerSplitCrash then
+            splitPersistCrashes += 1
+            crashNode(id)
+          else
+            rd.snapshot.foreach { snapMeta =>
+              applyInstalledSnapshotToStateMachine(id, snapMeta)
+            }
+            store.persistReady(rd)
+            rd.persistedMessages.foreach(m => enqueueMessage(m, chaosEnabled))
+            recordApplied(id, rd.committedEntries)
+            verifyReadStates(id, rd.readStates)
 
-          val light = raw.advance(rd)
-          light.commitIndex.foreach { ci =>
-            store.setHardState(store.hardState.copy(commitIndex = ci))
-          }
-          recordApplied(id, light.committedEntries)
-          light.messages.foreach(m => enqueueMessage(m, chaosEnabled))
+            val light = raw.advance(rd)
+            light.commitIndex.foreach { ci =>
+              store.setHardState(store.hardState.copy(commitIndex = ci))
+            }
+            recordApplied(id, light.committedEntries)
+            light.messages.foreach(m => enqueueMessage(m, chaosEnabled))
 
     private def applyInstalledSnapshotToStateMachine(
         id: NodeId,
@@ -305,17 +319,7 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
               .entries(fromIdx, persistedCommit + 1L)
               .map(EntryFingerprint.fromLog)
           else Vector.empty
-        val recovered =
-          if snapPrefix.nonEmpty || store.snapshotMetadata.isDefined then
-            snapPrefix ++ walSuffix
-          else
-            val existing = appliedByNode(id)
-            val prevLast = existing.lastOption.map(_.index).getOrElse(0L)
-            if persistedCommit > prevLast then
-              existing ++ store
-                .entries(prevLast + 1L, persistedCommit + 1L)
-                .map(EntryFingerprint.fromLog)
-            else existing
+        val recovered = snapPrefix ++ walSuffix
 
         recovered.foreach(fp => verifyCommittedFingerprint(id, fp))
         appliedByNode.update(id, recovered)
@@ -768,3 +772,111 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
     run1 should not be empty
     run1 shouldBe run2
   }
+
+  "Deterministic Simulation (Split-Persist Pre-Fsync Crash Chaos — C1, E2E2)" should
+    "preserve all 5 safety invariants when nodes crash between rd.messages and store.persistReady(rd)" in {
+      val ids = (1 to 5).map(i => NodeId(s"n$i")).toVector
+      var totalSplitCrashes = 0
+
+      for seed <- 301L to 306L do
+        val sim = new SimulatedNetwork(
+          nodeIds = ids,
+          seed = seed,
+          splitPersistCrashProb = 0.08
+        )
+        for _ <- 1 to 260 do
+          sim.stepSimulation(
+            chaosEnabled = true,
+            proposeEnabled = true,
+            compactEnabled = true,
+            readEnabled = true,
+            transferEnabled = true
+          )
+
+        sim.healNetwork()
+        for _ <- 1 to 60 do
+          sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+        for _ <- 1 to 40 do
+          sim.stepSimulation(chaosEnabled = false, proposeEnabled = false)
+
+        val leaders = ids.filter(id => sim.nodes(id).state.isInstanceOf[Leader])
+        leaders should have size 1
+        val refApplied = sim.appliedByNode(leaders.head)
+        refApplied should not be empty
+        ids.foreach(id => sim.appliedByNode(id) shouldBe refApplied)
+        totalSplitCrashes += sim.splitPersistCrashes
+
+      totalSplitCrashes should be > 0
+    }
+
+  "Deterministic Simulation (Aborted Uncommitted Joint-Consensus Truncation Rollback — C2, E2E2)" should
+    "roll back uncommitted C_old,new on a partitioned leader when overwritten by majority Command entries" in {
+      val allIds = (1 to 5).map(i => NodeId(s"n$i")).toVector
+      val initialThree = Set(NodeId("n1"), NodeId("n2"), NodeId("n3"))
+      val fiveMembers = allIds.map(_ -> NodeRole.Voter).toMap
+
+      val sim = new SimulatedNetwork(
+        nodeIds = allIds,
+        seed = 404L,
+        initialVotersOpt = Some(initialThree),
+        leaseReadEnabled = false
+      )
+
+      // 1. Elect initial leader L1 in {n1, n2, n3} and commit baseline entry so §4.1 barrier passes
+      var oldLeaderOpt: Option[NodeId] = None
+      var g0 = 0
+      while oldLeaderOpt.isEmpty && g0 < 60 do
+        sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+        oldLeaderOpt = sim.activeLeaders.find { id =>
+          sim.nodes(id).state.commitIndex > 0L
+        }
+        g0 += 1
+
+      val isolatedLeader = oldLeaderOpt.get
+
+      // 2. Isolate isolatedLeader from all other nodes!
+      for peer <- allIds if peer != isolatedLeader do
+        sim.blockedLinks += ((isolatedLeader, peer))
+        sim.blockedLinks += ((peer, isolatedLeader))
+
+      // 3. Propose 3 -> 5 Joint Consensus on isolatedLeader: appends uncommitted C_old,new locally!
+      sim
+        .nodes(isolatedLeader)
+        .proposeConfChange(fiveMembers)
+        .isRight shouldBe true
+      sim.drainNode(isolatedLeader, chaosEnabled = false)
+      sim.nodes(isolatedLeader).clusterConfig.isInJointConsensus shouldBe true
+
+      // 4. Advance simulation so surviving majority in {n1, n2, n3} - isolatedLeader elects L2 and commits Command entries overwriting isolatedLeader's C_old,new index!
+      for _ <- 1 to 55 do
+        sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+
+      val majorityLeaders = (initialThree - isolatedLeader).filter(id =>
+        sim.nodes(id).state.isInstanceOf[Leader]
+      )
+      majorityLeaders should have size 1
+
+      // 5. Heal partition -> isolatedLeader truncates uncommitted C_old,new and MUST roll back clusterConfig to initialThree!
+      sim.healNetwork()
+      for _ <- 1 to 35 do
+        sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+
+      sim.nodes(isolatedLeader).clusterConfig.isInJointConsensus shouldBe false
+      sim.nodes(isolatedLeader).clusterConfig.voters shouldBe initialThree
+
+      // 6. Now propose real 3 -> 5 Joint Consensus on majority leader and verify full 5-node convergence!
+      val activeLdr = sim.activeLeaders.head
+      sim.nodes(activeLdr).proposeConfChange(fiveMembers).isRight shouldBe true
+      sim.drainNode(activeLdr, chaosEnabled = false)
+      for _ <- 1 to 60 do
+        sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+      for _ <- 1 to 30 do
+        sim.stepSimulation(chaosEnabled = false, proposeEnabled = false)
+
+      allIds.foreach { id =>
+        sim.nodes(id).clusterConfig.isInJointConsensus shouldBe false
+        sim.nodes(id).clusterConfig.voters shouldBe allIds.toSet
+      }
+      val refLog = sim.appliedByNode(sim.activeLeaders.head)
+      allIds.foreach(id => sim.appliedByNode(id) shouldBe refLog)
+    }

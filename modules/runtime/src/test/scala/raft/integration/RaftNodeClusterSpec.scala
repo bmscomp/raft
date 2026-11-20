@@ -237,7 +237,17 @@ class RaftNodeClusterSpec extends AnyFlatSpec with Matchers:
           (newLeaderId, newLeader) = newLeaderPair
           _ = newLeaderId should not be oldLeaderId
           _ <- (1 to 10).toList.traverse_ { i =>
-            newLeader.proposeAndCommit(utf8(s"maj-$i=val-$i"))
+            newLeader
+              .proposeAndCommit(utf8(s"maj-$i=val-$i"))
+              .recoverWith { case _: RaftError =>
+                cluster
+                  .awaitLeaderExcluding(
+                    excluded = oldLeaderId,
+                    subset = majorityIds,
+                    minTerm = oldTerm + 1L
+                  )
+                  .flatMap(_._2.proposeAndCommit(utf8(s"maj-$i=val-$i")))
+              }
           }
 
           // Isolated old leader must step down out of Leader via CheckQuorumTimeout

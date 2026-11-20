@@ -124,6 +124,23 @@ Unlike black-box tests that only inspect final cluster state, a white-box DST ha
 4. **Leader Completeness**: Whenever any entry $(i, \text{term}, \text{payload})$ becomes committed on *any* node, record it in `committedHistory`; assert every subsequent `Leader` with `currentTerm > entry.term` possesses that exact entry in its WAL or installed snapshot.
 5. **State Machine Safety**: Record every `Log` applied via `Ready.committedEntries`, `LightReady.committedEntries`, or `Ready.snapshot`; assert no two nodes ever apply differing `(index, term, data)` tuples.
 
+### Split-Persist Pre-`fsync` Crash & Aborted Joint-Consensus Chaos
+
+Two subtle consensus failure modes require targeted deterministic fault injection in `DeterministicSimulationSpec`:
+
+```mermaid
+flowchart LR
+    R["raw.ready()"] --> M1["1. Enqueue rd.messages (Pre-Persist)"]
+    M1 --> C{"Split-Persist Crash?"}
+    C -->|"Crash Injected"| K["crashNode(id) BEFORE store.persistReady(rd)"]
+    K --> B["Reboot from Durable HardState + Snapshot + WAL Only"]
+    C -->|"Normal Path"| P["2. store.persistReady(rd) (Atomic fsync)"]
+    P --> M2["3. Enqueue rd.persistedMessages (Post-Persist)"]
+```
+
+- **Split-Persist Crash Injection (`splitPersistCrashProb`)**: Crashes a node *after* `rd.messages` enter the simulated network and *before* `store.persistReady(rd)` executes, then reboots from durable `MemStorage`. Because `ConsensusKernel` routes higher-term `RequestVoteResponse`, `AppendEntriesResponse`, and `InstallSnapshotResponse` exclusively to `rd.persistedMessages`, pre-`fsync` crashes never cause double-voting or lost quorum acknowledgments.
+- **Aborted Uncommitted Joint-Consensus Rollback**: Isolates a leader immediately after appending an uncommitted `C_old,new` entry, elects a new majority leader to overwrite that log index with `Command` entries, heals the partition, and verifies `ConsensusKernel` rolls back `clusterConfig` to `C_old` so subsequent membership migrations complete cleanly.
+
 ---
 
 ## Running DST Locally and in CI

@@ -121,22 +121,46 @@ Alongside WGL linearizability, `FullStackGrpcMmapClusterSpec` exercises:
 
 ---
 
-## The Five-Layer Verification Pyramid
+## Multi-JVM `SIGKILL (-9)` & Full-Stack `ReadIndex` Verification
+
+In `modules/jepsen` (`SimulatedCluster`) and `modules/itest` (`MultiJvmCrashRecoveryE2ESpec`), client writes use typed `RaftNode.proposeAndApply` (zero polling) while linearizable reads exercise **`RaftNode.leaseRead` falling back to quorum `RaftNode.readIndex`** directly against `StateMachine.get`, proving stale-leader fencing under arbitrary partitions.
+
+To test OS-level crash boundaries that in-process fiber cancellation cannot reach, `MultiJvmCrashRecoveryE2ESpec` spawns **3 independent OS child JVMs** via `java.lang.ProcessBuilder` over **mTLS Netty HTTP/2** (`tlsClientAuth = true`, `verifyPeerIdentity = true`) and on-disk FFM `MmapWalEngine` segments, then kills the active leader JVM mid-load with `Process.destroyForcibly()` (`SIGKILL -9`):
+
+```mermaid
+sequenceDiagram
+    participant Test as "Parent Test Coordinator (WGL Recorder)"
+    participant P1 as "Child JVM n1 (Leader, mTLS + MmapWalEngine)"
+    participant P2 as "Child JVM n2 (Follower)"
+    participant P3 as "Child JVM n3 (Follower)"
+
+    Test->>P1: "Concurrent PUT / CAS / GET (leaseRead -> readIndex)"
+    Note over Test,P1: "Abrupt OS kill: process.destroyForcibly() (SIGKILL -9)"
+    P2->>P3: "PreVote + RequestVote over mTLS"
+    Note over P2,P3: "Failover leader elected while WGL clients stay active"
+    Test->>P1: "Respawn fresh JVM on unclosed MmapWalEngine directory"
+    Note over P1: "Torn-tail self-healing + RSNP v2 snapshot & WAL catch-up"
+    Test->>Test: "Verify 3-JVM state convergence + WGL KVModel linearizability"
+```
+
+## The Six-Layer Verification Pyramid
 
 Every layer in this repository reinforces the others without duplicating slow I/O unnecessarily:
 
 ```mermaid
 flowchart TD
-    L1["1. Pure Unit & ScalaCheck Property Specs (raft-core: zero I/O, milliseconds)"]
-    L2["2. Seeded Deterministic Simulation Testing (DeterministicSimulationSpec: drops, partitions, 3->5->3 Joint Consensus, snapshots)"]
-    L3["3. Runtime Cluster & Virtual-Time Suites (raft-runtime: TestControl, CheckQuorum, ReadIndex, LeaseRead, Multi-Raft)"]
-    L4["4. Full-Stack Cross-Module E2E Suite (raft-itest: Netty HTTP/2 gRPC + FFM MmapWalEngine crash recovery + WGL KVModel)"]
-    L5["5. Jepsen Nemesis Smoke & Stress Suites (raft-jepsen: PartitionableTransport + Nemesis + LinearizabilityChecker)"]
+    L1["1. Pure Unit & Algebraic Property Specs (raft-core: zero I/O, milliseconds)"]
+    L2["2. Seeded Deterministic Simulation Testing (Split-persist crashes, aborted Joint Consensus, 5 safety invariants)"]
+    L3["3. Stateful FFM WAL Model-Checking (MmapWalEngineStatefulPropertySpec: rotations, torn tails, cold restarts)"]
+    L4["4. Runtime Cluster & Virtual-Time Suites (TestControl, CheckQuorum, LeaseRead, Multi-Raft)"]
+    L5["5. Multi-JVM SIGKILL -9 & mTLS Full-Stack E2E (ProcessBuilder + GrpcTransport + MmapWalEngine + WGL KVModel)"]
+    L6["6. Jepsen Nemesis Smoke & Stress Suites (PartitionableTransport + LeaseRead/ReadIndex + LinearizabilityChecker)"]
 
     L1 --> L2
     L2 --> L3
     L3 --> L4
     L4 --> L5
+    L5 --> L6
 ```
 
 | Verification Layer | Command | Typical Runtime | Primary Faults Caught |

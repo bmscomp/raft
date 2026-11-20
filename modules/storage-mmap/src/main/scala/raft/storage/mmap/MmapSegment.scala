@@ -163,6 +163,21 @@ class MmapSegment private (
     mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, 16L, entryCount)
     force()
 
+  /** Count physical records stored strictly before `targetOffset`
+    * (`[HeaderSize, targetOffset)`), unaffected by logical
+    * `WalIndexState.discardBefore` pruning.
+    */
+  def countEntriesBeforeOffset(targetOffset: Long): Long =
+    val limit = math.min(targetOffset, writeOffset)
+    @tailrec
+    def loop(pos: Long, acc: Long): Long =
+      if pos >= limit || pos + 4L > limit then acc
+      else
+        val recLen = mapped.get(ValueLayout.JAVA_INT_UNALIGNED, pos)
+        if recLen < EntryOverhead || pos + recLen.toLong > limit then acc
+        else loop(pos + recLen.toLong, acc + 1L)
+    loop(HeaderSize.toLong, 0L)
+
   /** Current write position in the segment file. */
   def currentWriteOffset: Long = writeOffset
 
