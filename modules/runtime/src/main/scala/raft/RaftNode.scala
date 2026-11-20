@@ -2523,7 +2523,12 @@ private final class RaftNodeImpl[F[_]: Async, R](
         case f: Follower => RaftError.NotLeader(f.leaderId)
         case _           => RaftError.NotLeader(None)
       _ <- drainProposalQueue(err)
-      _ <- failPendingLeaderRequests(err)
+      _ <- failPendingLeaderRequests(
+        proposalErr = RaftError.ProposalDropped(
+          "Leader stepped down while proposal was in-flight"
+        ),
+        readErr = err
+      )
       _ <- metrics.onStepDown(config.localId, st.term)
     yield ()
 
@@ -2544,19 +2549,24 @@ private final class RaftNodeImpl[F[_]: Async, R](
       _ <- droppedJoints.traverse_(d => d.complete(Left(err)).void)
     yield ()
 
-  private def failPendingLeaderRequests(err: RaftError): F[Unit] =
+  private def failPendingLeaderRequests(
+      proposalErr: RaftError,
+      readErr: RaftError
+  ): F[Unit] =
     for
       props <- pendingProposalsRef.getAndSet(Map.empty)
       joints <- jointWaiterRef.getAndSet(Map.empty)
       reads <- pendingReadsRef.getAndSet(Map.empty)
-      _ <- props.values.toList.traverse_ { case (_, w) => w.fail(err) }
-      _ <- joints.values.toList.traverse_(d => d.complete(Left(err)).void)
-      _ <- reads.values.toList.traverse_(d => d.complete(Left(err)).void)
+      _ <- props.values.toList.traverse_ { case (_, w) => w.fail(proposalErr) }
+      _ <- joints.values.toList.traverse_(d =>
+        d.complete(Left(proposalErr)).void
+      )
+      _ <- reads.values.toList.traverse_(d => d.complete(Left(readErr)).void)
     yield ()
 
   private def failAllPending(err: RaftError): F[Unit] =
     for
-      _ <- failPendingLeaderRequests(err)
+      _ <- failPendingLeaderRequests(err, err)
       applyWaiters <- readApplyWaitersRef.getAndSet(Vector.empty)
       _ <- applyWaiters.traverse_ { case (_, d) => d.complete(Left(err)).void }
     yield ()
