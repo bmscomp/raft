@@ -93,6 +93,7 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
       val nodeIds: Vector[NodeId],
       val seed: Long,
       initialVotersOpt: Option[Set[NodeId]] = None,
+      initialMembersOpt: Option[Map[NodeId, NodeRole]] = None,
       leaseReadEnabled: Boolean = true,
       dropProb: Double = 0.08,
       dupProb: Double = 0.03,
@@ -100,8 +101,13 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
       splitPersistCrashProb: Double = 0.0
   ):
     private val rng = new java.util.Random(seed)
-    private val initialCluster =
-      ClusterConfig(initialVotersOpt.getOrElse(nodeIds.toSet))
+    private val initialCluster = initialMembersOpt match
+      case Some(m) => ClusterConfig(m)
+      case None    => ClusterConfig(initialVotersOpt.getOrElse(nodeIds.toSet))
+
+    private def isWitnessNode(id: NodeId): Boolean =
+      nodes.get(id).exists(_.clusterConfig.isWitness(id)) ||
+        initialCluster.isWitness(id)
 
     val storages: Map[NodeId, MemStorage] =
       nodeIds.map(id => id -> MemStorage.create(initialCluster)).toMap
@@ -236,15 +242,27 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
         id: NodeId,
         fp: EntryFingerprint
     ): Unit =
-      committedHistory.get(fp.index) match
-        case Some(prev) =>
+      if isWitnessNode(id) then
+        if fp.logType == LogType.Command then fp.payload shouldBe empty
+        committedHistory.get(fp.index).foreach { prev =>
           withClue(
-            s"[Seed $seed step $stepNum] State Machine Safety violated at index ${fp.index} on ${id.value}: "
+            s"[Seed $seed step $stepNum] Witness State Machine Safety violated at index ${fp.index} on ${id.value}: "
           ) {
-            fp shouldBe prev
+            fp.index shouldBe prev.index
+            fp.term shouldBe prev.term
+            fp.logType shouldBe prev.logType
           }
-        case None =>
-          committedHistory.update(fp.index, fp)
+        }
+      else
+        committedHistory.get(fp.index) match
+          case Some(prev) =>
+            withClue(
+              s"[Seed $seed step $stepNum] State Machine Safety violated at index ${fp.index} on ${id.value}: "
+            ) {
+              fp shouldBe prev
+            }
+          case None =>
+            committedHistory.update(fp.index, fp)
 
     private def recordApplied(id: NodeId, entries: Vector[Log]): Unit =
       if entries.nonEmpty then
@@ -523,8 +541,11 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
         i <- nodeIds.indices
         j <- (i + 1) until nodeIds.size
       do
-        val sA = storages(nodeIds(i))
-        val sB = storages(nodeIds(j))
+        val idA = nodeIds(i)
+        val idB = nodeIds(j)
+        val eitherWitness = isWitnessNode(idA) || isWitnessNode(idB)
+        val sA = storages(idA)
+        val sB = storages(idB)
         val low = math.max(sA.firstIndex, sB.firstIndex)
         val high = math.min(sA.lastIndex, sB.lastIndex)
         if low <= high then
@@ -540,7 +561,8 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
                 eA.index shouldBe eB.index
                 eA.term shouldBe eB.term
                 eA.logType shouldBe eB.logType
-                Arrays.equals(eA.data, eB.data) shouldBe true
+                if !eitherWitness || eA.logType != LogType.Command then
+                  Arrays.equals(eA.data, eB.data) shouldBe true
               }
               matchedPrefixChecked = true
             idx -= 1L
@@ -550,15 +572,22 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
         i <- nodeIds.indices
         j <- (i + 1) until nodeIds.size
       do
-        val appA = appliedByNode(nodeIds(i))
-        val appB = appliedByNode(nodeIds(j))
+        val idA = nodeIds(i)
+        val idB = nodeIds(j)
+        val eitherWitness = isWitnessNode(idA) || isWitnessNode(idB)
+        val appA = appliedByNode(idA)
+        val appB = appliedByNode(idB)
         val commonLen = math.min(appA.length, appB.length)
         var k = 0
         while k < commonLen do
           withClue(
-            s"[Seed $seed step $stepNum] State Machine Safety divergence between ${nodeIds(i).value} and ${nodeIds(j).value} at pos $k:"
+            s"[Seed $seed step $stepNum] State Machine Safety divergence between ${idA.value} and ${idB.value} at pos $k:"
           ) {
-            appA(k) shouldBe appB(k)
+            if eitherWitness && appA(k).logType == LogType.Command then
+              appA(k).index shouldBe appB(k).index
+              appA(k).term shouldBe appB(k).term
+              appA(k).logType shouldBe appB(k).logType
+            else appA(k) shouldBe appB(k)
           }
           k += 1
 
@@ -879,4 +908,97 @@ class DeterministicSimulationSpec extends AnyFlatSpec with Matchers:
       }
       val refLog = sim.appliedByNode(sim.activeLeaders.head)
       allIds.foreach(id => sim.appliedByNode(id) shouldBe refLog)
+    }
+
+  "Deterministic Simulation (Mixed-Role Voter + Witness + Learner with Promotion)" should
+    "never elect Witness or Learner, strip Witness command payloads, sustain quorum when a Voter crashes, and converge after Learner promotion" in {
+      val v1 = NodeId("v1")
+      val v2 = NodeId("v2")
+      val w1 = NodeId("w1")
+      val l1 = NodeId("l1")
+      val allIds = Vector(v1, v2, w1, l1)
+      val initialMembers = Map(
+        v1 -> NodeRole.Voter,
+        v2 -> NodeRole.Voter,
+        w1 -> NodeRole.Witness,
+        l1 -> NodeRole.Learner
+      )
+      val promotedMembers = Map(
+        v1 -> NodeRole.Voter,
+        v2 -> NodeRole.Voter,
+        w1 -> NodeRole.Witness,
+        l1 -> NodeRole.Voter
+      )
+
+      for seed <- 501L to 504L do
+        val sim = new SimulatedNetwork(
+          nodeIds = allIds,
+          seed = seed,
+          initialMembersOpt = Some(initialMembers),
+          leaseReadEnabled = false
+        )
+
+        for _ <- 1 to 140 do
+          sim.stepSimulation(
+            chaosEnabled = true,
+            proposeEnabled = true,
+            readEnabled = true
+          )
+          sim.leadersByTerm.values should not contain w1
+          sim.leadersByTerm.values should not contain l1
+
+        sim.healNetwork()
+        for _ <- 1 to 35 do
+          sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+        val preCrashLeader = sim.activeLeaders.head
+        val otherVoter = if preCrashLeader == v1 then v2 else v1
+        val commitBeforeCrash = sim.nodes(preCrashLeader).commitIndex
+        sim.crashNode(otherVoter)
+        for _ <- 1 to 35 do
+          sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+        sim.nodes(preCrashLeader).commitIndex should be > commitBeforeCrash
+
+        sim.healNetwork()
+        var promoted = false
+        var guard = 0
+        while !promoted && guard < 60 do
+          sim.stepSimulation(chaosEnabled = false, proposeEnabled = true)
+          sim.activeLeaders.headOption.foreach { ldrId =>
+            if sim.nodes(ldrId).proposeConfChange(promotedMembers).isRight then
+              sim.drainNode(ldrId, chaosEnabled = false)
+              promoted = true
+          }
+          guard += 1
+        promoted shouldBe true
+
+        for _ <- 1 to 60 do
+          sim.stepSimulation(
+            chaosEnabled = false,
+            proposeEnabled = true,
+            readEnabled = true
+          )
+        for _ <- 1 to 35 do
+          sim.stepSimulation(chaosEnabled = false, proposeEnabled = false)
+
+        val finalLeaders =
+          allIds.filter(id => sim.nodes(id).state.isInstanceOf[Leader])
+        finalLeaders should have size 1
+        finalLeaders.head should not be w1
+
+        val refLog = sim.appliedByNode(finalLeaders.head)
+        refLog should not be empty
+        Vector(v1, v2, l1).foreach { id =>
+          sim.nodes(id).clusterConfig.isInJointConsensus shouldBe false
+          sim.nodes(id).clusterConfig.isVoter(id) shouldBe true
+          sim.appliedByNode(id) shouldBe refLog
+        }
+
+        val witnessLog = sim.appliedByNode(w1)
+        witnessLog.size shouldBe refLog.size
+        witnessLog.zip(refLog).foreach { case (wFp, rFp) =>
+          wFp.index shouldBe rFp.index
+          wFp.term shouldBe rFp.term
+          wFp.logType shouldBe rFp.logType
+          if wFp.logType == LogType.Command then wFp.payload shouldBe empty
+        }
     }

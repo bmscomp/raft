@@ -200,4 +200,61 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
         hs.write(HardState(term = 1L, votedFor = None, commitIndex = -1L))
       }
     }
+
+    "should read an all-zero existing file as HardState.Empty" in {
+      val tmpDir = Files.createTempDirectory("raft-hs-zero-")
+      val hsPath = tmpDir.resolve("hard_state.bin")
+      Files.write(hsPath, new Array[Byte](280))
+      val hs = MmapHardState.open(hsPath)
+      try hs.read shouldBe HardState.Empty
+      finally
+        hs.close()
+        Files.deleteIfExists(hsPath)
+        Files.deleteIfExists(tmpDir)
+    }
+
+    "should reject CRC-valid files with negative term, out-of-range votedForLen, or negative commitIndex" in {
+      import java.nio.{ByteBuffer, ByteOrder}
+      import java.util.zip.CRC32
+
+      def writeWithValidCrc(
+          path: Path,
+          term: Long,
+          votedForLen: Int,
+          commitIdx: Long
+      ): Unit =
+        val buf = ByteBuffer.allocate(280).order(ByteOrder.nativeOrder())
+        buf.putLong(0, term)
+        buf.putInt(8, votedForLen)
+        buf.putLong(272, commitIdx)
+        val arr = buf.array()
+        val crc = new CRC32()
+        crc.update(arr, 0, 268)
+        crc.update(arr, 272, 8)
+        buf.putInt(268, crc.getValue.toInt)
+        val _ = Files.write(path, arr)
+
+      val cases = List(
+        ("negative term", -5L, 0, 0L, "negative term"),
+        ("negative votedForLen", 1L, -1, 0L, "invalid votedForLen"),
+        ("oversized votedForLen", 1L, 300, 0L, "invalid votedForLen"),
+        ("negative commitIndex", 1L, 0, -9L, "negative commitIndex")
+      )
+
+      cases.foreach { case (_, term, vfLen, cIdx, expectedMsg) =>
+        val tmpDir = Files.createTempDirectory("raft-hs-sem-")
+        val hsPath = tmpDir.resolve("hard_state.bin")
+        writeWithValidCrc(hsPath, term, vfLen, cIdx)
+        val hs = MmapHardState.open(hsPath)
+        try
+          val ex = intercept[raft.state.RaftError.StorageCorruption] {
+            hs.read
+          }
+          ex.reason should include(expectedMsg)
+        finally
+          hs.close()
+          Files.deleteIfExists(hsPath)
+          Files.deleteIfExists(tmpDir)
+      }
+    }
   }

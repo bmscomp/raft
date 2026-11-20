@@ -239,6 +239,8 @@ class ProtobufMultiGroupCodecSpec
     }
 
     "should reject empty or malformed MultiRaftWireFrame bytes with CodecError" in {
+      import raft.transport.grpc.proto as pb
+
       ProtobufMultiGroupCodec.decode(Array.emptyByteArray).isLeft shouldBe true
       ProtobufMultiGroupCodec.decode(Array[Byte](0x00)).isLeft shouldBe true
       ProtobufMultiGroupCodec.decode(
@@ -246,11 +248,97 @@ class ProtobufMultiGroupCodecSpec
       ) match
         case Left(_: CodecError) => succeed
         case Right(v)            => fail(s"Expected Left, got $v")
+
+      val emptyFrameBytes =
+        pb.MultiRaftWireFrame(pb.MultiRaftWireFrame.Frame.Empty).toByteArray
+      ProtobufMultiGroupCodec.decode(emptyFrameBytes).isLeft shouldBe true
+
+      val missingPayload = pb
+        .MultiRaftWireFrame(
+          pb.MultiRaftWireFrame.Frame.Single(
+            pb.MultiGroupEnvelopeProto(
+              groupId = "g1",
+              fromId = "n1",
+              payload = None
+            )
+          )
+        )
+        .toByteArray
+      ProtobufMultiGroupCodec.decode(missingPayload) match
+        case Left(_: CodecError.InvalidField) => succeed
+        case other => fail(s"Expected InvalidField, got $other")
+
+      ProtobufMultiGroupCodec.encodeBatch(Seq.empty) shouldBe empty
+      ProtobufMultiGroupCodec.isCoalescedHeartbeatFrame(
+        Array.emptyByteArray
+      ) shouldBe false
+      ProtobufMultiGroupCodec.isCoalescedHeartbeatFrame(
+        Array[Byte](0x00, 0x01)
+      ) shouldBe false
+
+      val singleEnv = GroupEnvelope(
+        GroupId("g1"),
+        n1,
+        AppendEntriesRequest(1L, n1, 0L, 0L, Seq.empty, 0L),
+        Some(n2)
+      )
+      val singleBytes = ProtobufMultiGroupCodec.encodeBatch(Seq(singleEnv))
+      ProtobufMultiGroupCodec.isCoalescedHeartbeatFrame(
+        singleBytes
+      ) shouldBe false
+      ProtobufMultiGroupCodec.decode(singleBytes) shouldBe Right(
+        Vector(singleEnv)
+      )
+
+      val forwardedHbs = Vector(
+        GroupEnvelope(
+          GroupId("g1"),
+          n1,
+          AppendEntriesRequest(
+            3L,
+            NodeId("proxy-leader"),
+            10L,
+            2L,
+            Seq.empty,
+            9L
+          ),
+          Some(n2)
+        ),
+        GroupEnvelope(
+          GroupId("g2"),
+          n1,
+          AppendEntriesRequest(3L, n1, 11L, 3L, Seq.empty, 10L),
+          Some(n2)
+        )
+      )
+      val fwdBytes = ProtobufMultiGroupCodec.encodeBatch(forwardedHbs)
+      ProtobufMultiGroupCodec.isCoalescedHeartbeatFrame(fwdBytes) shouldBe true
+      ProtobufMultiGroupCodec.decode(fwdBytes) shouldBe Right(forwardedHbs)
+
+      val mixedRoute = Vector(
+        GroupEnvelope(
+          GroupId("g1"),
+          n1,
+          AppendEntriesRequest(1L, n1, 0L, 0L, Seq.empty, 0L),
+          Some(n2)
+        ),
+        GroupEnvelope(
+          GroupId("g2"),
+          n1,
+          AppendEntriesRequest(1L, n1, 0L, 0L, Seq.empty, 0L),
+          Some(NodeId("node-3"))
+        )
+      )
+      val mixedBytes = ProtobufMultiGroupCodec.encodeBatch(mixedRoute)
+      ProtobufMultiGroupCodec.isCoalescedHeartbeatFrame(
+        mixedBytes
+      ) shouldBe false
+      ProtobufMultiGroupCodec.decode(mixedBytes) shouldBe Right(mixedRoute)
     }
   }
 
   "GrpcTransport.multiGroupResource" - {
-    "should multiplex multiple groups, pipelined batches, and coalesced heartbeats over one live HTTP/2 socket pair" in {
+    "should multiplex multiple groups, pipelined batches, broadcasts, malformed frames, and coalesced heartbeats over one live HTTP/2 socket pair" in {
       val gCfg = GrpcConfig(host = "127.0.0.1", port = 0)
       val coal = CoalescedHeartbeatConfig(
         enabled = true,
@@ -278,7 +366,7 @@ class ProtobufMultiGroupCodecSpec
           grpc1.updatePeers(Map(n2 -> addr2)) *>
             grpc2.updatePeers(Map(n1 -> addr1))
         )
-      yield (mg1, mg2)).use { case (mg1, mg2) =>
+      yield (grpc1, mg1, mg2)).use { case (grpc1, mg1, mg2) =>
         val gA = GroupId("shard-A")
         val gB = GroupId("shard-B")
         for
@@ -287,7 +375,11 @@ class ProtobufMultiGroupCodecSpec
           tp2A <- mg2.registerGroup(gA)
           tp2B <- mg2.registerGroup(gB)
 
-          // Send coalesced heartbeats across both groups + pipelined data batch on shard-A
+          _ <- grpc1.send(
+            n2,
+            "corrupt-multiraft-frame".getBytes(StandardCharsets.UTF_8)
+          )
+
           _ <- tp1A.send(
             n2,
             AppendEntriesRequest(1L, n1, 0L, 0L, Seq.empty, 0L)
@@ -319,16 +411,26 @@ class ProtobufMultiGroupCodecSpec
               )
             )
           )
+          _ <- tp1B.broadcast(
+            RequestVoteRequest(3L, n1, 10L, 2L, isPreVote = true)
+          )
 
           recvA <- tp2A.receive.take(3).compile.toVector.timeout(5.seconds)
-          recvB <- tp2B.receive.take(1).compile.toVector.timeout(5.seconds)
+          recvB <- tp2B.receive.take(2).compile.toVector.timeout(5.seconds)
           stats1 <- mg1.coalescerStats
         yield {
           recvA should have size 3
-          recvB should have size 1
+          recvB should have size 2
           recvB.head._2
             .asInstanceOf[AppendEntriesRequest]
             .prevLogIndex shouldBe 5L
+          recvB(1)._2 shouldBe RequestVoteRequest(
+            3L,
+            n1,
+            10L,
+            2L,
+            isPreVote = true
+          )
           stats1.envelopesCoalesced shouldBe 2L
           stats1.batchesFlushed shouldBe 1L
         }

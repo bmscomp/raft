@@ -41,6 +41,15 @@ class LinearizabilityCheckerSpec extends AnyFlatSpec with Matchers:
   ): Operation =
     Operation(idx, process, OpType.Info, fn, key, None, Some(msg), ts())
 
+  private def failOp(
+      idx: Long,
+      process: Int,
+      fn: OpFunction,
+      key: String,
+      value: Option[Any]
+  ): Operation =
+    Operation(idx, process, OpType.Fail, fn, key, None, value, ts())
+
   "LinearizabilityChecker" should "accept an empty history" in {
     val result = LinearizabilityChecker.check(History.empty, RegisterModel)
     result.linearizable shouldBe true
@@ -355,4 +364,119 @@ class LinearizabilityCheckerSpec extends AnyFlatSpec with Matchers:
     )
     val result = LinearizabilityChecker.check(h, KVModel)
     result.linearizable shouldBe false
+  }
+
+  it should "verify monotonic increments, CAS, and reject stale reads under CounterModel" in {
+    nextTs = 0
+    val validHistory = History(
+      Vector(
+        invoke(1, 0, OpFunction.Read, "c"),
+        ok(1, 0, OpFunction.Read, "c", Some(0L)),
+        invoke(2, 0, OpFunction.Write, "c"),
+        invoke(3, 1, OpFunction.Write, "c"),
+        ok(2, 0, OpFunction.Write, "c", Some(1L)),
+        ok(3, 1, OpFunction.Write, "c", Some(2L)),
+        invoke(4, 0, OpFunction.CAS, "c", Some((2L, 10L))),
+        ok(4, 0, OpFunction.CAS, "c", Some("ok")),
+        invoke(5, 1, OpFunction.Read, "c"),
+        ok(5, 1, OpFunction.Read, "c", Some(10L))
+      )
+    )
+    LinearizabilityChecker
+      .check(validHistory, CounterModel)
+      .linearizable shouldBe true
+
+    nextTs = 0
+    val staleCounter = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "c"),
+        ok(1, 0, OpFunction.Write, "c", Some(1L)),
+        invoke(2, 0, OpFunction.Write, "c"),
+        ok(2, 0, OpFunction.Write, "c", Some(2L)),
+        invoke(3, 1, OpFunction.Read, "c"),
+        ok(3, 1, OpFunction.Read, "c", Some(1L))
+      )
+    )
+    LinearizabilityChecker
+      .check(staleCounter, CounterModel)
+      .linearizable shouldBe false
+  }
+
+  it should "reject non-linearizable crossed reads (R1 observes v2 before R2 starts and observes v1)" in {
+    nextTs = 0
+    val h = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "x", Some("v1")),
+        ok(1, 0, OpFunction.Write, "x", Some("ok")),
+        invoke(2, 0, OpFunction.Write, "x", Some("v2")),
+        invoke(3, 1, OpFunction.Read, "x"),
+        ok(3, 1, OpFunction.Read, "x", Some(Some("v2"))),
+        invoke(4, 2, OpFunction.Read, "x"),
+        ok(4, 2, OpFunction.Read, "x", Some(Some("v1"))),
+        ok(2, 0, OpFunction.Write, "x", Some("ok"))
+      )
+    )
+    val result = LinearizabilityChecker.check(h, KVModel)
+    result.linearizable shouldBe false
+    result.violation shouldBe defined
+  }
+
+  it should "validate OpType.Fail CAS outcomes accurately in both directions" in {
+    nextTs = 0
+    val validFailCas = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "k", Some("a")),
+        ok(1, 0, OpFunction.Write, "k", Some("ok")),
+        invoke(2, 1, OpFunction.CAS, "k", Some(("wrong", "b"))),
+        failOp(2, 1, OpFunction.CAS, "k", Some("failed")),
+        invoke(3, 0, OpFunction.Read, "k"),
+        ok(3, 0, OpFunction.Read, "k", Some(Some("a")))
+      )
+    )
+    LinearizabilityChecker.check(validFailCas, KVModel).linearizable shouldBe
+      true
+
+    nextTs = 0
+    val bogusFailCas = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "k", Some("a")),
+        ok(1, 0, OpFunction.Write, "k", Some("ok")),
+        invoke(2, 1, OpFunction.CAS, "k", Some(("a", "b"))),
+        failOp(2, 1, OpFunction.CAS, "k", Some("failed"))
+      )
+    )
+    LinearizabilityChecker.check(bogusFailCas, KVModel).linearizable shouldBe
+      false
+  }
+
+  it should "handle indeterminate (Info) CAS operations whether they took effect or not" in {
+    nextTs = 0
+    val infoCasTookEffect = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "k", Some("v0")),
+        ok(1, 0, OpFunction.Write, "k", Some("ok")),
+        invoke(2, 1, OpFunction.CAS, "k", Some(("v0", "v1"))),
+        info(2, 1, OpFunction.CAS, "k", "timeout"),
+        invoke(3, 2, OpFunction.Read, "k"),
+        ok(3, 2, OpFunction.Read, "k", Some(Some("v1")))
+      )
+    )
+    LinearizabilityChecker
+      .check(infoCasTookEffect, KVModel)
+      .linearizable shouldBe true
+
+    nextTs = 0
+    val infoCasDropped = History(
+      Vector(
+        invoke(1, 0, OpFunction.Write, "k", Some("v0")),
+        ok(1, 0, OpFunction.Write, "k", Some("ok")),
+        invoke(2, 1, OpFunction.CAS, "k", Some(("v0", "v1"))),
+        info(2, 1, OpFunction.CAS, "k", "timeout"),
+        invoke(3, 2, OpFunction.Read, "k"),
+        ok(3, 2, OpFunction.Read, "k", Some(Some("v0")))
+      )
+    )
+    LinearizabilityChecker
+      .check(infoCasDropped, KVModel)
+      .linearizable shouldBe true
   }

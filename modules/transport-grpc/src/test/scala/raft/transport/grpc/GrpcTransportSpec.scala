@@ -595,3 +595,154 @@ class GrpcTransportSpec extends AnyFlatSpec with Matchers:
       prog.unsafeRunSync()
     finally deleteRec(pkiDir)
   }
+
+  it should "classify transient gRPC status codes, handle createClient/sendBatch edge cases, and enforce RPC guardrails" in {
+    import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+    import io.grpc.stub.StreamObserver
+    import raft.transport.grpc.proto as pb
+    import java.util.concurrent.CountDownLatch
+    import java.util.concurrent.TimeUnit
+
+    GrpcTransport.transientStatusCode(
+      Status.UNAVAILABLE.asRuntimeException()
+    ) shouldBe Some(Status.Code.UNAVAILABLE)
+    GrpcTransport.transientStatusCode(
+      Status.DEADLINE_EXCEEDED.asException()
+    ) shouldBe Some(Status.Code.DEADLINE_EXCEEDED)
+    GrpcTransport.transientStatusCode(
+      Status.RESOURCE_EXHAUSTED.asRuntimeException()
+    ) shouldBe Some(Status.Code.RESOURCE_EXHAUSTED)
+    GrpcTransport.transientStatusCode(
+      Status.PERMISSION_DENIED.asRuntimeException()
+    ) shouldBe None
+    GrpcTransport.transientStatusCode(new RuntimeException("boom")) shouldBe
+      None
+
+    val clientTest = for
+      q <- Queue.unbounded[IO, (NodeId, Array[Byte])]
+      client <- GrpcTransport.createClient[IO](
+        GrpcConfig(host = "127.0.0.1", port = 0, maxRetries = 0),
+        TransportConfig(n1, "127.0.0.1:0", Map(n2 -> "127.0.0.1:1")),
+        q
+      )
+      _ <- client.sendBatch(n2, Seq.empty)
+      _ <- client.sendBatch(
+        NodeId("unknown-peer"),
+        Seq(Array[Byte](1), Array[Byte](2))
+      )
+      _ <- client.shutdown
+      _ <- client.send(n2, Array[Byte](7))
+      _ <- client.sendBatch(n2, Seq(Array[Byte](7), Array[Byte](8)))
+    yield succeed
+
+    val serverGuardrailsTest = GrpcTransport
+      .resource[IO](
+        GrpcConfig(host = "127.0.0.1", port = 0),
+        TransportConfig(n1, "127.0.0.1:0", Map.empty),
+        logger
+      )
+      .use { srv =>
+        srv.localAddress.flatMap { addr =>
+          IO.blocking {
+            val ch = ManagedChannelBuilder
+              .forTarget(addr)
+              .usePlaintext()
+              .build()
+            try
+              val blocking = pb.RaftServiceGrpc.blockingStub(ch)
+
+              val badSenderEx = intercept[StatusRuntimeException] {
+                val _ = blocking.sendEnvelope(
+                  pb.WireEnvelope(senderId = "   ")
+                )
+              }
+              badSenderEx.getStatus.getCode shouldBe Status.Code.INVALID_ARGUMENT
+
+              val aeEx = intercept[StatusRuntimeException] {
+                val _ = blocking.appendEntries(pb.AppendEntriesRequest())
+              }
+              aeEx.getStatus.getCode shouldBe Status.Code.UNIMPLEMENTED
+
+              val rvEx = intercept[StatusRuntimeException] {
+                val _ = blocking.requestVote(pb.RequestVoteRequest())
+              }
+              rvEx.getStatus.getCode shouldBe Status.Code.UNIMPLEMENTED
+
+              val asyncStub = pb.RaftServiceGrpc.stub(ch)
+              val latch = new CountDownLatch(1)
+              var snapErr: Throwable = null
+              val reqObs = asyncStub.installSnapshot(
+                new StreamObserver[pb.InstallSnapshotResponse]:
+                  override def onNext(v: pb.InstallSnapshotResponse): Unit = ()
+                  override def onError(t: Throwable): Unit =
+                    snapErr = t
+                    latch.countDown()
+                  override def onCompleted(): Unit = latch.countDown()
+              )
+              reqObs.onNext(pb.InstallSnapshotChunk())
+              reqObs.onCompleted()
+              latch.await(5, TimeUnit.SECONDS) shouldBe true
+              snapErr shouldBe a[StatusRuntimeException]
+              snapErr
+                .asInstanceOf[StatusRuntimeException]
+                .getStatus
+                .getCode shouldBe Status.Code.UNIMPLEMENTED
+            finally
+              val _ = ch.shutdownNow()
+          }
+        }
+      }
+
+    (clientTest *> serverGuardrailsTest).unsafeRunSync()
+  }
+
+  it should "extract CN, non-loopback DNS SAN, and SPIFFE URI SAN identities from X.509 certificates" in {
+    import java.io.ByteArrayInputStream
+    import java.security.cert.{CertificateFactory, X509Certificate}
+
+    val pkiDir = Files.createTempDirectory("raft-grpc-x509-id-")
+    try
+      val keyPath = pkiDir.resolve("peer.key")
+      val crtPath = pkiDir.resolve("peer.crt")
+      val log = ProcessLogger(_ => (), _ => ())
+      val code = Process(
+        Seq(
+          "openssl",
+          "req",
+          "-x509",
+          "-newkey",
+          "rsa:2048",
+          "-nodes",
+          "-keyout",
+          keyPath.toString,
+          "-out",
+          crtPath.toString,
+          "-days",
+          "1",
+          "-subj",
+          "/CN=node-cn-1",
+          "-addext",
+          "subjectAltName=DNS:localhost,DNS:node-dns-1,URI:spiffe://raft.local/ns/prod/sa/node-spiffe-1"
+        ),
+        pkiDir.toFile
+      ).!(log)
+      code shouldBe 0
+
+      val cf = CertificateFactory.getInstance("X.509")
+      val cert = cf
+        .generateCertificate(
+          new ByteArrayInputStream(Files.readAllBytes(crtPath))
+        )
+        .asInstanceOf[X509Certificate]
+
+      val ids = GrpcTransport.extractCertificateIdentities(cert)
+      ids should contain("node-cn-1")
+      ids should contain("node-dns-1")
+      ids should contain("spiffe://raft.local/ns/prod/sa/node-spiffe-1")
+      ids should contain("node-spiffe-1")
+      ids should not contain "localhost"
+    finally
+      Files.deleteIfExists(pkiDir.resolve("peer.key"))
+      Files.deleteIfExists(pkiDir.resolve("peer.crt"))
+      Files.deleteIfExists(pkiDir)
+  }

@@ -406,5 +406,32 @@ class Phase2CrashSafeWalSpec
           range.map(_.index) shouldBe (31L to 42L).toVector
           range.head.payload.utf8String shouldBe "k-31"
       }
+
+      "should dynamically allocate an oversized segment when a single entry exceeds segmentSize and survive reopen" in {
+        val bigPayload = Array.tabulate[Byte](2048)(i => (i % 199).toByte)
+        for
+          tmpDir <- IO(Files.createTempDirectory("raft-wal-oversized-"))
+          e1 <- MmapWalEngine.open[IO](tmpDir, segmentSize = 512L)
+          _ <- e1.appendEntries(
+            Seq(
+              Log.command(1L, 1L, "small-1".getBytes(StandardCharsets.UTF_8)),
+              Log.command(2L, 1L, bigPayload),
+              Log.command(3L, 2L, "small-3".getBytes(StandardCharsets.UTF_8))
+            )
+          )
+          _ <- e1.close
+
+          e2 <- MmapWalEngine.open[IO](tmpDir, segmentSize = 512L)
+          all <- e2.readRange(LogIndex.unsafeFrom(1L), LogIndex.unsafeFrom(3L))
+          t2 <- e2.termAt(LogIndex.unsafeFrom(2L))
+          _ <- e2.close
+          _ <- IO(deleteRecursive(tmpDir))
+        yield
+          all.map(_.index) shouldBe Vector(1L, 2L, 3L)
+          all(0).payload.utf8String shouldBe "small-1"
+          java.util.Arrays.equals(all(1).data, bigPayload) shouldBe true
+          all(2).payload.utf8String shouldBe "small-3"
+          t2 shouldBe Some(Term.unsafeFrom(1L))
+      }
     }
   }
