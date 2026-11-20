@@ -271,6 +271,10 @@ object RaftNode:
           ](Vector.empty)
           leaseUntilRef <- Ref.of[F, FiniteDuration](Duration.Zero)
           peerLastAckRef <- Ref.of[F, Map[NodeId, FiniteDuration]](Map.empty)
+          peerPendingSendsRef <- Ref.of[
+            F,
+            Map[NodeId, Vector[(Long, FiniteDuration)]]
+          ](Map.empty)
           snapshotInFlightRef <- Ref.of[F, Set[NodeId]](Set.empty)
           proposalQueue <- Queue.bounded[F, QueuedProposal[F, R]](
             config.maxPendingProposals
@@ -354,6 +358,7 @@ object RaftNode:
           readApplyWaitersRef = readApplyWaitersRef,
           leaseUntilRef = leaseUntilRef,
           peerLastAckRef = peerLastAckRef,
+          peerPendingSendsRef = peerPendingSendsRef,
           stickinessUntilRef = stickinessUntilRef,
           snapshotInFlightRef = snapshotInFlightRef,
           peerMailboxesCell = peerMailboxesCell,
@@ -439,6 +444,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
     ],
     leaseUntilRef: Ref[F, FiniteDuration],
     peerLastAckRef: Ref[F, Map[NodeId, FiniteDuration]],
+    peerPendingSendsRef: Ref[F, Map[NodeId, Vector[(Long, FiniteDuration)]]],
     stickinessUntilRef: Ref[F, FiniteDuration],
     snapshotInFlightRef: Ref[F, Set[NodeId]],
     peerMailboxesCell: AtomicCell[
@@ -475,6 +481,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
       _ <- shutdownRef.set(false)
       _ <- leaseUntilRef.set(Duration.Zero)
       _ <- peerLastAckRef.set(Map.empty)
+      _ <- peerPendingSendsRef.set(Map.empty)
       _ <- stickinessUntilRef.set(Duration.Zero)
       _ <- logger.info(s"Starting RAFT node ${config.localId.value}")
       hs <- stableStore.hardState
@@ -1100,6 +1107,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
       _ <- peerProgressRef.set(Map.empty)
       _ <- leaseUntilRef.set(Duration.Zero)
       _ <- peerLastAckRef.set(Map.empty)
+      _ <- peerPendingSendsRef.set(Map.empty)
       _ <- stateRef.update(s => Follower(s.term, None, None, s.commitIndex))
       _ <- drainProposalQueue(RaftError.ProposalDropped("Node shutting down"))
       _ <- failAllPending(RaftError.ProposalDropped("Node shutting down"))
@@ -1236,24 +1244,36 @@ private final class RaftNodeImpl[F[_]: Async, R](
       .flatMap(dispatchOutbound)
 
   private val stickinessWindow: FiniteDuration =
-    val diff = config.electionTimeoutMin - config.heartbeatInterval
-    if diff > Duration.Zero then diff else Duration.Zero
+    config.electionTimeoutMin
+
+  private val trackStickiness: Boolean =
+    config.leaderStickinessEnabled || config.checkQuorumEnabled || config.leaseReadEnabled
 
   private def isStickyFollowerOrLeader(
       state: NodeState,
       msg: RaftMessage
   ): F[Boolean] =
     msg match
-      case req: RequestVoteRequest
-          if req.isPreVote && !req.isTransfer && config.leaderStickinessEnabled =>
-        state match
-          case _: Leader                           => F.pure(true)
-          case f: Follower if f.leaderId.isDefined =>
-            for
-              now <- Clock[F].monotonic
-              until <- stickinessUntilRef.get
-            yield now < until
-          case _ => F.pure(false)
+      case req: RequestVoteRequest if !req.isTransfer =>
+        val shouldGuard =
+          if req.isPreVote then config.leaderStickinessEnabled
+          else config.checkQuorumEnabled || config.leaseReadEnabled
+        if !shouldGuard then F.pure(false)
+        else
+          state match
+            case _: Leader =>
+              if req.isPreVote || config.checkQuorumEnabled then F.pure(true)
+              else
+                for
+                  now <- Clock[F].monotonic
+                  until <- leaseUntilRef.get
+                yield now < until
+            case f: Follower if f.leaderId.isDefined =>
+              for
+                now <- Clock[F].monotonic
+                until <- stickinessUntilRef.get
+              yield now < until
+            case _ => F.pure(false)
       case _ => F.pure(false)
 
   private def updateLeaderStickiness(
@@ -1265,15 +1285,13 @@ private final class RaftNodeImpl[F[_]: Async, R](
       case ElectionTimeout =>
         stickinessUntilRef.set(Duration.Zero)
       case ae: AppendEntriesRequest if ae.term >= priorState.term =>
-        if config.leaderStickinessEnabled && stickinessWindow > Duration.Zero
-        then
+        if trackStickiness && stickinessWindow > Duration.Zero then
           Clock[F].monotonic.flatMap(now =>
             stickinessUntilRef.set(now + stickinessWindow)
           )
         else F.unit
       case snap: InstallSnapshotRequest if snap.term >= priorState.term =>
-        if config.leaderStickinessEnabled && stickinessWindow > Duration.Zero
-        then
+        if trackStickiness && stickinessWindow > Duration.Zero then
           Clock[F].monotonic.flatMap(now =>
             stickinessUntilRef.set(now + stickinessWindow)
           )
@@ -1303,7 +1321,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
                     RequestVoteResponse(
                       state.term,
                       voteGranted = false,
-                      isPreVote = true
+                      isPreVote = req.isPreVote
                     )
                   )
                 )
@@ -1385,6 +1403,37 @@ private final class RaftNodeImpl[F[_]: Async, R](
           yield effOut ++ catchUpOut
     yield out
 
+  private def recordLeaseSend(to: NodeId, term: Long): F[Unit] =
+    if !config.leaseReadEnabled then F.unit
+    else
+      Clock[F].monotonic.flatMap { now =>
+        peerPendingSendsRef.update { m =>
+          val cur = m.getOrElse(to, Vector.empty).dropWhile(_._1 < term)
+          val next =
+            if cur.size >= 256 then cur
+            else cur :+ (term -> now)
+          m.updated(to, next)
+        }
+      }
+
+  private def popLeaseSendTime(
+      peerId: NodeId,
+      term: Long
+  ): F[Option[FiniteDuration]] =
+    peerPendingSendsRef.modify { m =>
+      val cur = m.getOrElse(peerId, Vector.empty).dropWhile(_._1 < term)
+      cur.headOption match
+        case Some((t, sendTime)) if t == term =>
+          val tail = cur.tail
+          val updated =
+            if tail.isEmpty then m - peerId else m.updated(peerId, tail)
+          (updated, Some(sendTime))
+        case _ =>
+          val updated =
+            if cur.isEmpty then m - peerId else m.updated(peerId, cur)
+          (updated, None)
+    }
+
   private def maybeRefreshLeaderLease(
       msg: RaftMessage,
       senderOpt: Option[NodeId],
@@ -1394,37 +1443,50 @@ private final class RaftNodeImpl[F[_]: Async, R](
     (msg, senderOpt, newState) match
       case (resp: AppendEntriesResponse, Some(peerId), l: Leader)
           if resp.term == l.term && resp.success && config.leaseReadEnabled =>
-        Clock[F].monotonic.flatMap { now =>
-          peerLastAckRef.updateAndGet(_.updated(peerId, now)).flatMap { acks =>
-            def quorumAckFor(vs: Set[NodeId]): Option[FiniteDuration] =
-              if vs.isEmpty then None
-              else
-                val times = vs.toVector.flatMap { v =>
-                  if v == config.localId then Some(now) else acks.get(v)
+        for
+          now <- Clock[F].monotonic
+          sendTimeOpt <- popLeaseSendTime(peerId, l.term)
+          _ <- sendTimeOpt match
+            case None           => F.unit
+            case Some(sendTime) =>
+              peerLastAckRef
+                .updateAndGet { acks =>
+                  val prev = acks.getOrElse(peerId, Duration.Zero)
+                  val effective = if sendTime > prev then sendTime else prev
+                  acks.updated(peerId, effective)
                 }
-                val majIdx = vs.size / 2
-                if times.size <= majIdx then None
-                else
-                  val desc = times.sorted(Ordering[FiniteDuration].reverse)
-                  Some(desc(majIdx))
+                .flatMap { acks =>
+                  def quorumAckFor(vs: Set[NodeId]): Option[FiniteDuration] =
+                    if vs.isEmpty then None
+                    else
+                      val times = vs.toVector.flatMap { v =>
+                        if v == config.localId then Some(now) else acks.get(v)
+                      }
+                      val majIdx = vs.size / 2
+                      if times.size <= majIdx then None
+                      else
+                        val desc =
+                          times.sorted(Ordering[FiniteDuration].reverse)
+                        Some(desc(majIdx))
 
-            val quorumAckOpt = cluster.oldVoters match
-              case None        => quorumAckFor(cluster.newVoters)
-              case Some(oldVs) =>
-                for
-                  a <- quorumAckFor(cluster.newVoters)
-                  b <- quorumAckFor(oldVs)
-                yield if a <= b then a else b
+                  val quorumAckOpt = cluster.oldVoters match
+                    case None        => quorumAckFor(cluster.newVoters)
+                    case Some(oldVs) =>
+                      for
+                        a <- quorumAckFor(cluster.newVoters)
+                        b <- quorumAckFor(oldVs)
+                      yield if a <= b then a else b
 
-            quorumAckOpt match
-              case None            => F.unit
-              case Some(quorumAck) =>
-                val candidateLease = quorumAck + config.leaderLeaseDuration
-                leaseUntilRef.update(prev =>
-                  if candidateLease > prev then candidateLease else prev
-                )
-          }
-        }
+                  quorumAckOpt match
+                    case None            => F.unit
+                    case Some(quorumAck) =>
+                      val candidateLease =
+                        quorumAck + config.leaderLeaseDuration
+                      leaseUntilRef.update(prev =>
+                        if candidateLease > prev then candidateLease else prev
+                      )
+                }
+        yield ()
       case _ => F.unit
 
   private def maybeRearmCheckQuorum(
@@ -2080,24 +2142,46 @@ private final class RaftNodeImpl[F[_]: Async, R](
     else
       actions.traverse_ {
         case OutboundAction.SendOne(to, msg) =>
+          val leaseRec = msg match
+            case ae: AppendEntriesRequest => recordLeaseSend(to, ae.term)
+            case _                        => F.unit
           val hbMetric = msg match
             case ae: AppendEntriesRequest if ae.entries.isEmpty =>
               metrics.onHeartbeatSent(config.localId, 1)
             case _ => F.unit
-          hbMetric *> enqueuePeerSend(to, PeerSend.Single(msg))
+          leaseRec *> hbMetric *> enqueuePeerSend(to, PeerSend.Single(msg))
 
         case OutboundAction.SendBatch(to, msgs) =>
-          enqueuePeerSend(to, PeerSend.Batch(msgs))
+          val leaseRec = msgs.traverse_ {
+            case ae: AppendEntriesRequest => recordLeaseSend(to, ae.term)
+            case _                        => F.unit
+          }
+          leaseRec *> enqueuePeerSend(to, PeerSend.Batch(msgs))
 
         case OutboundAction.SendGroup(byPeer, hbPeers) =>
           val hbMetric =
             if hbPeers > 0 then metrics.onHeartbeatSent(config.localId, hbPeers)
             else F.unit
           hbMetric *> byPeer.traverse_ { case (peer, msgs) =>
-            msgs.traverse_(m => enqueuePeerSend(peer, PeerSend.Single(m)))
+            msgs.traverse_ { m =>
+              val leaseRec = m match
+                case ae: AppendEntriesRequest => recordLeaseSend(peer, ae.term)
+                case _                        => F.unit
+              leaseRec *> enqueuePeerSend(peer, PeerSend.Single(m))
+            }
           }
 
         case OutboundAction.BroadcastMsg(msg, hbPeers) =>
+          val leaseRec = msg match
+            case ae: AppendEntriesRequest if config.leaseReadEnabled =>
+              clusterRef.get.flatMap { cluster =>
+                (cluster.newVoters ++ cluster.oldVoters.getOrElse(
+                  Set.empty
+                )).toList
+                  .filterNot(_ == config.localId)
+                  .traverse_(p => recordLeaseSend(p, ae.term))
+              }
+            case _ => F.unit
           val bcastMetric = msg match
             case req: RequestVoteRequest =>
               metrics.onElectionStarted(config.localId, req.term)
@@ -2108,8 +2192,8 @@ private final class RaftNodeImpl[F[_]: Async, R](
             logger.debug(err)("Outbound broadcast failed")
           }
           if config.parallelReplicationEnabled then
-            bcastMetric *> supervisor.supervise(runBcast).void
-          else runBcast *> bcastMetric
+            leaseRec *> bcastMetric *> supervisor.supervise(runBcast).void
+          else leaseRec *> runBcast *> bcastMetric
       }
 
   private def sendMessageWithMetrics(to: NodeId, msg: RaftMessage): F[Unit] =
@@ -2434,6 +2518,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
       _ <- peerProgressRef.set(Map.empty)
       _ <- leaseUntilRef.set(Duration.Zero)
       _ <- peerLastAckRef.set(Map.empty)
+      _ <- peerPendingSendsRef.set(Map.empty)
       err = st match
         case f: Follower => RaftError.NotLeader(f.leaderId)
         case _           => RaftError.NotLeader(None)
@@ -2584,6 +2669,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
       }.toMap
       _ <- peerProgressRef.set(initProgress)
       _ <- peerLastAckRef.set(Map.empty)
+      _ <- peerPendingSendsRef.set(Map.empty)
       _ <- stateRef.update {
         case l: Leader =>
           l.initializeIndices(followers, lastLogIndex)
