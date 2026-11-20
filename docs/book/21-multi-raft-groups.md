@@ -198,9 +198,9 @@ def startMultiRaftHost(
   yield (grpc, mgTransport, coordinator)
 ```
 
-### Shard Operations & Active Leader Rebalancing
+### Shard Operations, Typed Groups & Active Leader Rebalancing
 
-`MultiRaftNode[F]` exposes group-scoped linearizable writes, batch writes, quorum/lease reads, and automated shard leadership rebalancing:
+`MultiRaftNode[F]` serializes group lifecycle transitions (`createGroup`, `createTypedGroup[R]`, `removeGroup`, `shutdown`) atomically via `AtomicCell[F, Map[GroupId, ...]]` with resource-safe rollback (`0` TOCTOU races, `0` leaked fibers if a shard fails to start). Callers can register strongly typed groups via `createTypedGroup[R](groupId, TypedGroupConfig[F, R]): F[RaftNode[F, R]]`, execute group-scoped writes (`proposeAndApplyToGroup`, `proposeBatchAndCommitToGroup`), run per-shard membership migrations (`proposeConfChangeToGroup`), serve quorum/lease reads (`readIndexFromGroup` / `leaseReadFromGroup`), and rebalance leaders:
 
 ```scala
 val preferredPlacement: Map[GroupId, NodeId] = Map(
@@ -223,6 +223,22 @@ for
   stats <- mgTransport.coalescerStats
 yield (ids, rIdx, initiatedTransfers, stats)
 ```
+
+## Runnable Multi-Raft Walkthroughs
+
+Two runnable examples in `modules/examples` demonstrate Multi-Raft from minimal in-memory multiplexing up to a full production stack:
+
+1. **Sharded KV with Dynamic Group Lifecycle (`examples.distributed.MultiGroupExample`)**
+   ```bash
+   sbt "examples/runMain examples.distributed.MultiGroupExample"
+   ```
+   Creates a 3-host `MultiGroupTransport.createInMemoryCluster` with `CoalescedHeartbeatConfig(enabled = true, flushInterval = 10.millis, maxBatchSize = 16)`, provisions `shard-0` (keys `a`–`m`) and `shard-1` (keys `n`–`z`) across all 3 hosts (6 Raft state machines sharing 3 transport endpoints), routes writes (`alice`, `bob`, `nancy`, `zara`) to each shard's elected leader via `proposeAndCommitToGroup`, verifies `readIndexFromGroup` on both shards, hot-adds and cleanly removes `shard-2` at runtime, and proves all 3 replicas of both shards converge identically.
+
+2. **Flagship Production Stack: Multi-Shard Transactional Bank Ledger (`examples.advanced.ShardedBankLedgerExample`)**
+   ```bash
+   sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"
+   ```
+   Runs `tx-coord` + 3 `ledger-shard-*` groups across 3 single-port `GrpcTransport.multiGroupResource` servers and 12 independent `MmapWalEngine` stores, demonstrating `CoalescerStats`, `rebalanceLeadership`, `proposeBatchAndCommitToGroup`, `leaseReadFromGroup` → `readIndexFromGroup` fallback, and cross-shard atomic 2PC with crash recovery ([Chapter 15](15-case-distributed-transactions.md)).
 
 ## Summary
 

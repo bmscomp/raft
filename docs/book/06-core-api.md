@@ -52,7 +52,7 @@ There's something worth noting about the `getTermAt` parameter: it's a function,
 
 ## Node States
 
-Every node in a Raft cluster is in exactly one of four states. These are modeled as a sealed trait hierarchy:
+Every node in a Raft cluster is in exactly one of four roles, modeled as an immutable Scala 3 `enum` (`raft.state.NodeState`). Crucially, **every** role carries `commitIndex` so a node's committed watermark never regresses across elections or higher-term step-downs:
 
 ```mermaid
 stateDiagram-v2
@@ -66,132 +66,154 @@ stateDiagram-v2
     Leader --> Follower: "Higher Term / CheckQuorum Step-Down"
 ```
 
-Let's look at each state in detail.
+Let's look at each role in detail.
 
 ### Follower
 
 ```scala
-case Follower(
-  term: Long,
-  votedFor: Option[NodeId] = None,
-  leaderId: Option[NodeId] = None,
-  commitIndex: Long = 0L
-)
+enum NodeState:
+  case Follower(
+    term: Long,
+    votedFor: Option[NodeId] = None,
+    leaderId: Option[NodeId] = None,
+    commitIndex: Long = 0L
+  )
 ```
 
 The **default** and most common state. A follower passively responds to RPCs:
-- **`AppendEntries`** from the leader: append entries to the log, update commit index, reset election timer
-- **`RequestVote`** from candidates: grant or deny vote based on the rules from Chapter 2
-- **`ElectionTimeout`**: transition to PreCandidate (if pre-vote is enabled) or Candidate
+- **`AppendEntries`** from the leader: verify `(prevLogIndex, prevLogTerm)`, append entries, advance `commitIndex` strictly up to `min(leaderCommit, prevLogIndex + entries.size)`, reset election timer
+- **`RequestVote`** from candidates: grant or deny vote based on term, single-vote guard, leader stickiness, and `LogId(term, index)` freshness
+- **`ElectionTimeout`**: transition to `PreCandidate` (if `preVoteEnabled`) or `Candidate`
 
-The `votedFor` field records who this node voted for in the current term. It's `None` if the node hasn't voted. This field is part of the **hard state** — it must be persisted to disk before responding to any RPC, because a crash-and-restart must not allow the node to vote again in the same term.
+The `votedFor` field records who this node voted for in the current term (`None` if no vote was cast). Together with `term`, it forms the **hard state** that must be atomically persisted via `StableStore.setHardState` (or `Ready.hardState`) before responding to any RPC.
 
-The `leaderId` field tracks the current leader. It's `None` when the follower doesn't know who the leader is (e.g., right after a term change). Client libraries use this field to redirect requests to the leader.
+The `leaderId` field tracks the current leader (`None` right after a term change) so client gateways can redirect requests via `RaftError.NotLeader(leaderId)`.
 
 ### PreCandidate
 
 ```scala
-case class PreCandidate(
-  term: Long,
-  preVotesReceived: Set[NodeId]
-)
+  case PreCandidate(
+    term: Long,
+    preVotesReceived: Set[NodeId] = Set.empty,
+    commitIndex: Long = 0L
+  )
 ```
 
-Only exists when `preVoteEnabled = true` in the config (which is the default). This is the intermediate state from the Pre-Vote protocol (Chapter 3).
-
-The pre-candidate sends `RequestVote` RPCs with `isPreVote = true` at the **next term** (current + 1), but crucially **does not increment its own term**. The `preVotesReceived` set tracks which peers have granted their pre-vote. If the set reaches a majority, the node transitions to Candidate (and only then increments its term).
+Active when `preVoteEnabled = true` (the default). The pre-candidate broadcasts `RequestVoteRequest(term = term + 1, isPreVote = true)` without incrementing its own persistent `term` or emitting `PersistHardState`. Only when `preVotesReceived` achieves a valid quorum (`hasPreVoteQuorum(cluster)` or `hasPreVoteMajority(clusterSize)`) does the node promote to `Candidate(term + 1, ...)`.
 
 ### Candidate
 
 ```scala
-case class Candidate(
-  term: Long,
-  votesReceived: Set[NodeId]
-)
+  case Candidate(
+    term: Long,
+    votesReceived: Set[NodeId] = Set.empty,
+    commitIndex: Long = 0L
+  )
 ```
 
-A candidate has incremented its term, voted for itself, and is actively seeking votes. The `votesReceived` set always starts with the candidate's own `NodeId` (self-vote). As vote responses arrive, the set grows. When it reaches a majority of the cluster size, the candidate becomes Leader.
-
-Three things can end a candidacy:
-1. **Win**: `votesReceived.size > clusterSize / 2` → become Leader
-2. **Lose**: receive an `AppendEntries` from a leader with `term >= candidate.term` → become Follower
-3. **Timeout**: election timer fires without achieving a majority → start a new election (increment term, re-vote)
+A candidate has incremented its term, voted for itself (`votesReceived = Set(localId)`), persisted its hard state, and broadcast `RequestVoteRequest(isPreVote = false)`. Three events terminate candidacy:
+1. **Win**: `hasQuorum(cluster)` / `hasMajority(clusterSize)` → become `Leader`
+2. **Lose**: `AppendEntriesRequest` with `term >= candidate.term` (or any message with `term > candidate.term`) → `stepDown` to `Follower`
+3. **Timeout**: election timer fires without a quorum → start a fresh election at `term + 1`
 
 ### Leader
 
 ```scala
-case class Leader(
-  term: Long,
-  matchIndex: Map[NodeId, Long] = Map.empty,
-  commitIndex: Long = 0,
-  // ... additional fields for advanced features
-)
+  case Leader(
+    term: Long,
+    nextIndex: Map[NodeId, Long] = Map.empty,
+    matchIndex: Map[NodeId, Long] = Map.empty,
+    commitIndex: Long = 0L,
+    transferTarget: Option[NodeId] = None,
+    pendingReads: Map[String, PendingRead] = Map.empty,
+    leaseUntil: Long = 0L,
+    recentlyActive: Set[NodeId] = Set.empty
+  )
 ```
 
-The active leader. This is the only state that accepts client commands and drives log replication. Key fields:
+The authoritative cluster leader. Key fields:
+- **`nextIndex` / `matchIndex`**: per-follower replication cursors and confirmed watermarks used to compute `calculateCommitIndex` / `calculateCommitIndexForCluster` (supporting Joint Consensus dual majorities).
+- **`transferTarget`**: when `Some(target)` (§3.10), the leader fences new client proposals (`RaftError.LeadershipTransferInProgress`), catches up `target`, and emits `TimeoutNow(target)`.
+- **`pendingReads`**: in-flight §6.4 `ReadIndex` quorum-heartbeat rounds awaiting majority acknowledgment.
+- **`leaseUntil` / `recentlyActive`**: monotonic lease deadline for zero-RTT `LeaseRead` and active-peer tracking for §6.2 `CheckQuorum`.
 
-- **`matchIndex`**: for each follower, the highest log index known to be replicated on that follower. The leader uses this to calculate the commit index (the median of all match indices, including its own).
-- **`commitIndex`**: the highest log index that has been replicated to a majority and is safe to apply to the state machine.
+## Messages (`RaftMessage`)
 
-When a leader first takes office, it doesn't know any follower's state. `matchIndex` starts empty, and the leader discovers each follower's position through the `AppendEntries` consistency check (the "search backward" mechanism from Chapter 2).
-
-## Messages
-
-All protocol messages — both inter-node RPCs and internal events — are modeled as a single sealed hierarchy:
+All 17 protocol messages — inter-node RPCs, administrative commands, and internal logical timer events — form a single deeply immutable `sealed trait RaftMessage` with structural value equality (`==`):
 
 ```scala
-enum RaftMessage:
-  // Inter-node RPCs
-  case RequestVoteRequest(
-    term: Long,
-    candidateId: NodeId,
-    lastLogIndex: Long,
-    lastLogTerm: Long,
-    isPreVote: Boolean = false
-  )
+sealed trait RaftMessage extends Product with Serializable
 
-  case RequestVoteResponse(
-    term: Long,
-    voteGranted: Boolean,
-    isPreVote: Boolean = false
-  )
-
-  case AppendEntriesRequest(
+object RaftMessage:
+  // Core replication & election RPCs (§5.2, §5.3, §9.6, §3.10)
+  final case class AppendEntriesRequest(
     term: Long,
     leaderId: NodeId,
     prevLogIndex: Long,
     prevLogTerm: Long,
     entries: Seq[Log],
     leaderCommit: Long
-  )
+  ) extends RaftMessage
 
-  case AppendEntriesResponse(
+  final case class AppendEntriesResponse(
     term: Long,
     success: Boolean,
-    matchIndex: Long
-  )
+    matchIndex: Long,
+    conflictIndex: Option[Long] = None, // §5.3 fast term-skip hint
+    conflictTerm: Option[Long] = None   // §5.3 conflicting term hint
+  ) extends RaftMessage
 
-  case InstallSnapshotRequest(
+  final case class RequestVoteRequest(
+    term: Long,
+    candidateId: NodeId,
+    lastLogIndex: Long,
+    lastLogTerm: Long,
+    isPreVote: Boolean = false,
+    isTransfer: Boolean = false         // true on TimeoutNow-triggered elections
+  ) extends RaftMessage
+
+  final case class RequestVoteResponse(
+    term: Long,
+    voteGranted: Boolean,
+    isPreVote: Boolean = false
+  ) extends RaftMessage
+
+  // Chunked snapshot streaming (§7) — payload wrapped in immutable Bytes
+  final case class InstallSnapshotRequest(
     term: Long,
     leaderId: NodeId,
     lastIncludedIndex: Long,
     lastIncludedTerm: Long,
     offset: Long,
-    data: Array[Byte],
+    payload: Bytes,
     done: Boolean
-  )
+  ) extends RaftMessage
 
-  case InstallSnapshotResponse(term: Long, success: Boolean)
+  final case class InstallSnapshotResponse(
+    term: Long,
+    success: Boolean,
+    matchIndex: Long = 0L
+  ) extends RaftMessage
 
-  // Internal events (not sent over the network)
-  case ElectionTimeout        // the election timer fired
-  case HeartbeatTimeout       // the heartbeat timer fired
-  case TimeoutNow(target: NodeId)  // leadership transfer trigger
+  // Leadership transfer (§3.10), ReadIndex (§6.4), Membership (§6)
+  final case class TransferLeadershipRequest(term: Long, target: NodeId) extends RaftMessage
+  final case class TimeoutNowRequest(term: Long, leaderId: NodeId) extends RaftMessage
+  final case class ReadIndexRequest(requestId: String) extends RaftMessage
+  final case class ReadIndexResponse(requestId: String, success: Boolean, readIndex: Long) extends RaftMessage
+  final case class AddServerRequest(term: Long, newServer: NodeId, isLearner: Boolean = false) extends RaftMessage
+  final case class AddServerResponse(term: Long, success: Boolean, leaderHint: Option[NodeId]) extends RaftMessage
+  final case class RemoveServerRequest(term: Long, server: NodeId) extends RaftMessage
+  final case class RemoveServerResponse(term: Long, success: Boolean, leaderHint: Option[NodeId]) extends RaftMessage
+
+  // Internal logical timer events
+  case object ElectionTimeout    extends RaftMessage
+  case object HeartbeatTimeout   extends RaftMessage
+  case object CheckQuorumTimeout extends RaftMessage
 ```
 
-Internal events like `ElectionTimeout` and `HeartbeatTimeout` are modeled as messages for a specific reason: it means the timer system doesn't need special access to the protocol logic. The timer fires, the runtime wraps it as a `HeartbeatTimeout` message, and it goes through the same `onMessage` path as any other event. This uniformity simplifies both the runtime and testing.
+Modeling `ElectionTimeout`, `HeartbeatTimeout`, and `CheckQuorumTimeout` as `RaftMessage` values means timers require no backdoor into protocol state: every external or temporal stimulus passes through the exact same pure transition function.
 
-> **Note — The `isPreVote` flag:** Notice that `RequestVoteRequest` and `RequestVoteResponse` carry an `isPreVote` boolean rather than being separate message types. This is a pragmatic choice — it means the serialization format and transport code don't need to change when Pre-Vote is enabled or disabled. The protocol logic checks this flag internally to decide whether to actually persist state changes.
+> **Note — Why `isTransfer` and `(conflictIndex, conflictTerm)` matter:** `isTransfer = true` tells followers to bypass Leader Stickiness during a deliberate §3.10 leadership transfer so the handoff completes in one RTT. `conflictIndex` and `conflictTerm` let leaders skip an entire conflicting term per RTT instead of decrementing `nextIndex` one entry at a time (§5.3).
 
 ## The Effect Catalog
 
@@ -222,21 +244,28 @@ Internal events like `ElectionTimeout` and `HeartbeatTimeout` are modeled as mes
 
 ## Configuration: `RaftConfig`
 
-Every node is configured via a `RaftConfig` instance. This is an immutable case class — create it once at startup and pass it to every `onMessage` call:
+Every node is configured via an immutable `RaftConfig` instance — construct it directly or via the pure error-accumulating smart constructor `RaftConfig.validate(...)`:
 
 ```scala
-case class RaftConfig(
+final case class RaftConfig(
   localId: NodeId,
-  electionTimeoutMin: FiniteDuration = 150.millis,
-  electionTimeoutMax: FiniteDuration = 300.millis,
-  heartbeatInterval: FiniteDuration  = 50.millis,
-  maxEntriesPerRequest: Int          = 100,
-  preVoteEnabled: Boolean            = true,
-  leaderStickinessEnabled: Boolean   = true,
+  electionTimeoutMin: FiniteDuration  = 150.millis,
+  electionTimeoutMax: FiniteDuration  = 300.millis,
+  heartbeatInterval: FiniteDuration   = 50.millis,
+  maxEntriesPerRequest: Int           = 100,
+  preVoteEnabled: Boolean             = true,
+  leaderStickinessEnabled: Boolean    = true,
   leaderLeaseDuration: FiniteDuration = 100.millis,
   parallelReplicationEnabled: Boolean = true,
-  batching: BatchConfig  = BatchConfig(),
-  pipelining: PipelineConfig = PipelineConfig()
+  batching: BatchConfig               = BatchConfig(),
+  pipelining: PipelineConfig          = PipelineConfig(),
+  compaction: CompactionConfig        = CompactionConfig(),
+  checkQuorumEnabled: Boolean         = true,
+  leaseReadEnabled: Boolean           = false,
+  electionTimeoutTicks: Int           = 10,
+  heartbeatIntervalTicks: Int         = 1,
+  maxInboundQueueSize: Int            = 8192,
+  maxPendingProposals: Int            = 8192
 )
 ```
 
@@ -244,12 +273,14 @@ Here's guidance on tuning the key parameters:
 
 | Parameter | Default | Tuning Guidance |
 |-----------|---------|-----------------|
-| `electionTimeoutMin/Max` | 150–300ms | Should be at least **10× the network round-trip time**. In a LAN (~1ms RTT), the defaults work well. In a WAN (~50ms RTT), increase to 500–1000ms. |
-| `heartbeatInterval` | 50ms | Must be **much less than** `electionTimeoutMin`. A good rule of thumb is `electionTimeoutMin / 3`. |
-| `maxEntriesPerRequest` | 100 | Controls the maximum number of log entries in a single `AppendEntries` RPC. Higher values improve throughput for lagging followers but increase memory usage per RPC. |
-| `preVoteEnabled` | true | **Always enable in production.** Disable only for testing the raw election logic. |
-| `leaderStickinessEnabled` | true | Reduces spurious elections. Safe to leave on in all environments. |
-| `leaderLeaseDuration` | 100ms | Must be **less than** `electionTimeoutMin` and should account for clock skew between nodes. Conservative: `electionTimeoutMin × 0.5`. |
+| `electionTimeoutMin/Max` | 150–300ms | At least **10× network RTT** (`500–1000ms` across WAN/AZs). Used by wall-clock runtimes (`RaftNode`). |
+| `heartbeatInterval` | 50ms | Must stay strictly below `electionTimeoutMin` (rule of thumb: `electionTimeoutMin / 3`). |
+| `electionTimeoutTicks` / `heartbeatIntervalTicks` | `10` / `1` | Logical tick cadence for Sans-I/O `ConsensusKernel` / `RawNode` and Deterministic Simulation Testing ([Chapter 22](22-sans-io-rawnode-ready.md)). |
+| `maxEntriesPerRequest` | 100 | Maximum log entries packed into one `AppendEntriesRequest` chunk. |
+| `preVoteEnabled` | `true` | **Always enable in production** to eliminate partitioned term inflation (§9.6). |
+| `leaderStickinessEnabled` / `checkQuorumEnabled` | `true` / `true` | Follower-side vote guard (§6) and leader-side minority step-down (§6.2). |
+| `leaseReadEnabled` / `leaderLeaseDuration` | `false` / 100ms | Enables zero-RTT local reads when `checkQuorumEnabled = true`; keep `leaderLeaseDuration < electionTimeoutMin - maxClockDrift`. |
+| `maxInboundQueueSize` / `maxPendingProposals` | `8192` / `8192` | Bounded backpressure limits preventing OOM under burst load or slow disks. |
 
 > **Note — Timing constraints:** The Raft paper formally requires: `broadcastTime ≪ electionTimeout ≪ MTBF`. The `broadcastTime` is the average time to send an RPC to all nodes (~0.5–20ms on a LAN). The MTBF (mean time between failures) is typically months or years. Your election timeout must sit comfortably between these two extremes. If the election timeout is too close to the broadcast time, followers will start elections before heartbeats arrive. If it's too close to the MTBF, the cluster might not recover from failures quickly enough.
 
@@ -304,80 +335,79 @@ config.allNodes                 // Set(n1, n2, n3)
 
 > **Note — Quorum During Joint Consensus:** When `isInJointConsensus` is `true`, the `hasQuorum` method requires a majority of **both** the old configuration (stored in `jointConfig`) and the current membership. This dual-quorum check is what makes joint consensus safe (Chapter 3).
 
-## Log Entries
+## Log Entries, `Bytes`, `LogId`, and Typed `RaftError`
 
-Log entries are the fundamental unit of replicated data:
+Log entries are deeply immutable values backed by `raft.state.Bytes` (structural `==`, SIMD-intrinsified hashing, zero-copy read-only `ByteBuffer` views):
 
 ```scala
-case class Log(
+final case class Log(
   index: Long,
   term: Long,
-  logType: LogType = LogType.Command,
-  data: Array[Byte] = Array.empty
-)
+  logType: LogType,
+  payload: Bytes
+):
+  def data: Array[Byte]          // defensive copy for legacy byte-array consumers
+  def typedIndex: LogIndex
+  def typedTerm: Term
+  def stripForWitness: Log       // clears Command payload for Witness tie-breakers
 
 enum LogType:
-  case Command        // a client-submitted command
-  case NoOp           // leader's initial no-op entry (see Chapter 2)
-  case Configuration  // a membership change entry (ClusterConfig)
+  case Command        // client-submitted command
+  case NoOp           // leader's initial current-term barrier entry (§5.4.2)
+  case Configuration  // CRC32-verified RCFG v2 ClusterConfig entry (§6)
 ```
 
-Factory methods make entry creation clear and intentional:
+Factory methods keep entry construction safe and explicit:
 
 ```scala
-val clientCmd = Log.command(index = 1, term = 1, data = "SET x=1".getBytes)
+val clientCmd  = Log.command(index = 1, term = 1, data = "SET x=1".getBytes)
+val zeroCopy   = Log.commandBytes(LogIndex.unsafeFrom(1), Term.unsafeFrom(1), Bytes.fromUtf8("SET x=1"))
 val leaderInit = Log.noOp(index = 1, term = 1)
+val confEntry  = Log.configuration(index = 2, term = 1, clusterConfig)
 ```
 
-The `data` field is an opaque byte array — the protocol logic never inspects its contents. Your application defines the serialization format (JSON, Protobuf, Avro, or anything else). The protocol's job is to ensure that every node receives and applies the same entries in the same order.
+Alongside `Log`, `raft-core` defines three small domain primitives that eliminate subtle consensus bugs across the entire codebase:
+
+- **`LogId(term: Term, index: LogIndex)`**: Canonical coordinate with an exact lexicographic `Ordered[LogId]` (`term` primary, `index` tiebreaker) encoding Raft's §5.4.1 up-to-date log relation.
+- **`HardState(term: Long, votedFor: Option[NodeId], commitIndex: Long)`** & **`ReadState(index: Long, requestCtx: String)`**: Immutable persistence and linearizable-read descriptors emitted by `ConsensusKernel` / `RawNode`.
+- **`RaftError`** (sealed `RuntimeException with NoStackTrace`): Exhaustive typed failure cases (`NotLeader(leaderId)`, `ElectionInProgress`, `LeadershipTransferInProgress(transferee)`, `ConfigurationChangeInProgress(pending)`, `LeaderNotReadyInTerm(term)`, `ProposalDropped(reason)`, `GroupNotFound(groupId)`, `StorageCorruption(reason)`) so clients and routers never parse error strings.
 
 ## Vote Response Handling
 
-For tracking voter identity and accumulating votes, the library provides a dedicated function:
+When calling `RaftLogic.onMessage` directly with a `RequestVoteResponse`, pass the voter's `NodeId` via `sender = Some(voterId)` — or invoke `RaftLogic.onVoteResponse` explicitly for deterministic, idempotent vote deduplication:
 
 ```scala
 val afterVote = RaftLogic.onVoteResponse(
-  state = candidate,                    // current Candidate state
-  voter = NodeId("node-2"),             // who sent the response
-  resp = RequestVoteResponse(
-    term = 1,
-    voteGranted = true,
-    isPreVote = false
-  ),
-  config = config,                      // RaftConfig
-  clusterSize = 3                       // total nodes
+  state = candidate,
+  voterId = NodeId("node-2"),
+  resp = RequestVoteResponse(term = 1, voteGranted = true, isPreVote = false),
+  config = config,
+  clusterSize = 3
 )
-// If this was the 2nd vote in a 3-node cluster → majority reached
-// afterVote.state → Leader(term = 1)
-// afterVote.effects → [BecomeLeader, ...]
+// 2nd vote in a 3-node cluster → majority reached
+// afterVote.state → Leader(term = 1, ...)
+// afterVote.effects → List(BecomeLeader, ...)
 ```
-
-This function is separate from `onMessage` because vote responses require the voter's identity (to prevent double-counting votes from the same node). Regular `onMessage` doesn't carry sender identity.
 
 ## Summary
 
-Here's the complete API surface at a glance:
+`raft-core` provides two complementary pure entry points over the exact same domain model:
 
-```
-                    ┌──────────────────────────┐
-                    │       RaftLogic          │
-                    │                          │
-  RaftMessage ─────→│  onMessage(state, msg)   │─────→ Transition
-  Timer events      │  onVoteResponse(...)     │       ├── NodeState
-                    │  handleReadIndex(...)    │       └── List[Effect]
-                    │  handleLeaseRead(...)    │
-                    │  handleTransferLeader..  │
-                    └──────────────────────────┘
-
-  NodeState: Follower | PreCandidate | Candidate | Leader
-  Effect:    SendMessage | Broadcast | PersistHardState | AppendLogs
-             TruncateLog | CommitEntries | BecomeLeader | ResetElectionTimer
-             ResetHeartbeatTimer | ConfirmLeadership | ReadIndexReady
-             LeaseReadReady | ExtendLease | TimeoutNow | ...
-  Config:    RaftConfig (tuning), ClusterConfig (membership)
-  Data:      Log (entries), Transition (state + effects)
+```mermaid
+flowchart LR
+    subgraph Stateless["Stateless Pure Layer (RaftLogic)"]
+        RL["RaftLogic.onMessage / onVoteResponse -> Transition(NodeState, List[Effect])"]
+    end
+    subgraph Mealy["Stateful Sans-I/O Layer (ConsensusKernel + RawNode)"]
+        CK["ConsensusKernel (KernelState + UnstableLog + ProgressTracker + SplitMix64)"]
+        RN["RawNode (tick / step / proposeBytes / readIndex / proposeConfChange -> Ready / LightReady)"]
+        CK --- RN
+    end
+    Domain["Shared Zero-Dep Domain: NodeState, 17 RaftMessages, 18 Effects, Log/Bytes, LogId, ClusterConfig (RCFG v2), RaftConfig/Validated, RaftError"]
+    Domain --> Stateless
+    Domain --> Mealy
 ```
 
 ---
 
-*Next: [Chapter 7 — The SPI Layer](07-spi-layer.md) covers the four interfaces you implement to connect the pure protocol logic to your infrastructure: Transport, LogStore, StableStore, and StateMachine.*
+*Next: [Chapter 7 — The SPI Layer](07-spi-layer.md) covers the pluggable interfaces that connect pure consensus to your infrastructure: `Transport`, `LogStore`, `StableStore`, `SnapshotStore`, `StateMachine`, `TimerService`, and `MessageCodec`.*

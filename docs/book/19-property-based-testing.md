@@ -150,33 +150,57 @@ property("Log Matching: same index+term implies same prefix") =
 ```scala
 property("Leader Append-Only: leaders never delete entries") =
   forAll(Gen.listOfN(50, RaftEventGen.randomEvent(0))) { events =>
-    var leaderLogs: Map[NodeId, Vector[Log]] = Map.empty
-
-    events.foldLeft(initialCluster) { (cluster, event) =>
-      val updated = applyEventToRandomNode(cluster, event)
-
-      updated.nodes.foreach { (id, node) =>
-        node.state match
-          case _: Leader =>
-            leaderLogs.get(id) match
-              case Some(prevLog) =>
-                // The current log must be a prefix-extension of the previous log
-                assert(node.log.startsWith(prevLog),
-                  s"Leader $id truncated its log!")
-              case None => ()
-            leaderLogs = leaderLogs + (id -> node.log)
-          case _ =>
-            leaderLogs = leaderLogs - id
+    val (_, preserved) =
+      events.foldLeft((initialCluster, Map.empty[NodeId, Vector[Log]], true)) {
+        case ((cluster, prevLeaderLogs, ok), event) =>
+          val updated = applyEventToRandomNode(cluster, event)
+          val (nextLogs, stepOk) = updated.nodes.foldLeft((prevLeaderLogs, ok)) {
+            case ((accLogs, accOk), (id, node)) =>
+              node.state match
+                case _: Leader =>
+                  val prefixValid = accLogs.get(id).forall(prev => node.log.startsWith(prev))
+                  (accLogs.updated(id, node.log), accOk && prefixValid)
+                case _ =>
+                  (accLogs - id, accOk)
+          }
+          (updated, nextLogs, stepOk)
       }
-
-      updated
-    }
-
-    true
+    preserved
   }
 ```
 
-## Property 4: State Machine Safety
+## Property 4: Leader Completeness
+
+```scala
+property("Leader Completeness: committed entries survive in every future leader's log") =
+  forAll(Gen.listOfN(120, RaftEventGen.randomEvent(0))) { events =>
+    val (_, _, valid) =
+      events.foldLeft((initialCluster, Map.empty[Long, Log], true)) {
+        case ((cluster, committedHistory, ok), event) =>
+          val updated = applyEventToRandomNode(cluster, event)
+          // Record every newly committed (index -> Log) across the cluster
+          val nextCommitted = updated.nodes.values.foldLeft(committedHistory) { (acc, node) =>
+            node.log.filter(_.index <= node.commitIndex).foldLeft(acc) { (m, e) =>
+              m.updated(e.index, e)
+            }
+          }
+          // Every active Leader in term > entry.term MUST contain that exact committed entry
+          val leadersComplete = updated.nodes.values.forall { node =>
+            node.state match
+              case l: Leader =>
+                nextCommitted.values.forall { committed =>
+                  l.term <= committed.term ||
+                    node.log.exists(e => e.index == committed.index && e == committed)
+                }
+              case _ => true
+          }
+          (updated, nextCommitted, ok && leadersComplete)
+      }
+    valid
+  }
+```
+
+## Property 5: State Machine Safety
 
 ```scala
 property("State Machine Safety: no conflicting applies") =
@@ -225,11 +249,12 @@ forAll(matchGen) { case (m1, m2, m3, m4, m5, delta) =>
 }
 ```
 
-### 3. Wire-Codec Round-Trip Isomorphism (`JsonCodec` & `ProtobufMessageCodec`)
+### 3. Wire-Codec, Envelope & Stateful WAL Model-Checking Laws
 
-A subtle escaping or varint bug in a wire codec can silently corrupt `conflictTerm`, flip `isTransfer`, or truncate binary snapshot chunks. `JsonCodecPropertySpec` and `ProtobufMessageCodecSpec` generate all 17 `RaftMessage` variants populated with arbitrary `Array[Byte]` payloads, ASCII control characters (`0x00`–`0x1f`), quotes, backslashes, and multi-byte UTF-8 symbols, asserting exact round-trip identity:
-
-$$\forall m \in \text{RaftMessage}: \quad \text{decode}(\text{encode}(m)) = \text{Right}(m)$$
+- **Wire-Codec Isomorphism (`JsonCodecPropertySpec` & `ProtobufMessageCodecSpec`)**: Generates all 17 `RaftMessage` variants populated with arbitrary `Bytes` payloads, ASCII control characters (`0x00`–`0x1f`), quotes, backslashes, and multi-byte UTF-8 symbols, asserting exact structural equality (`==` works natively on `Log` and `InstallSnapshotRequest` because payloads live inside `Bytes`!):
+  $$\forall m \in \text{RaftMessage}: \quad \text{decode}(\text{encode}(m)) = \text{Right}(m)$$
+- **Binary Envelope Round-Trips (`ClusterConfig` `"RCFG"` v2 & `SnapshotMetadata` `"RSNP"` v1/v2)**: Verifies that arbitrary UTF-8 `NodeId`s (including delimiters `'|'`, `','`, `':'`) and CRC32 corruption flips round-trip or fail fast with typed errors.
+- **Stateful Off-Heap WAL Model-Checking (`MmapWalEngineStatefulPropertySpec`)**: Generates random command sequences (`appendEntries`, segment rotation, `truncateFrom`, `discardBefore`, `saveSnapshot`, cold restart) against a live `MmapWalEngine` on disk and verifies every read matches a pure `Vector[Log]` reference oracle bit-for-bit!
 
 ## Running the Properties
 

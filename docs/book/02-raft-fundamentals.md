@@ -65,15 +65,18 @@ Terms are also the mechanism Raft uses to **detect stale information**. The rule
 
 > **Note — Terms vs. Lamport Clocks:** If you're familiar with Lamport's logical clocks (Chapter 1), you might notice that terms work differently. Lamport clocks increment on every local event and every message send/receive. Raft terms only increment when an election starts. This makes terms coarser-grained — they don't capture all causal relationships — but within Raft's architecture, that's sufficient because all operations are mediated through the leader, and the leader's term serves as a definitive ordering mechanism.
 
-In the library, a term is represented as a `Long`:
+In the library, roles are modeled as an immutable Scala 3 `enum`, and every role preserves `commitIndex` monotonically across elections and step-downs:
 
 ```scala
-// From the Raft state model
-case class Follower(
-  term: Long,
-  votedFor: Option[NodeId],
-  leaderId: Option[NodeId]
-) extends NodeState
+// From raft.state.NodeState
+enum NodeState:
+  case Follower(
+    term: Long,
+    votedFor: Option[NodeId] = None,
+    leaderId: Option[NodeId] = None,
+    commitIndex: Long = 0L
+  )
+  // PreCandidate, Candidate, Leader ...
 ```
 
 The `term` and `votedFor` fields together form the **hard state** — the information that must be persisted to durable storage before responding to any RPC. If a node crashes and restarts, it must remember its current term and who it voted for to prevent voting twice in the same term.
@@ -171,7 +174,7 @@ Example 4: Candidate has higher last term
 
 **Why does term take priority over index?** Because entries from a higher term are guaranteed to be more recent than entries from a lower term. An entry at term 4, index 2 was created after every entry from terms 1–3, regardless of how many entries those earlier terms produced. The term number is the more reliable indicator of recency.
 
-> **Note — The election restriction is the linchpin of safety.** Without this check, a candidate with a stale, incomplete log could win an election and overwrite committed entries on followers — violating safety. The Raft paper dedicates an entire section (§5.4) to proving that this restriction is sufficient to ensure that every elected leader has all committed entries. Read the proof in the original paper if you want to understand this deeply — it's one of the clearest parts of the paper.
+> **Note — The election restriction is the linchpin of safety (and Raft's boldest trade-off).** Without this check, a candidate with a stale, incomplete log could win an election and overwrite committed entries on followers — violating safety. Notice how Raft differs from Multi-Paxos and Viewstamped Replication here: rather than allowing *any* node to win an election and then reconstructing missing committed entries from peers during a complex recovery phase, Raft enforces **Leader Completeness at election time** via the lexicographic total order on `LogId(term, index)`. The trade-off is minor (a lagging node simply cannot become leader), while the engineering win is enormous: once a candidate wins a majority of votes, it is *already* guaranteed to hold every committed entry, so log entries only ever flow in one direction — from leader to followers. Read §5.4 of the Raft paper and [Chapter 4](04-safety-proofs-implemented.md) to see how this single four-line comparison locks the entire safety proof into place.
 
 ### How Does an Election End?
 
@@ -222,7 +225,7 @@ Raft's core data structure is the **replicated log** — an ordered sequence of 
 
 Each entry contains three pieces of information:
 
-- **Index**: the position.in the log (1-based, monotonically increasing, with no gaps)
+- **Index**: the position in the log (1-based, monotonically increasing, with no gaps)
 - **Term**: the leader's term number when this entry was created. Don't confuse this with the term in which the entry was committed — an entry might be created by a leader in term 2 but only committed after a new leader takes over in term 3.
 - **Command**: the application data — a serialized representation of a client command (e.g., "SET x = 1" in a key-value store)
 
@@ -362,14 +365,16 @@ The state machine is the **application-specific logic** that consumes committed 
 
 The contract is simple: the state machine is a **deterministic function** of the log. Given the same sequence of entries, every state machine on every node will produce the same output state. This is the fundamental guarantee of the replicated state machine approach (Schneider, 1990 — referenced in Chapter 1).
 
-In this library, the state machine is captured by the `StateMachine` SPI (Service Provider Interface), which we'll cover in detail in Chapter 6:
+In this library, the state machine is captured by the `StateMachine` SPI (Service Provider Interface), which we'll cover in detail in [Chapter 7](07-spi-layer.md):
 
 ```scala
 trait StateMachine[F[_], R]:
   def apply(log: Log): F[R]
-  def snapshot: F[Array[Byte]]
-  def restore(data: Array[Byte]): F[Unit]
+  def snapshot: F[fs2.Stream[F, Byte]]
+  def restore(data: fs2.Stream[F, Byte]): F[Unit]
 ```
+
+Notice two intentional refinements over a textbook interface: `apply(log)` returns a typed result `F[R]` (which `RaftNode[F, R].proposeAndApply` propagates directly back to the caller as `Applied[R]`, eliminating ad-hoc mutable response maps), and `snapshot`/`restore` operate over streaming `fs2.Stream[F, Byte]` rather than contiguous heap arrays so multi-gigabyte state machines never trigger `OutOfMemoryError`.
 
 ## Heartbeats and Liveness
 
@@ -423,6 +428,19 @@ Let's trace a single client write through the entire Raft protocol to see how al
 ```
 
 If a follower is slow or its response is lost, the leader retries the `AppendEntries` in the next heartbeat cycle. If the leader crashes after step 6, the entry is safe on a majority of nodes, and the next leader will re-replicate it and complete the commit.
+
+## Hands-On Protocol Examples: Seeing Fundamentals Execute
+
+Four self-contained runnable examples in `modules/examples` let you step through every mechanism in this chapter with zero external infrastructure (no sockets, no Docker, no disk setup):
+
+| Example | Command | What It Demonstrates |
+|---------|---------|---------------------|
+| **3-Node Election** | `sbt "examples/runMain examples.cluster.ThreeNodeClusterExample"` | Pure `RaftLogic.onMessage` transitions across 3 followers (`preVoteEnabled = false`): `ElectionTimeout` → `Candidate(term=1)` → `RequestVoteRequest` broadcast → majority votes from `node-2` & `node-3` → `Leader` promotion and initial heartbeat `AppendEntriesRequest`. |
+| **Log Matching (§5.3)** | `sbt "examples/runMain examples.protocol.LogMatchingExample"` | Walks through all 4 inductive cases of `AppendEntries` validation using a pure `getTermAt: Long => Option[Long]` function: (1) empty log `prevLogIndex = 0` accepts, (2) matching `(prevLogIndex = 5, prevLogTerm = 2)` accepts and emits `AppendLogs`, (3) missing entry (`prevLogIndex = 100` vs `lastLogIndex = 50`) rejects, and (4) conflicting term at index `10` (follower term `3` vs leader term `4`) rejects to trigger leader backtracking. |
+| **Commit Tracking (§5.4.2)** | `sbt "examples/runMain examples.protocol.CommitTrackingExample"` | Initializes a 5-node leader (`nextIndex = 101`, `matchIndex = 0`), ingests heterogeneous follower progress (`100, 100, 75, 50`), computes the majority median `75` via `leader.calculateCommitIndex(clusterSize = 5, getTermAt)` (enforcing the current-term rule), broadcasts `leaderCommit = 75` on `HeartbeatTimeout`, and observes `CommitEntries(75)` on the follower. |
+| **Randomized Timers** | `sbt "examples/runMain examples.protocol.TimerServiceExample"` | Exercises `DefaultTimerService[IO]`: generates jittered election timeouts (breaking FLP symmetry), cancels an active election fiber mid-flight when a leader heartbeat arrives, and chains periodic leader heartbeat ticks. |
+
+Notice the recurring architectural theme across these examples: because `RaftLogic` is a pure function with `getTermAt` injected as a parameter, you can test all four `LogMatching` boundary cases or a 5-node commit-index median calculation in **microseconds** without booting a single server or thread.
 
 ## Summary
 

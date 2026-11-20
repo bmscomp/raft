@@ -233,6 +233,20 @@ This decomposition makes Raft dramatically easier to teach, implement, debug, an
 - **Consul** — HashiCorp's service mesh and KV store
 - **RethinkDB**, **ScyllaDB**, **Dgraph**, and many others
 
+### Why Raft's Design Succeeded: Four Structural Strengths
+
+Understandability is often mistaken for "pedagogical friendliness." In distributed systems engineering, however, understandability is a **correctness multiplier**: protocols with smaller state spaces and sharper invariants leave fewer dark corners where subtle split-brain or data-loss bugs can hide. Four deliberate design choices give Raft its enduring structural strength:
+
+1. **Strong Leadership & Unidirectional Log Flow.** Unlike symmetric protocols where any node may propose into any log slot and peers must merge divergent histories after a crash, Raft restricts data flow to a single direction: **Leader → Followers**. Followers never push entries to the leader; the leader's log is the sole source of truth for its term. This single asymmetry eliminates dueling proposers, removes post-election log-reconciliation phases, and collapses steady-state replication into one network round-trip (`AppendEntries`).
+
+2. **Contiguous, Gap-Free Logs (State-Space Reduction).** Multi-Paxos permits out-of-order slot decisions — slot `k + 1` can be chosen while slot `k` is still undecided — forcing every production engine to build complex hole-filling and out-of-order apply machinery. Raft bans log gaps altogether. By requiring every `AppendEntries` RPC to verify `(prevLogIndex, prevLogTerm)` against the follower's log, Raft turns the entire log prefix into an inductive chain that is verified in `O(1)` time per RPC.
+
+3. **Election-Time Leader Completeness (No Log-Merge Phase).** Instead of allowing any node to win an election and then running a complex recovery protocol to fetch missing committed entries from acceptors (as Paxos and Viewstamped Replication do), Raft uses the **election restriction** (§5.4.1) to guarantee that only a server already holding *every* committed entry can win a majority of votes. Recovery complexity moves out of runtime log merging and into a four-line lexicographic comparison on `(lastLogTerm, lastLogIndex)`.
+
+4. **Additive, Safety-Preserving Extensibility.** Because the core protocol decomposes cleanly into Election, Replication, and Safety, production extensions — Pre-Vote (§9.6), Leader Stickiness, `CheckQuorum`, Joint Consensus (§6), `ReadIndex` / `LeaseRead` (§6.4), Leadership Transfer (§3.10), Learners, and Witnesses — layer cleanly onto the core without weakening any of the five foundational safety proofs.
+
+> **Why this matters for this library:** Every design strength of Raft above maps directly onto an architectural choice in this Scala 3 implementation — from the zero-dependency pure Mealy machine (`ConsensusKernel` / `RaftLogic`) and lexicographic `LogId(term, index)` total order to `ProgressTracker` flow control and two-phase `Ready` / `LightReady` persistence barriers. We will trace that correspondence explicitly throughout Parts I–VIII.
+
 ## What Consensus Gives You
 
 With a correct consensus algorithm, you can build a surprisingly wide range of distributed primitives. All of them boil down to the same core idea: a group of machines agreeing on a **sequence of operations** and applying them in the same order.

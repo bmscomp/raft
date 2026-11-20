@@ -170,7 +170,15 @@ val newCommit = leader.calculateCommitIndex(clusterSize = 3, getTermAt = {
 // newCommit == 5L
 ```
 
-When `commitIndex` advances, `RaftNode` applies newly committed `Command` entries sequentially to `StateMachine.apply`, updates `lastApplied`, resolves any awaiting `proposeAndCommit` / `proposeBatchAndCommit` fibers, and wakes any `readIndex` / `leaseRead` waiters whose `readIndex <= lastApplied`.
+When `commitIndex` advances, `RaftNode[F, R]` fetches newly committed entries in a **single batched `LogStore.getRange` call** (instead of `K` individual `get` lookups), applies each `Command` entry sequentially to `StateMachine[F, R].apply`, resolves awaiting `proposeAndApply` / `proposeBatchAndApply` fibers with typed `Applied[R]` results (or `LogId` for `proposeAndCommit`), and wakes `readIndex` / `leaseRead` waiters once `lastApplied >= readIndex`.
+
+> [!TIP]
+> **Three Hidden Replication Accelerators Inside `RaftNode[F, R]`:**
+> 1. **`O(1)` `TermRingBuffer`**: Caches recent `(index -> term)` entries in a bounded ring buffer so `prevLogTerm` lookups during heartbeats, `AppendEntries`, and `ReadIndex` never trigger `O(N)` log scans.
+> 2. **Lock-Free Network Dispatch**: Pure state transitions and local WAL appends run inside `Mutex[F]` in microseconds, after which `Mutex[F]` is released **before** any `send`, `sendBatch`, or `broadcast` network RPC executes — preventing slow sockets from stalling consensus state transitions.
+> 3. **Witness Payload Stripping (`Log.stripForWitness`)**: When replicating to `NodeRole.Witness` tie-breakers, `LogType.Command` payload bytes are stripped automatically while preserving `(index, term)` metadata and `Configuration` entries.
+>
+> **See it live:** Run `sbt "examples/runMain examples.protocol.LogMatchingExample"` for all four §5.3 consistency cases and `sbt "examples/runMain examples.protocol.CommitTrackingExample"` for 5-node quorum median commit tracking.
 
 ---
 

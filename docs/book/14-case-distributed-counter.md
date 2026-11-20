@@ -90,11 +90,11 @@ class CounterStateMachine[F[_]: Sync](
   def getValue: F[Long] = counter.get
   def getHistory: F[List[String]] = history.get
 
-  def snapshot: F[Array[Byte]] =
-    counter.get.map(v => v.toString.getBytes)
+  def snapshot: F[fs2.Stream[F, Byte]] =
+    counter.get.map(v => fs2.Stream.emits(v.toString.getBytes("UTF-8")).covary[F])
 
-  def restore(data: Array[Byte]): F[Unit] =
-    counter.set(new String(data).toLong)
+  def restore(data: fs2.Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap(b => counter.set(new String(b, "UTF-8").toLong))
 ```
 
 The `history` field is not part of the replicated state — it's a debugging aid. Each node's history will contain the same entries (because the same commands are applied in the same order), making it easy to verify correctness.
@@ -155,7 +155,8 @@ class SimulatedNode[F[_]: Async](
 
       transition = RaftLogic.onMessage(
         state, msg, config, lastIdx, lastTerm, clusterSize,
-        getTermAt = idx => logs.find(_.index == idx).map(_.term)
+        getTermAt = idx => logs.find(_.index == idx).map(_.term),
+        sender    = Some(from)
       )
 
       _ <- stateRef.set(transition.state)
@@ -164,19 +165,23 @@ class SimulatedNode[F[_]: Async](
 
   private def executeEffect(from: NodeId, effect: Effect): F[Unit] =
     effect match
+      case PersistHardState(_, _) =>
+        Async[F].unit // persist atomically in production via StableStore.setHardState
+      case TruncateLog(fromIndex) =>
+        logRef.update(_.filter(_.index < fromIndex))
+      case AppendLogs(entries) =>
+        logRef.update(_ ++ entries)
       case SendMessage(to, msg) =>
         network.send(nodeId, to, msg)
       case Broadcast(msg) =>
         network.broadcast(nodeId, msg)
-      case AppendLogs(entries) =>
-        logRef.update(_ ++ entries)
       case CommitEntries(upToIndex) =>
         for
           logs  <- logRef.get
           ci    <- commitIndex.get
-          toApply = logs.filter(l => l.index > ci && l.index <= upToIndex)
+          toApply = logs.filter(l => l.index > ci && l.index <= upToIndex.value)
           _ <- toApply.traverse_(stateMachine.apply)
-          _ <- commitIndex.set(upToIndex)
+          _ <- commitIndex.set(upToIndex.value)
         yield ()
       case _ => Async[F].unit
 ```
@@ -257,10 +262,21 @@ You can also verify Raft's safety invariants:
 // 3. No committed entry is ever lost (even if a minority of nodes crash permanently)
 ```
 
-## Run the Example
+## Companion Example: Decoupling the Wire Format (`CounterWithCodecExample`)
+
+While `DistributedCounterExample` passes typed `RaftMessage` values directly over in-memory queues, real clusters serialize messages onto TCP, HTTP/2, or custom binary protocols. The companion example `examples.counter.CounterWithCodecExample` demonstrates implementing `SimpleMessageCodec[TextWireMessage]` (a custom pipe-delimited codec returning `Either[CodecError, RaftMessage]`):
+
+- Runs a two-phase Pre-Vote → Vote election and applies `Increment(10)`, `Increment(5)`, and `Decrement(3)` (converging to `12`).
+- Round-trips a `RequestVoteRequest(isPreVote = true)` through `TextMessageCodec.encode` → `TextMessageCodec.decode`, proving how `Transport.withCodec` cleanly decouples protocol logic from wire formats (whether JSON, custom text, or `raft-transport-grpc`'s binary Protobuf).
+
+## Run the Examples
 
 ```bash
-sbt "runMain examples.distributed.DistributedCounterExample"
+# Full 3-node cluster simulation (Pre-Vote + Vote + AppendEntries + Heartbeat commit -> value 11 on all 3 nodes)
+sbt "examples/runMain examples.distributed.DistributedCounterExample"
+
+# Counter StateMachine + custom SimpleMessageCodec[TextWireMessage] round-trip
+sbt "examples/runMain examples.counter.CounterWithCodecExample"
 ```
 
 ---

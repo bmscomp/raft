@@ -1,12 +1,12 @@
 # Chapter 23: Host-System Integration Blueprints
 
-*How the 6-module architecture lets you adopt only what you need — from embedding pure `raft-core` on JDK 25 Virtual Threads to assembling a full Cats Effect + FFM Mmap WAL + Netty gRPC cluster.*
+*How the 7-module architecture lets you adopt only what you need — from embedding pure `raft-core` on JDK 25 Virtual Threads to assembling a full Cats Effect + FFM Mmap WAL + Netty gRPC cluster.*
 
 ---
 
-## The 6-Module Architecture
+## The 7-Module Architecture
 
-To keep the consensus core dependency-free while offering production-ready building blocks, the repository is organized into six sbt modules:
+To keep the consensus core dependency-free while offering production-ready building blocks and end-to-end verification, the repository is organized into seven sbt modules:
 
 ```mermaid
 flowchart TD
@@ -15,7 +15,8 @@ flowchart TD
     mmap["raft-storage-mmap (JDK 22+ FFM WAL)"]
     grpc["raft-transport-grpc (ScalaPB + gRPC Netty)"]
     jepsen["raft-jepsen (Linearizability & Nemesis Suite)"]
-    examples["raft-examples (publish / skip := true, Logback)"]
+    examples["raft-examples (18 Runnable Examples, publish/skip)"]
+    itest["raft-itest (Full-Stack Multi-JVM SIGKILL + mTLS E2E)"]
 
     core --> runtime
     runtime --> mmap
@@ -23,16 +24,20 @@ flowchart TD
     runtime --> jepsen
     mmap --> examples
     grpc --> examples
+    mmap --> itest
+    grpc --> itest
+    jepsen --> itest
 ```
 
 | Module | Artifact | JDK Target | External Compile Dependencies | When to Choose |
 |--------|----------|------------|-------------------------------|----------------|
-| `modules/core` | `raft-core` | **JDK 21+** | **None (0 JARs)** | Embedding Raft inside your own actor system, Netty/Nio event loop, ZIO, Ox/Virtual Threads, or deterministic simulator |
-| `modules/runtime` | `raft-runtime` | **JDK 21+** | `cats-effect`, `fs2-core`, `fs2-io`, `log4cats-core` | Turnkey functional runtime (`RaftNode`, `MultiRaftNode`, streaming `Snapshot[F]`, `CompactionManager`) |
-| `modules/storage-mmap` | `raft-storage-mmap` | **JDK 22+/25** | `raft-runtime` (JDK `java.lang.foreign` FFM API) | Off-heap memory-mapped segmented WAL + CRC32 crash recovery |
-| `modules/transport-grpc` | `raft-transport-grpc` | **JDK 22+/25** | `grpc-netty-shaded`, `scalapb-runtime-grpc` | Persistent HTTP/2 peer channels with Protobuf framing |
+| `modules/core` | `raft-core` | **JDK 21+** | **None (0 JARs)** | Embedding Raft inside your own actor system, Netty/NIO event loop, ZIO, Ox/Virtual Threads, or deterministic simulator |
+| `modules/runtime` | `raft-runtime` | **JDK 21+** | `cats-effect`, `fs2-core`, `fs2-io`, `log4cats-core` | Turnkey functional runtime (`RaftNode[F, R]`, `MultiRaftNode`, streaming `Snapshot[F]`, `CompactionManager`) |
+| `modules/storage-mmap` | `raft-storage-mmap` | **JDK 22+/25** | `raft-runtime` (JDK `java.lang.foreign` FFM API) | Off-heap memory-mapped segmented WAL + lock-free `SegmentLease` + CRC32 crash recovery |
+| `modules/transport-grpc` | `raft-transport-grpc` | **JDK 22+/25** | `grpc-netty-shaded`, `scalapb-runtime-grpc` | Persistent HTTP/2 peer channels with Protobuf framing, `WireAck` backpressure & mTLS |
 | `modules/jepsen` | *(internal)* | JDK 25 | `raft-runtime`, `scalatest` | Wing & Gong linearizability checker + partition/crash nemesis suite |
-| `modules/examples` | *(internal)* | JDK 25 | All modules + `logback-classic` | 18 runnable end-to-end examples |
+| `modules/examples` | *(internal)* | JDK 25 | All production modules + `logback-classic` | 18 runnable end-to-end examples (including flagship `ShardedBankLedgerExample`) |
+| `modules/itest` | *(internal)* | JDK 25 | All modules | Cross-module gRPC + `MmapWalEngine` + Multi-JVM `SIGKILL -9` + mTLS + WGL suites |
 
 ---
 
@@ -58,7 +63,7 @@ Because a single Virtual Thread owns `RawNode`, all consensus mutations are seri
 
 ## Blueprint 2: Cats Effect + Custom Storage & Transport (`raft-runtime`)
 
-If your service is already built on Typelevel Cats Effect 3 and FS2, `raft-runtime` provides `RaftNode[F]` and `MultiRaftNode[F]` over clean SPIs:
+If your service is already built on Typelevel Cats Effect 3 and FS2, `raft-runtime` provides typed `RaftNode[F, R]` and `MultiRaftNode[F]` over clean SPIs:
 
 - **`LogStore[F]` & `StableStore[F]`**: Backed by RocksDB, PostgreSQL/SQLite, LMDB, or `raft-storage-mmap`.
 - **`Transport[F, Wire]`**: Backed by `raft-transport-grpc`, HTTP/2, WebSockets, or `MultiGroupTransport[F]` for multi-group multiplexing.
@@ -87,7 +92,7 @@ sequenceDiagram
     Node-->>Client: "Complete Deferred with Applied(LogId, value: R)"
 ```
 
-Key runtime invariants handled automatically by `RaftNode[F]`:
+Key runtime invariants handled automatically by `RaftNode[F, R]`:
 - **Two-Stage `ReadIndex` Barrier**: `node.readIndex` first awaits quorum heartbeat confirmation (`Effect.ReadIndexReady(id, commitIdx)`) and then suspends in `readApplyWaiters` until `lastApplied >= commitIdx`, ensuring the local `StateMachine` reflects all writes committed before the read started.
 - **Zero-RTT Monotonic `leaseRead`**: When `leaseReadEnabled = true` and `checkQuorumEnabled = true`, quorum `AppendEntriesResponse` ACKs extend a monotonic `Clock[F].monotonic` deadline by `leaderLeaseDuration`; `node.leaseRead` returns `Some(commitIndex)` locally while the lease is valid and `None` upon expiry so callers can seamlessly fall back to `node.readIndex`.
 - **Automatic Joint Consensus Finalization & Self-Removal Step-Down**: Calling `node.proposeConfChange(targetCluster)` automatically enters `C_old,new` when voter sets change, appends and commits `C_new` once `C_old,new` commits, steps down immediately if `C_new` removes the active leader from `voters`, and resolves the caller's `F[LogId]` once `C_new` is durably committed.
@@ -96,11 +101,15 @@ Key runtime invariants handled automatically by `RaftNode[F]`:
 
 ## Blueprint 3: Off-Heap Memory-Mapped WAL (`raft-storage-mmap`)
 
-`MmapWalEngine` uses JDK's Foreign Function & Memory (`java.lang.foreign.Arena` + `MemorySegment`) API for zero-copy, off-heap segmented write-ahead logging:
+`MmapWalEngine` uses JDK's Foreign Function & Memory (`java.lang.foreign.Arena` + `MemorySegment`) API for zero-GC, crash-safe off-heap segmented write-ahead logging. Five deliberate systems-engineering choices distinguish it from naive `MappedByteBuffer` WALs:
 
-- **Segmented rotation**: When an active segment (`wal-0000000001.seg`) fills past `segmentSize`, `MmapWalEngine` automatically syncs it and rotates to `wal-0000000002.seg`.
-- **Zero-copy CRC32**: Checksums are computed directly over `MemorySegment.asSlice(...).asByteBuffer()` without allocating intermediate byte arrays or sharing non-thread-safe `CRC32` instances.
-- **Compaction & crash recovery**: `discardBefore(snapshotIndex)` unmaps and deletes obsolete segment files while writing an index checkpoint; on restart, `recoverFromWal` parses actual segment IDs from filenames so compacted logs recover seamlessly from any starting segment number.
+- **Segmented Rotation & `forceRange`**: When an active `.wal` segment fills past `segmentSize`, `MmapWalEngine` syncs it and rotates to the next numbered segment; batch appends issue a single `seg.forceRange(batchStart, seg.currentWriteOffset)` `msync` over only the newly written byte range.
+- **Lock-Free Leased Reads (`SegmentLease[F]`)**: Readers (`readEntry`, `readRange`, and zero-allocation `termAt` via `MmapSegment.readTerm` at `offset + 12`) pin `Arena.ofShared()` segments in `O(1)` via `SegmentLease.withReader` **without acquiring `writeMutex`**. When compaction or truncation invokes `retire(deleteFile)`, physical `arena.close()` and `.wal` deletion defer until the last in-flight reader releases its pin — eliminating FFM use-after-free races.
+- **Pure 2-Level 64-Bit Radix `WalIndexState`**: Maps `LogIndex` (up to `Long.MaxValue`, immune to 32-bit `Int` truncation) to `(segmentId, fileOffset)` across 4,096-entry super-pages and 64-entry leaf chunks with `0` `var`s, `0` `synchronized` blocks, `O(1)` allocation-free `IArray` loads, and `768`-byte structural sharing on inserts.
+- **CRC32-First Bounds Checks & Torn-Tail `SIGKILL` Healing**: `MmapSegment.readEntry` verifies bounds, `LogType` ordinal, and CRC32 *before* allocating heap payload arrays; `openForRecovery` truncates uncommitted torn tails (`index > commitIndex`) while failing fast with `CorruptedEntryException` on mid-log or committed bit-rot.
+- **280-Byte Page-Cache-Resident `MmapHardState` + Streaming `"RSNP"` v2 Snapshots**: `hard_state.bin` zero-fills stale `votedFor` bytes, stores 8-byte-aligned `currentTerm` and `commitIndex`, verifies CRC32 on every read, and `msync`s on every write; snapshots stream directly between `fs2.Stream[F, Byte]` and `FileChannel` with header + payload CRC32 and directory `fsync`.
+
+> **Flagship Reference:** See `examples.advanced.ShardedBankLedgerExample` (`sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"`), which combines Blueprints 2, 3, and 4 into a 3-host, 12-WAL-engine, single-port gRPC Multi-Raft transactional bank ledger.
 
 ```scala
 import java.nio.file.Paths

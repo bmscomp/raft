@@ -253,7 +253,7 @@ val config = RaftConfig(
 
 ---
 
-## Optimization 7: Binary Protobuf Wire Framing, Channel Hygiene & Bounded Backpressure
+## Optimization 7: Binary Protobuf Wire Framing, Single-RPC Batching & Bounded Backpressure
 
 `raft-transport-grpc` pairs `WireEnvelope` over Netty HTTP/2 with `ProtobufMessageCodec` (`RaftWirePayload` `oneof` covering all 17 `RaftMessage` cases, including §5.3 `conflict_index` / `conflict_term` hints and §3.10 `is_transfer` flags):
 
@@ -262,21 +262,40 @@ flowchart LR
     subgraph Sender["Leader / Sender Node"]
         RM["RaftMessage / sendBatch"]
         PBC["ProtobufMessageCodec (Zero Base64)"]
-        RETRY["Bounded Retry (UNAVAILABLE Backoff)"]
-        CH["Netty ManagedChannel Pool (Evicts Removed Peers)"]
+        RETRY["Bounded Backoff (UNAVAILABLE / RESOURCE_EXHAUSTED)"]
+        CH["AtomicCell ManagedChannel Pool (Evicts Removed Peers)"]
     end
 
     subgraph Receiver["Follower / Receiver Node"]
-        SRV["Netty HTTP/2 RaftService"]
-        BQ["Bounded Queue (maxInboundQueueSize = 4096)"]
+        SRV["Netty HTTP/2 + Optional mTLS Identity Interceptor"]
+        BQ["Bounded Queue (GrpcConfig: 4096 / RaftConfig: 8192)"]
         DEC["ProtobufMessageCodec.decode"]
-        LOOP["RaftNode Consensus Loop"]
+        LOOP["RaftNode[F, R] Consensus Loop"]
     end
 
     RM --> PBC --> RETRY --> CH
-    CH -->|"WireEnvelope (HTTP/2)"| SRV
-    SRV -->|"Non-blocking tryOffer"| BQ --> DEC --> LOOP
+    CH -->|"1 WireEnvelope(payloads=[1..K])"| SRV
+    SRV -->|"Accepted -> WireAck(true) / Full -> WireAck(false)"| BQ --> DEC --> LOOP
 ```
+
+Three wire-level strengths protect throughput under burst load:
+1. **Single-RPC Batch Framing (`WireEnvelope.payloads`)**: `sendBatch` packs pipelined `AppendEntries` bursts into **one** HTTP/2 `WireEnvelope` RPC rather than `N` sequential unary calls.
+2. **Explicit Receiver Backpressure (`WireAck(accepted = false)`)**: When a follower's bounded `incomingQueue` saturates, the server responds with `WireAck(accepted = false)` instead of silently dropping frames; the sender treats this as transient `RESOURCE_EXHAUSTED` and applies bounded exponential backoff without tearing down healthy HTTP/2 channels.
+3. **Lock-Free `AtomicCell` Channel Pool**: Replaces mutable `ConcurrentHashMap` / `synchronized` blocks with pure immutable `ChannelPoolState` transitions; `updatePeers` atomically evicts and closes retired peer channels.
+
+---
+
+## Optimization 8: Lock-Free Concurrency & Pre-Persist Overlap (The Systems Engineering Edge)
+
+Most Raft throughput ceilings in real JVM services come not from the Raft algorithm itself, but from **coarse locks held across I/O** and **GC pauses caused by on-heap log buffers**. This library attacks both without touching a single safety proof:
+
+| Technique | Layer | Why It Is Unconditionally Safe |
+| :--- | :--- | :--- |
+| **Pre-Persist Leader Broadcast (§10.2.1)** | `ConsensusKernel` / `RawNode` (`Ready.messages` vs. `Ready.persistedMessages`) | A leader whose term did not change may transmit `AppendEntriesRequest` in `Ready.messages` *in parallel* with its own local WAL `fsync`, because followers persist before ACKing and `advance(rd)` only counts the leader's own `matched` index *after* local persistence completes. Any term/vote change triggers `hasUnpersistedTermOrVote`, forcing **all** RPCs into `Ready.persistedMessages`. |
+| **Network I/O Outside `Mutex[F]` + `TermRingBuffer`** | `RaftNode[F, R]` | Consensus transitions and WAL appends hold `Mutex[F]` for microseconds (with `O(1)` ring-buffer term lookups), then release the lock before dispatching any network RPC — eliminating lock-held socket stalls. |
+| **Lock-Free Leased Off-Heap Reads (`SegmentLease`)** | `MmapWalEngine` (`raft-storage-mmap`) | `readEntry`, `readRange`, and zero-allocation `termAt` pin off-heap FFM `MemorySegment`s lock-free via `SegmentLease[F].withReader` without contending with `writeMutex`, while deferred `Arena.close()` prevents use-after-free during compaction. |
+
+> **See optimizations live:** Run `sbt "examples/runMain examples.protocol.ReadIndexAndLeaseExample"` to compare `ReadIndex` vs. `LeaseRead` under live partitions, and `sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"` to see `BatchConfig`, `PipelineConfig`, `CoalescedHeartbeatConfig`, `MmapWalEngine`, and `leaseReadFromGroup` working together at full stack.
 
 ---
 

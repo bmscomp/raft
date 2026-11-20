@@ -11,7 +11,7 @@ Chapters 2 and 3 presented Raft's safety properties as formal invariants. Chapte
 This is something no other Raft resource does systematically. Most textbooks state the properties; most codebases assume them. Here, we make the connection explicit.
 
 > [!NOTE]
-> All code references point to `RaftLogic.scala`, the pure consensus core. Because the logic is free of I/O and side effects, every safety property can be verified with simple unit tests — no mock infrastructure needed.
+> All code references below point to `raft-core`'s pure consensus engines: stateless `RaftLogic.scala` (for single-step transition inspection) and the zero-`var` Mealy engine `ConsensusKernel.scala` backing `RawNode`. Because neither engine performs I/O or mutates external state, every safety property is directly verifiable in microseconds with unit tests, ScalaCheck laws, and Deterministic Simulation Testing ([Chapter 24](24-deterministic-simulation-testing.md)) — no mocks required.
 
 ---
 
@@ -165,7 +165,7 @@ test("Leader Append-Only: leader rejects AppendEntries in same term") {
   val req = AppendEntriesRequest(
     term = 5, leaderId = NodeId("imposter"),
     prevLogIndex = 0, prevLogTerm = 0,
-    entries = Seq(Log(index = 1, term = 5, data = Array.empty)),
+    entries = Seq(Log.command(index = 1, term = 5, data = Array.empty)),
     leaderCommit = 0
   )
   val transition = RaftLogic.onMessage(leader, req, config, 0, 0, 3)
@@ -475,6 +475,20 @@ In code:
 
 - **`RaftLogic.onReadIndex`**: Checks `currentTermCommitted` — requiring `getTermAt(l.commitIndex).contains(l.term)` (and rejecting `commitIndex == 0` whenever `lastLogIndex > 0`, i.e., while the leader's initial `NoOp` is still in flight).
 - **`RawNode.proposeConfChange`**: Checks `hasCommittedInCurrentTerm(l.term)` before appending `LogType.Configuration`, returning `Left(RaftError.LeaderNotReadyInTerm(l.term))` if the leader's `NoOp` has not yet committed.
+
+---
+
+## Structural Enforcement in `ConsensusKernel` & `RawNode`
+
+In production engines, bugs rarely appear in the textbook `onRequestVote` or `onAppendEntries` clauses alone; they sneak in at the seams between **persistence ordering**, **membership rollback**, **dual-quorum accounting**, and **empty-heartbeat commit clamping**. `ConsensusKernel` (`modules/core/src/main/scala/raft/kernel/ConsensusKernel.scala`) closes those four seams structurally:
+
+| Safety Seam | Raft Reference | Structural Enforcement in `raft-core` |
+|-------------|----------------|---------------------------------------|
+| **Persistence-Before-RPC** | §5.1 / §5.2 | `KernelState.hasUnpersistedTermOrVote(localId)` checks `currentHardState != lastPersistedHardState`. Whenever `term` or `votedFor` changed, `ConsensusKernel.enqueueMessage` forces **every** outbound RPC into `Ready.persistedMessages` (never `Ready.messages`), making it structurally impossible for a compliant host loop to leak a vote or higher-term reply before `fsync`. |
+| **Strict Receiver Commit Clamp** | §5.3 Rule 5 | Followers clamp `commitIndex` strictly to `min(req.leaderCommit, req.prevLogIndex + req.entries.size)` — never against unverified tail entries beyond `prevLogIndex` (preventing stale-entry commits on empty heartbeats; see [Chapter 24, Bug 1](24-deterministic-simulation-testing.md)). |
+| **Dual-Quorum Votes & Commits** | §6 Joint Consensus | `ProgressTracker.tallyVotes` requires `VoteResult.Won` in *both* `C_old` and `C_new`; `ProgressTracker.maximalCommittedIndex` computes `min(committed(C_old), committed(C_new))`, guaranteeing monotonic safety across simultaneous multi-node reconfigurations. |
+| **Configuration Truncation Rollback** | Ongaro §4.1 | Whenever a higher-term leader's `AppendEntries` truncates an uncommitted `LogType.Configuration` (`RCFG` v2 CRC32) entry, `ConsensusKernel` deterministically reconstructs the active `ClusterConfig` from the latest snapshot plus surviving log entries. |
+| **Canonical `LogId(term, index)` Total Order** | §5.4.1 | `LogId.compare` defines a verified transitive, antisymmetric total order (`term` primary, `index` tiebreaker) tested by ScalaCheck algebraic laws (`TypesAndDomainSpec`), guaranteeing acyclicity in vote comparisons. |
 
 ---
 

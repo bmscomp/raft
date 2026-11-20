@@ -73,9 +73,11 @@ Even with pre-vote, there's a subtler source of disruptive elections. Imagine a 
 
 This is especially common under heavy load, when the leader might be busy processing many client requests and its heartbeat gets slightly delayed.
 
-### The Solution: "Check Pulse" Before Voting
+### The Solution: "Check Pulse" Before Voting (and `CheckQuorum` on the Leader)
 
-Leader stickiness (also called the **CheckQuorum** optimization) adds a simple check to the vote-granting logic:
+Two complementary mechanisms protect a healthy leader from disruption — and this library configures them independently (`leaderStickinessEnabled` and `checkQuorumEnabled`):
+
+1. **Leader Stickiness (follower-side, §6):** Followers ignore `RequestVote` RPCs while they have heard from a valid leader within `electionTimeout`:
 
 ```
 Follower receives RequestVote (or pre-vote):
@@ -84,6 +86,8 @@ Follower receives RequestVote (or pre-vote):
   else:
     evaluate the vote normally
 ```
+
+2. **`CheckQuorum` (leader-side, §6.2):** The leader tracks `recentActive` per peer and periodically verifies that a voting quorum responded within the last election timeout (`ProgressTracker.quorumRecentlyActive`). If an isolated minority leader loses quorum contact, it automatically steps down to `Follower` and rejects pending client writes/reads — preventing stale-leader livelock and bounding `LeaseRead` validity.
 
 The intuition is straightforward: if the leader is alive and communicating, there's no reason to elect a new one. Only if the leader has actually stopped sending heartbeats (indicating a genuine failure) will followers grant votes.
 
@@ -143,7 +147,7 @@ Let's trace through a concrete example — adding nodes D and E to a cluster of 
 
 3. **Once C_old,new is committed**, the leader appends a second entry for the new configuration: `C_new = {A,B,C,D,E}`.
 
-4. **Once C_new is committed**, the transition is complete. The old configuration is discarded, and the cluster operates under. the new five-node configuration.
+4. **Once C_new is committed**, the transition is complete. The old configuration is discarded, and the cluster operates under the new five-node configuration.
 
 ### Safety Argument
 
@@ -380,12 +384,12 @@ Leader: → resumes normal AppendEntries from index 1001
 
 For large state machines, the snapshot data may be too large to fit in a single RPC. In such cases, the leader can send the snapshot in **chunks** (offset-based transfer), with the follower reassembling the chunks and applying the complete snapshot once all chunks arrive. The library supports this via the `PendingSnapshot` data structure (see Chapter 6).
 
-> **Note — Snapshot triggering**: The Raft paper leaves the policy for when to take snapshots up to the implementation. Common strategies include:
+> **Note — Snapshot triggering & streaming:** The Raft paper leaves the policy for when to take snapshots up to the implementation. Common strategies include:
 > - **Size-based**: snapshot when the log exceeds a threshold size (e.g., 10,000 entries)
 > - **Time-based**: snapshot at fixed intervals (e.g., every hour)
 > - **Ratio-based**: snapshot when the log is N times larger than the last snapshot
 >
-> The library provides the `StateMachine.snapshot` SPI method for applications to generate their snapshot data; the triggering policy is left to the runtime implementation.
+> In `raft-runtime`, `CompactionManager` automates this via `CompactionConfig` and `CompactionPolicy` (`CompactionPolicy.threshold[F](n)` or custom policies), streaming `"RSNP"` v2 checksummed snapshots directly between `StateMachine[F, R]` (`fs2.Stream[F, Byte]`), `SnapshotStore[F]`, and `FilePendingSnapshot` on disk so arbitrarily large state machines never materialize contiguous heap arrays.
 
 ## Non-Voting Members: Learners and Witnesses
 
@@ -414,6 +418,46 @@ For example, a two-datacenter deployment might have 2 full voters in DC-1 and 2 
 | **Witness** | ✓ | ✗ (metadata only) | ✗ | Tie-breaking in even-sized clusters |
 
 > **Note — etcd's Learner Implementation:** etcd popularized the learner concept in its Raft implementation. Before etcd 3.4, adding a new member to the cluster was risky because a slow new member could reduce availability. Since etcd 3.4, new members join as learners by default and must be explicitly promoted to voters after catching up. This pattern has been adopted by most production Raft implementations.
+
+## Why Raft's Extension Architecture Holds Together
+
+A striking quality of the eight mechanisms in this chapter — Pre-Vote, Leader Stickiness / `CheckQuorum`, Joint Consensus, `ReadIndex`, `LeaseRead`, Leadership Transfer, Snapshots, and Learners / Witnesses — is that **none of them compromises Raft's five foundational safety invariants**. Why? Because each extension operates strictly inside a well-defined seam exposed by Raft's decomposition:
+
+- **Pre-Vote (§9.6) & Leader Stickiness** only restrict *when* a node enters an election or grants a speculative vote; once a real election starts, standard term/vote/log-freshness rules govern completely.
+- **Joint Consensus (§6)** preserves the quorum intersection lemma across configuration boundaries by replacing single-majority intersection with dual-majority intersection ($Q_{\text{old}} \cap Q'_{\text{old}} \neq \emptyset$ and $Q_{\text{new}} \cap Q'_{\text{new}} \neq \emptyset$).
+- **`ReadIndex` (§6.4)** exploits the exact same quorum intersection lemma as writes: any heartbeat quorum in term $T$ overlaps with the voting quorum of any future leader in term $T' > T$, proving no higher-term leader existed when the heartbeat round began.
+- **Leadership Transfer (§3.10)** is purely a liveness optimization: `TimeoutNowRequest` simply accelerates a standard `RequestVote` election *after* catching up the target's log, while `ConsensusKernel` immediately revokes `leaseUntil = 0L` on the outgoing leader so zero-RTT lease reads can never race with the incoming leader.
+- **Witnesses** participate in voting and commit quorums while stripping `LogType.Command` payload bytes (`Log.stripForWitness`) — preserving `(index, term)` metadata and `Configuration` entries so Log Matching and Leader Completeness remain intact while `ClusterConfig.canCampaign` forbids a witness from ever running for leader.
+
+## Runnable Deep Dives: Protocol Extensions in Action
+
+Four runnable examples in `modules/examples` demonstrate these exact extensions end-to-end — and prove their subtle edge cases live:
+
+1. **Pre-Vote Term-Inflation Prevention (`examples.protocol.PreVoteExample`)**
+   ```bash
+   sbt "examples/runMain examples.protocol.PreVoteExample"
+   ```
+   Steps `RaftLogic.onMessage` through a 5-node cluster where `Follower(term = 5)` hits `ElectionTimeout`: with `preVoteEnabled = true`, it enters `PreCandidate(term = 5)` without mutating `HardState`, broadcasts `RequestVoteRequest(term = 6, isPreVote = true)`, and promotes to `Candidate(term = 6)` only after 2 peer pre-votes reach `3/5`. Step 4 then subjects an isolated follower to three consecutive timeouts — demonstrating term stability (`5 → 5 → 5`) with Pre-Vote versus destructive term inflation (`5 → 6 → 7 → 8`) without it.
+
+2. **Joint Consensus Multi-Node Migration (`examples.cluster.JointConsensusExample`)**
+   ```bash
+   sbt "examples/runMain examples.cluster.JointConsensusExample"
+   ```
+   Uses zero-dependency `RawNode` + `MemStorage` to migrate a live cluster from `{n1, n2, n3}` directly to `{n2, n3, n4, n5}` — simultaneously removing `n1` and adding `n4, n5` (a change that would risk disjoint-quorum split-brain if applied in one step). Calling `proposeConfChange(targetMembers)` enters `C_old,new` (`isInJointConsensus == true`); once dual majorities commit `C_old,new`, `ConsensusKernel` automatically appends and commits `C_new` inside `LightReady`, after which `"post-reconfig-write"` replicates and commits across the new 4-voter quorum.
+
+3. **Linearizable `ReadIndex` vs. `LeaseRead` & `CheckQuorum` (`examples.protocol.ReadIndexAndLeaseExample`)**
+   ```bash
+   sbt "examples/runMain examples.protocol.ReadIndexAndLeaseExample"
+   ```
+   Contrasts both §6.4 read paths under live network partitions in a deterministic 3-node `RawNode` cluster:
+   - With `leaseReadEnabled = false`, `readIndex("req-quorum-1")` confirms after one heartbeat RTT on a healthy cluster, while isolating the leader (`setPartition(leader1)`) immediately blocks `readIndex("req-stale-leader")` (zero stale reads).
+   - With `leaseReadEnabled = true`, `readIndex("req-lease-fast")` completes in **zero RTTs** locally while the monotonic `CheckQuorum` lease is active; advancing 22 logical ticks without quorum forces `CheckQuorum` to step `leader2` down to `Follower`.
+
+4. **Zero-Downtime Leadership Transfer (`examples.protocol.LeadershipTransferExample`)**
+   ```bash
+   sbt "examples/runMain examples.protocol.LeadershipTransferExample"
+   ```
+   Deliberately drops packets to `node-3` while `{node-1, node-2}` commit `"tx-1"` and `"tx-2"`, then reconnects `node-3` and invokes `transferLeader(node-3)`. Proves three operational behaviors in sequence: (a) proposals to the departing leader during transfer are immediately fenced (`Left(RaftError.LeadershipTransferInProgress)`), (b) `node-1` catches up `node-3`'s lagging log and emits `TimeoutNowRequest`, and (c) `node-3` wins leadership in **zero election-timeout ticks**.
 
 ## Summary
 

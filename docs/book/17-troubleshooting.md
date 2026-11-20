@@ -76,10 +76,12 @@ transition.effects.foreach { effect =>
 // followers aren't responding — check network connectivity.
 
 // Check 3: Is matchIndex advancing?
-leader match
-  case Leader(term, matchIndex) =>
-    logger.info(s"matchIndex: $matchIndex")
-    // If matchIndex values are not advancing, followers are rejecting entries
+state match
+  case l: NodeState.Leader =>
+    logger.info(s"term=${l.term}, commitIndex=${l.commitIndex}, matchIndex=${l.matchIndex}")
+    // If matchIndex values are not advancing, followers are rejecting entries or unreachable
+  case other =>
+    logger.info(s"Not leader: $other")
 ```
 
 ---
@@ -96,19 +98,19 @@ This should **not** happen with a correct Raft implementation. If it does, the m
 
 1. **Persistence failures** — the `StableStore` is not actually durable. If a node crashes and loses its `term` and `votedFor`, it can vote twice in the same term, potentially electing two leaders.
 
-2. **Clock-based lease reads with excessive clock skew** — if you're using lease-based reads (see [Chapter 3](03-raft-advanced-theory.md)) and the clock skew exceeds your `maxClockSkew` setting, a deposed leader can serve stale reads during its (incorrectly) extended lease.
+2. **Clock-based lease reads with excessive clock drift** — if `leaseReadEnabled = true` and monotonic clock drift exceeds `electionTimeoutMin - leaderLeaseDuration`, a deposed leader can serve stale reads briefly before its lease expires.
 
-3. **Bug in the effect interpreter** — if `PersistHardState` effects are not executed before responding to RPCs (i.e., the persist is async but the response is sent immediately), safety invariants can be violated.
+3. **Bug in a custom effect interpreter or `Ready` loop** — if `PersistHardState` (or `Ready.entries` + `Ready.hardState`) is not durably flushed before transmitting `SendMessage` / `Ready.persistedMessages`, safety invariants can be violated.
 
 ### The Fix
 
 > [!CAUTION]
 > Split-brain is a **data safety issue**. If you see it, stop and investigate before allowing further writes.
 
-- Verify your `StableStore` persists to durable storage and survives process restarts
-- Verify `PersistHardState` effects are awaited before sending any responses
-- If using lease reads, increase `maxClockSkew` margin or switch to ReadIndex
-- Run the library's property-based safety tests to verify your integration (see [Chapter 19](19-property-based-testing.md))
+- Verify your `StableStore` implements atomic `setHardState(term, votedFor)` with `msync`/`fsync` (as in `MmapHardState`)
+- Verify `Ready.persistedMessages` (or `PersistHardState` effects) always wait for durable WAL flush before network send
+- If using lease reads, widen the `electionTimeoutMin - leaderLeaseDuration` margin or switch to clock-free `readIndex`
+- Run the library's ScalaCheck property suites ([Chapter 19](19-property-based-testing.md)) and seeded DST ([Chapter 24](24-deterministic-simulation-testing.md)) to verify your integration
 
 ---
 
@@ -132,14 +134,19 @@ Implement **log compaction** via snapshots:
 4. When a follower is too far behind, send the snapshot via `InstallSnapshot` instead of replaying the entire log
 
 ```scala
-// Snapshot trigger: compact when log exceeds threshold
-if logStore.lastIndex - logStore.firstIndex > snapshotThreshold then
-  val snapshot = stateMachine.snapshot()
-  snapshotStore.save(snapshot, commitIndex)
-  logStore.truncateBefore(commitIndex)
+// Configure automatic compaction in RaftConfig (handled by CompactionManager in raft-runtime)
+val config = RaftConfig(
+  localId = n1,
+  compaction = CompactionConfig(
+    level             = CompactionLevel.Custom,
+    snapshotChunkSize = 64 * 1024,
+    retainedEntries   = 250L, // keep a small tail so slightly lagging peers avoid full snapshots
+    policy            = Some(CompactionPolicy.threshold[IO](10_000L))
+  )
+)
 ```
 
-A common compaction strategy is to snapshot every N committed entries (e.g., every 10,000) or when the log exceeds a size threshold.
+In `raft-storage-mmap`, `CompactionManager` streams the `"RSNP"` v2 snapshot to `StorageBackedSnapshotStore`, `fsync`s the snapshot file and `snapshots/` directory, and calls `logStore.discardBefore(LogIndex.unsafeFrom(compactIdx))` to retire and delete obsolete `.wal` segments safely via `SegmentLease`.
 
 ---
 
@@ -201,6 +208,20 @@ val newConfig = clusterConfig.beginJointConsensus(
 See [Chapter 3](03-raft-advanced-theory.md) for learner semantics and [Chapter 9](09-log-replication-practice.md) for parallel replication.
 
 ---
+
+## Reading Library Telemetry & Typed `RaftError` Signals
+
+Modern production debugging starts with the structured counters and typed errors already built into the library:
+
+| Signal / Error | Source | Root Cause & Action |
+|----------------|--------|---------------------|
+| `RaftError.NotLeader(Some(hint))` | `RaftNode` / `RawNode` | Normal redirection; update client leader cache to `hint` and retry. |
+| `RaftError.LeaderNotReadyInTerm(term)` | `proposeConfChange` / `readIndex` | Newly elected leader has not yet committed its initial `NoOp` (§5.4.2 / §4.1); retry after one RTT. |
+| `RaftError.LeadershipTransferInProgress(t)` | `propose` | Leader is draining to `t` (§3.10); back off briefly and route to `t`. |
+| `RaftError.StorageCorruption(reason)` | `MmapHardState` / `CorruptedEntryException` | Committed WAL or `hard_state.bin` CRC32 bit-rot detected; quarantine host disk and replace replica via Learner + snapshot catch-up. |
+| `GrpcTransportStats.backpressureRetries` rising | `grpcTransport.transportStats` | Follower `maxInboundQueueSize` saturated (`WireAck(accepted = false)`); inspect slow `StateMachine.apply` or WAL disk latency. |
+| `GrpcTransportStats.rejectedSpoofedEnvelopes > 0` | `grpcTransport.transportStats` | mTLS `verifyPeerIdentity` rejected a mismatched `WireEnvelope.sender_id` (`PERMISSION_DENIED`); inspect PKI `CN` / SAN / SPIFFE certificates. |
+| `CoalescerStats.droppedUnknownGroupEnvelopes > 0` | `multiGroupTransport.coalescerStats` | Stale shard routing or partially removed Multi-Raft group; verify group membership across all hosts. |
 
 ## Diagnostic Checklist
 

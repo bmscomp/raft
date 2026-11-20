@@ -143,6 +143,17 @@ flowchart LR
 
 ---
 
+## Walkthrough: `DeterministicSimulationExample` in 200 Lines of Pure Scala
+
+If you want to study DST without wading through a full test framework, `examples.simulation.DeterministicSimulationExample` packs a complete FoundationDB/TigerBeetle-style 5-node chaos simulator into ~200 lines of zero-dependency Scala (`raft-core` only):
+
+1. **Deterministic Seeded PRNG & Discrete-Event Queue**: Uses a self-contained Xorshift64 PRNG seeded from `seed = 20261115L` and an `inFlight` buffer of `Envelope(deliverAt, seq, from, to, msg)` frames — delivering packets in deterministic `(deliverAt, seq)` order with random 1–3 tick delays and 10% packet loss during the chaotic phase (`steps 1..200`).
+2. **Adversarial Fault Injection**: Every 45 steps it toggles a symmetric partition isolating random nodes; every 70 steps it **crashes and reboots a random replica** by wiping its in-memory `RawNode` and `applied` state and reconstructing a fresh `RawNode` strictly from durable `MemStorage`.
+3. **Continuous Safety Oracle (`checkInvariants`)**: After *every single step*, asserts both **Election Safety** (recording `leadersByTerm(t)` and throwing on any split-brain) and **State Machine Safety** (verifying every applied `(index, term, label)` tuple matches identically across all 5 replicas).
+4. **Bit-for-Bit Reproducibility Proof**: Executes `runSimulation(seed = 20261115L, steps = 300)` **twice** back-to-back and asserts `require(run1 == run2)` — proving zero hidden thread, clock, or RNG leakage inside `ConsensusKernel` / `RawNode`.
+
+---
+
 ## Running DST Locally and in CI
 
 - **Fast PR gate** (~1s):

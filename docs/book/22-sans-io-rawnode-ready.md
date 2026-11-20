@@ -143,7 +143,7 @@ if rawNode.hasReady then
 
   // 4. Apply committed entries in order, then serve linearizable ReadStates
   rd.committedEntries.foreach { entry =>
-    if entry.logType == LogType.Command then stateMachine.apply(entry.data)
+    if entry.logType == LogType.Command then stateMachine.apply(entry.payload)
   }
   rd.readStates.foreach(serveReadState)
 
@@ -152,7 +152,7 @@ if rawNode.hasReady then
   light.commitIndex.foreach(wal.updateCommitIndex)
   sendOverNetwork(light.messages)
   light.committedEntries.foreach { entry =>
-    if entry.logType == LogType.Command then stateMachine.apply(entry.data)
+    if entry.logType == LogType.Command then stateMachine.apply(entry.payload)
   }
 ```
 
@@ -164,21 +164,46 @@ When a leader persists its own `Ready.entries` and calls `rawNode.advance(rd)`, 
 
 ---
 
+## Inside `ConsensusKernel`: The Zero-`var` Mealy Engine Behind `RawNode`
+
+`RawNode` itself is only ~120 lines — an `AtomicReference[KernelState]` cursor delegating 100% of protocol transitions to `raft.kernel.ConsensusKernel`. Understanding `KernelState` reveals why this design is unusually resilient:
+
+- **Composite Log View (`UnstableLog` + `RaftStorage`)**: `UnstableLog(truncateFrom, entries, pendingSnapshot)` buffers unpersisted deltas purely in memory. `ConsensusKernel.termAt`, `lastLogIndex`, and `entriesBetween` layer `UnstableLog` seamlessly over read-only `RaftStorage` without ever mutating storage before the host calls `persistReady(rd)`.
+- **Pure SplitMix64 Election Jitter (`prngState: Long`)**: Every randomized election timeout in `[electionTimeoutTicks, 2 * electionTimeoutTicks)` is computed purely from `prngState` via `ConsensusKernel.nextRandomizedTimeout` — eliminating hidden `java.util.Random` / `System.nanoTime()` calls so identical `(KernelState, input)` sequences are bit-for-bit identical across machines and JVMs.
+- **Direct Functional Embedding**: Host systems built on Cats Effect `AtomicCell`, ZIO `Ref`, or pure functional actors can even call `ConsensusKernel` directly without `RawNode`'s `AtomicReference` wrapper.
+
+---
+
 ## Self-Describing Snapshot Envelopes (`RSNP`) in `RawNode`
 
-When a follower lags behind `storage.firstIndex`, a Sans-I/O leader must transmit **both** the compacted `ClusterConfig` (voters, learners, witnesses) **and** the serialized state-machine snapshot bytes inside `InstallSnapshotRequest.data`.
+When a follower lags behind `storage.firstIndex`, a Sans-I/O leader must transmit **both** the compacted `ClusterConfig` (voters, learners, witnesses) **and** the serialized state-machine snapshot bytes inside `InstallSnapshotRequest.payload` (`Bytes`).
 
-`SnapshotMetadata` provides a zero-dependency binary envelope (`magic = "RSNP"`, version `1`) with structural byte-array equality:
+`SnapshotMetadata` provides a zero-dependency binary envelope (`magic = "RSNP"`, version `1` for in-memory `RawNode` frames via `encodePayloadBytes`/`decodePayloadBytes`, and version `2` streaming headers via `encodeStreamingHeader` for `raft-runtime` / `MmapWalEngine` disk streams):
 
 ```mermaid
 flowchart LR
-    SM["Leader SnapshotMetadata (config + data)"] --> ENC["SnapshotMetadata.encodePayload"]
+    SM["Leader SnapshotMetadata (config + payload: Bytes)"] --> ENC["SnapshotMetadata.encodePayloadBytes"]
     ENC --> WIRE["InstallSnapshotRequest (RSNP Header + Config + State Bytes)"]
-    WIRE --> DEC["SnapshotMetadata.decodePayload"]
+    WIRE --> DEC["SnapshotMetadata.decodePayloadBytes"]
     DEC --> RD["Follower Ready.snapshot (ClusterConfig + State Bytes)"]
 ```
 
-On receipt, `RawNode` decodes the envelope, updates its `ProgressTracker` membership immediately if `config` is present, and surfaces the complete `SnapshotMetadata(lastIncludedIndex, lastIncludedTerm, config, data)` in `Ready.snapshot` so the host loop can atomically restore its state machine and truncate obsolete WAL entries.
+On receipt, `ConsensusKernel` decodes the envelope, updates its `ProgressTracker` membership immediately if `config` is present, and surfaces the complete `SnapshotMetadata(lastIncludedIndex, lastIncludedTerm, config, payload)` in `Ready.snapshot` so the host loop can atomically restore its state machine and truncate obsolete WAL entries.
+
+---
+
+## Runnable Walkthrough: `RawNodeHostLoopExample` (JDK 25 Virtual Threads)
+
+Run the standalone zero-Cats-Effect Sans-I/O cluster demo:
+
+```bash
+sbt "examples/runMain examples.rawnode.RawNodeHostLoopExample"
+```
+
+`RawNodeHostLoopExample.scala` (204 lines) imports **only** `raft-core` and standard `java.util.concurrent`:
+1. Spawns 3 `VirtualThreadReplica` actors via `Executors.newVirtualThreadPerTaskExecutor()`, each owning a `LinkedBlockingQueue[HostEvent]` (`Tick`, `Inbound(from, msg)`, `Propose(bytes, reply)`, `Stop`) and a `RawNode(config, MemStorage)`.
+2. Drives logical time cleanly with `inbox.poll(20, TimeUnit.MILLISECONDS)` — calling `raw.tick()` on poll timeout and `raw.step(from, msg)` on inbound delivery, with zero OS timer threads or mutex locks.
+3. Executes the canonical 5-step `drainReadyCycle()` (`softState` → `dispatch(rd.messages)` → `storage.persistReady(rd)` → `dispatch(rd.persistedMessages)` → `applyEntries(rd.committedEntries)` → `raw.advance(rd)` → `LightReady`), proving how cleanly `raft-core` embeds inside any host concurrency model.
 
 ---
 
@@ -186,8 +211,9 @@ On receipt, `RawNode` decodes the envelope, updates its `ProgressTracker` member
 
 | Component | Role | Inspiration |
 |-----------|------|-------------|
-| `RawNode` | Single-threaded deterministic consensus driver (`tick`, `step`, `propose`, `readIndex`, `transferLeader`, `proposeConfChange`) | `tikv/raft-rs` `RawNode` |
-| `Ready` | Point-in-time batch separating `messages` (pre-sync) from `persistedMessages` (post-sync) | `etcd/raft` & `tikv/raft-rs` `Ready` |
+| `ConsensusKernel` | 100% pure, `0`-`var` Mealy consensus engine (`KernelState`, `UnstableLog`, SplitMix64 PRNG) | Functional Mealy machines & TLA+ actions |
+| `RawNode` | Thin cursor over `ConsensusKernel` (`tick`, `step`, `proposeBytes`, `proposeBatchBytes`, `readIndex`, `transferLeader`, `proposeConfChange`) | `tikv/raft-rs` `RawNode` |
+| `Ready` | Point-in-time batch separating `messages` (pre-sync) from `persistedMessages` (post-sync via `hasUnpersistedTermOrVote`) | `etcd/raft` & `tikv/raft-rs` `Ready` |
 | `LightReady` | Immediate post-persistence commit & broadcast follow-up returned by `advance(rd)` | `tikv/raft-rs` `LightReady` |
 | `ProgressTracker` | `Probe` / `Replicate` / `Snapshot` per-peer state + `Inflights` + Joint Consensus dual quorum | `tikv/raft-rs` `ProgressTracker` |
 
