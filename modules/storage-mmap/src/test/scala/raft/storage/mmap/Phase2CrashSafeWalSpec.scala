@@ -377,5 +377,34 @@ class Phase2CrashSafeWalSpec
             RaftError.StorageCorruption
           ]
       }
+
+      "should preserve retained active/sealed segments on discardBefore after clearLog or non-1 starting index" in {
+        for
+          tmpDir <- IO(Files.createTempDirectory("raft-wal-discard-offset-"))
+          engine <- MmapWalEngine.open[IO](tmpDir, segmentSize = 4096L)
+          _ <- engine.clearLog
+          // Append entries starting at index 16 (not 1!) up to 31
+          _ <- engine.appendEntries(
+            (16L to 31L).map(i =>
+              Log.command(i, 3L, s"k-$i".getBytes(StandardCharsets.UTF_8))
+            )
+          )
+          // Discard before 30 -> entries 30 and 31 MUST remain readable!
+          _ <- engine.discardBefore(LogIndex.unsafeFrom(30L))
+          _ <- engine.appendEntries(
+            (32L to 42L).map(i =>
+              Log.command(i, 3L, s"k-$i".getBytes(StandardCharsets.UTF_8))
+            )
+          )
+          range <- engine.readRange(
+            LogIndex.unsafeFrom(31L),
+            LogIndex.unsafeFrom(42L)
+          )
+          _ <- engine.close
+          _ <- IO(deleteRecursive(tmpDir))
+        yield
+          range.map(_.index) shouldBe (31L to 42L).toVector
+          range.head.payload.utf8String shouldBe "k-31"
+      }
     }
   }

@@ -13,26 +13,18 @@ Traditional:   Library ──depends on──→ gRPC, RocksDB, etc.
 SPI approach:  Library ──depends on──→ abstract traits ←──implemented by── You
 ```
 
-There are five SPIs in this library:
+There are five SPIs in this library, wired together by typed `RaftNode[F, R]`:
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                     RaftNode[F]                          │
-│                                                          │
-│    RaftLogic (Pure) ────→ Effects ────→ SPI Calls        │
-│                                                          │
-├───────────────┬──────────────┬────────────┬──────────────┤
-│  Transport    │   LogStore   │StableStore │ StateMachine │
-│               │              │            │              │
-│  send()       │  append()    │ setTerm()  │ apply()      │
-│  broadcast()  │  get()       │ setVote()  │ snapshot()   │
-│  sendBatch()  │  truncate()  │ getTerm()  │ restore()    │
-│  receive      │  getRange()  │ getVote()  │              │
-├───────────────┴──────────────┴────────────┴──────────────┤
-│                     TimerService                         │
-│  resetElectionTimer  · resetHeartbeatTimer  · cancelAll  │
-│  electionTimeouts (stream)  · heartbeatTicks (stream)    │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    RN["Typed RaftNode[F, R] (proposeAndApply -> F[Applied[R]])"]
+    LOGIC["Pure Consensus Core (RaftLogic + TermRingBuffer)"]
+    RN --> LOGIC
+    RN --> TP["Transport[F, Wire] (send / sendBatch / broadcast outside Mutex)"]
+    RN --> LS["LogStore[F] (batched getRange + O(1) termAt)"]
+    RN --> SS["StableStore[F] (atomic setHardState)"]
+    RN --> SM["StateMachine[F, R] (typed apply: Log => F[R] + streaming snapshot/restore)"]
+    RN --> TS["TimerService[F] (supervised election & heartbeat timers)"]
 ```
 
 Each SPI is parameterized by `F[_]`, the effect type from Cats Effect (typically `IO`). This means SPI implementations can express asynchronous, concurrent, and potentially failing operations in a type-safe way.

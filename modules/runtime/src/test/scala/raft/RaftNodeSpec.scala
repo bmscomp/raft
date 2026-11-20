@@ -61,10 +61,10 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
 
     def currentMap: IO[Map[String, String]] = ref.get
 
-  private def awaitLeader(
-      nodes: List[(NodeId, RaftNode[IO])],
+  private def awaitLeader[R](
+      nodes: List[(NodeId, RaftNode[IO, R])],
       retries: Int = 300
-  ): IO[(NodeId, RaftNode[IO])] =
+  ): IO[(NodeId, RaftNode[IO, R])] =
     nodes
       .traverse { case (id, n) => n.getState.map(st => (id, n, st)) }
       .flatMap { states =>

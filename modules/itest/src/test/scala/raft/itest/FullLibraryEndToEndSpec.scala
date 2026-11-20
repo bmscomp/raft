@@ -190,7 +190,7 @@ class FullLibraryEndToEndSpec extends AnyFlatSpec with Matchers:
       port: Int,
       address: String,
       grpc: GrpcTransport[IO],
-      raftNode: RaftNode[IO],
+      raftNode: RaftNode[IO, E2ECmdResult],
       sm: CasKvStateMachine,
       metrics: RecordingRaftMetrics
   )

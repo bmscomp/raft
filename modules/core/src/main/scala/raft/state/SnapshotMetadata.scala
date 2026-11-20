@@ -33,8 +33,9 @@ final case class SnapshotMetadata(
   def typedTerm: Term = Term.unsafeFrom(lastIncludedTerm)
 
 object SnapshotMetadata:
-  private val EnvelopeMagic: Int = 0x52534e50 // "RSNP"
-  private val EnvelopeVersion: Byte = 1
+  private[state] val EnvelopeMagic: Int = 0x52534e50 // "RSNP"
+  private[state] val EnvelopeVersion: Byte = 1
+  private[state] val StreamingEnvelopeVersion: Byte = 2
 
   /** Construct [[SnapshotMetadata]] from an `Array[Byte]` (defensively copied).
     */
@@ -105,17 +106,44 @@ object SnapshotMetadata:
   ): Array[Byte] =
     encodePayloadBytes(config, Bytes.copyFrom(data)).toArray
 
-  /** Decode a wire [[Bytes]] payload produced by [[encodePayloadBytes]],
-    * falling back gracefully to legacy raw `ClusterConfig` or raw state-machine
-    * bytes.
+  /** Encode a length-free `"RSNP"` v2 streaming header (`10 + cfgBytes.length`
+    * bytes) that can be prepended directly in front of a lazy snapshot byte
+    * stream without materializing the snapshot payload in memory.
+    */
+  def encodeStreamingHeader(config: Option[ClusterConfig]): Bytes =
+    val cfgBytes = config.map(ClusterConfig.encodeBytes).getOrElse(Bytes.empty)
+    val buf = ByteBuffer.allocate(4 + 1 + 1 + 4 + cfgBytes.length)
+    val _ = buf.putInt(EnvelopeMagic)
+    val _ = buf.put(StreamingEnvelopeVersion)
+    val _ = buf.put(if config.isDefined then 1.toByte else 0.toByte)
+    val _ = buf.putInt(cfgBytes.length)
+    cfgBytes.putInto(buf)
+    Bytes.unsafeWrap(buf.array())
+
+  /** Decode a wire [[Bytes]] payload produced by [[encodePayloadBytes]] or
+    * [[encodeStreamingHeader]], falling back gracefully to legacy raw
+    * `ClusterConfig` or raw state-machine bytes.
     */
   def decodePayloadBytes(wire: Bytes): (Option[ClusterConfig], Bytes) =
     if wire.isEmpty then (None, Bytes.empty)
-    else if wire.length >= 14 then
+    else if wire.length >= 10 then
       val buf = wire.asReadOnlyByteBuffer
       val magic = buf.getInt()
       val version = buf.get()
-      if magic == EnvelopeMagic && version == EnvelopeVersion then
+      if magic == EnvelopeMagic && version == StreamingEnvelopeVersion then
+        val hasCfg = buf.get() != 0
+        val cfgLen = buf.getInt()
+        if cfgLen >= 0 && cfgLen <= buf.remaining() then
+          val cfgSlice = wire.slice(buf.position(), buf.position() + cfgLen)
+          val dataStart = buf.position() + cfgLen
+          val dataSlice = wire.slice(dataStart, wire.length)
+          val cfgOpt =
+            if hasCfg then ClusterConfig.decodeBytes(cfgSlice).toOption
+            else None
+          (cfgOpt, dataSlice)
+        else fallbackDecodeBytes(wire)
+      else if magic == EnvelopeMagic && version == EnvelopeVersion && wire.length >= 14
+      then
         val hasCfg = buf.get() != 0
         val cfgLen = buf.getInt()
         if cfgLen >= 0 && cfgLen <= buf.remaining() - 4 then
