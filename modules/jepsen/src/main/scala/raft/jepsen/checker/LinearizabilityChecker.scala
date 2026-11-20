@@ -129,37 +129,59 @@ object LinearizabilityChecker:
       Entry(inv, comp, inv.timestamp, comp.map(_.timestamp))
     }.toArray
 
+    val definiteMask = scala.collection.immutable.BitSet.fromSpecific(
+      entries.indices.filter(i => entries(i).comp.isDefined)
+    )
+    val initialMask = scala.collection.immutable.BitSet.fromSpecific(
+      entries.indices
+    )
+    // Gavin Lowe (2017) WGL state-space memoization: `(remainingMask, modelState)`
+    // uniquely determines subproblem satisfiability, avoiding O(k!) duplicate
+    // exploration across concurrent / indeterminate (Info) operations.
+    val deadStates =
+      scala.collection.mutable.HashSet
+        .empty[(scala.collection.immutable.BitSet, model.State, Boolean)]
+    var timedOut = false
+
     // DFS: try to linearize all definite entries (using indeterminate Info mutations only if/when needed)
     def dfs(
-        remaining: Array[Entry],
+        remainingMask: scala.collection.immutable.BitSet,
         modelState: model.State,
-        linearized: Vector[Operation]
+        linearized: Vector[Operation],
+        lastWasInfoWrite: Boolean
     ): Option[Vector[Operation]] =
-      if System.currentTimeMillis() > deadline then return None
-      if remaining.isEmpty || remaining.forall(_.comp.isEmpty) then
-        return Some(linearized)
+      if timedOut || System.currentTimeMillis() > deadline then
+        timedOut = true
+        return None
+      if (remainingMask & definiteMask).isEmpty then return Some(linearized)
+      if deadStates.contains((remainingMask, modelState, lastWasInfoWrite)) then
+        return None
 
       explored += 1
 
-      // An entry can be linearized next if no un-linearized definite entry
-      // has a completion time strictly before this entry's invocation time
-      // (real-time precedence constraint)
-      val rawCandidates = remaining.indices.filter { i =>
-        val candidate = remaining(i)
-        remaining.indices.forall { j =>
-          if i == j then true
-          else
-            val other = remaining(j)
-            other.compTime.forall(_ >= candidate.invTime)
-        }
+      // An entry can be linearized next iff its invocation time is <= the minimum
+      // completion time among all remaining definite operations (O(N) vs O(N^2)).
+      var minComp = Long.MaxValue
+      (remainingMask & definiteMask).foreach { j =>
+        val ct = entries(j).compTime.get
+        if ct < minComp then minComp = ct
       }
-      val (definiteCands, infoCands) =
-        rawCandidates.partition(i => remaining(i).comp.isDefined)
+      val rawCandidates = remainingMask.toVector.filter { i =>
+        entries(i).invTime <= minComp
+      }
+      val (definiteCands, infoCands0) =
+        rawCandidates.partition(i => entries(i).comp.isDefined)
+      // Two back-to-back indeterminate (Info) blind Writes on the same key with
+      // no intervening definite operation are observationally redundant because
+      // the second Write immediately overwrites the first.
+      val infoCands =
+        if !lastWasInfoWrite then infoCands0
+        else infoCands0.filter(i => entries(i).inv.function != OpFunction.Write)
       val candidates = definiteCands ++ infoCands
 
-      candidates.iterator
+      val found = candidates.iterator
         .map { idx =>
-          val entry = remaining(idx)
+          val entry = entries(idx)
           val (newState, expectedOutput) = model.step(
             modelState,
             entry.inv.function,
@@ -174,16 +196,24 @@ object LinearizabilityChecker:
             case Some(comp) => model.matches(expectedOutput, comp.outputValue)
 
           if worthwhile && outputMatches then
-            val newRemaining = remaining.indices
-              .filter(_ != idx)
-              .map(remaining)
-              .toArray
-            dfs(newRemaining, newState, linearized :+ entry.inv)
+            val isInfoWrite =
+              entry.comp.isEmpty && entry.inv.function == OpFunction.Write
+            dfs(
+              remainingMask - idx,
+              newState,
+              linearized :+ entry.inv,
+              isInfoWrite
+            )
           else None
         }
         .collectFirst { case Some(witness) => witness }
 
-    val result = dfs(entries, model.init, Vector.empty)
+      if found.isEmpty && !timedOut then
+        val _ = deadStates.add((remainingMask, modelState, lastWasInfoWrite))
+      found
+
+    val result =
+      dfs(initialMask, model.init, Vector.empty, lastWasInfoWrite = false)
     val elapsed = System.currentTimeMillis() - startTime
 
     result match

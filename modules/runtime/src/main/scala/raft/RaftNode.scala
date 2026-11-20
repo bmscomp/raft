@@ -270,6 +270,7 @@ object RaftNode:
             Vector[(Long, Deferred[F, Either[RaftError, Long]])]
           ](Vector.empty)
           leaseUntilRef <- Ref.of[F, FiniteDuration](Duration.Zero)
+          peerLastAckRef <- Ref.of[F, Map[NodeId, FiniteDuration]](Map.empty)
           snapshotInFlightRef <- Ref.of[F, Set[NodeId]](Set.empty)
           proposalQueue <- Queue.bounded[F, QueuedProposal[F, R]](
             config.maxPendingProposals
@@ -352,6 +353,7 @@ object RaftNode:
           pendingReadsRef = pendingReadsRef,
           readApplyWaitersRef = readApplyWaitersRef,
           leaseUntilRef = leaseUntilRef,
+          peerLastAckRef = peerLastAckRef,
           stickinessUntilRef = stickinessUntilRef,
           snapshotInFlightRef = snapshotInFlightRef,
           peerMailboxesCell = peerMailboxesCell,
@@ -436,6 +438,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
       Vector[(Long, Deferred[F, Either[RaftError, Long]])]
     ],
     leaseUntilRef: Ref[F, FiniteDuration],
+    peerLastAckRef: Ref[F, Map[NodeId, FiniteDuration]],
     stickinessUntilRef: Ref[F, FiniteDuration],
     snapshotInFlightRef: Ref[F, Set[NodeId]],
     peerMailboxesCell: AtomicCell[
@@ -471,6 +474,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
       _ <- peerProgressRef.set(Map.empty)
       _ <- shutdownRef.set(false)
       _ <- leaseUntilRef.set(Duration.Zero)
+      _ <- peerLastAckRef.set(Map.empty)
       _ <- stickinessUntilRef.set(Duration.Zero)
       _ <- logger.info(s"Starting RAFT node ${config.localId.value}")
       hs <- stableStore.hardState
@@ -850,6 +854,11 @@ private final class RaftNodeImpl[F[_]: Async, R](
       mutex.lock
         .surround {
           for
+            stopped <- shutdownRef.get
+            _ <-
+              if stopped then
+                F.raiseError(RaftError.ProposalDropped("Node is shut down"))
+              else F.unit
             seq <- readSeqRef.updateAndGet(_ + 1L)
             reqId = s"${config.localId.value}-read-$seq"
             waiter <- Deferred[F, Either[RaftError, Long]]
@@ -869,39 +878,49 @@ private final class RaftNodeImpl[F[_]: Async, R](
     F.uncancelable { poll =>
       mutex.lock
         .surround {
-          stateRef.get.flatMap {
-            case l: Leader =>
-              if !config.leaseReadEnabled then F.pure(None)
-              else
-                for
-                  readyInTerm <- hasCommittedInCurrentTerm(l)
-                  cluster <- clusterRef.get
-                  now <- Clock[F].monotonic
-                  leaseUntil <- leaseUntilRef.get
-                  singleVoter = cluster.hasQuorum(Set(config.localId))
-                  leaseValid = readyInTerm && (singleVoter || now < leaseUntil)
-                  action <-
-                    if !leaseValid then F.pure(None)
-                    else
-                      lastAppliedRef.get.flatMap { applied =>
-                        if applied >= l.commitIndex then
-                          F.pure(
-                            Some(Left(l.commitIndex)): Option[
-                              Either[Long, Deferred[F, Either[RaftError, Long]]]
-                            ]
-                          )
+          shutdownRef.get.flatMap {
+            case true =>
+              F.raiseError(RaftError.ProposalDropped("Node is shut down"))
+            case false =>
+              stateRef.get.flatMap {
+                case l: Leader =>
+                  if !config.leaseReadEnabled then F.pure(None)
+                  else
+                    for
+                      readyInTerm <- hasCommittedInCurrentTerm(l)
+                      cluster <- clusterRef.get
+                      now <- Clock[F].monotonic
+                      leaseUntil <- leaseUntilRef.get
+                      singleVoter = cluster.hasQuorum(Set(config.localId))
+                      leaseValid =
+                        readyInTerm && (singleVoter || now < leaseUntil)
+                      action <-
+                        if !leaseValid then F.pure(None)
                         else
-                          Deferred[F, Either[RaftError, Long]].flatMap { d =>
-                            readApplyWaitersRef
-                              .update(_ :+ (l.commitIndex -> d))
-                              .as(Some(Right(d)))
+                          lastAppliedRef.get.flatMap { applied =>
+                            if applied >= l.commitIndex then
+                              F.pure(
+                                Some(Left(l.commitIndex)): Option[
+                                  Either[
+                                    Long,
+                                    Deferred[F, Either[RaftError, Long]]
+                                  ]
+                                ]
+                              )
+                            else
+                              Deferred[F, Either[RaftError, Long]].flatMap {
+                                d =>
+                                  readApplyWaitersRef
+                                    .update(_ :+ (l.commitIndex -> d))
+                                    .as(Some(Right(d)))
+                              }
                           }
-                      }
-                yield action
-            case f: Follower =>
-              F.raiseError(RaftError.NotLeader(f.leaderId))
-            case _: Candidate | _: PreCandidate =>
-              F.raiseError(RaftError.ElectionInProgress)
+                    yield action
+                case f: Follower =>
+                  F.raiseError(RaftError.NotLeader(f.leaderId))
+                case _: Candidate | _: PreCandidate =>
+                  F.raiseError(RaftError.ElectionInProgress)
+              }
           }
         }
         .flatMap {
@@ -1079,6 +1098,9 @@ private final class RaftNodeImpl[F[_]: Async, R](
       _ <- cancelPeerMailboxes
       _ <- cleanupPendingSnapshot
       _ <- peerProgressRef.set(Map.empty)
+      _ <- leaseUntilRef.set(Duration.Zero)
+      _ <- peerLastAckRef.set(Map.empty)
+      _ <- stateRef.update(s => Follower(s.term, None, None, s.commitIndex))
       _ <- drainProposalQueue(RaftError.ProposalDropped("Node shutting down"))
       _ <- failAllPending(RaftError.ProposalDropped("Node shutting down"))
     yield ()
@@ -1351,7 +1373,12 @@ private final class RaftNodeImpl[F[_]: Async, R](
               lastLogIndex,
               cluster
             )
-            _ <- maybeRefreshLeaderLease(msg, transition.state, cluster)
+            _ <- maybeRefreshLeaderLease(
+              msg,
+              senderOpt,
+              transition.state,
+              cluster
+            )
             _ <- maybeRearmCheckQuorum(msg, transition.state)
             effOut <- executeEffectsLocked(transition.effects)
             catchUpOut <- prepareCatchUpEntries(msg, senderOpt)
@@ -1360,18 +1387,44 @@ private final class RaftNodeImpl[F[_]: Async, R](
 
   private def maybeRefreshLeaderLease(
       msg: RaftMessage,
+      senderOpt: Option[NodeId],
       newState: NodeState,
       cluster: ClusterConfig
   ): F[Unit] =
-    (msg, newState) match
-      case (resp: AppendEntriesResponse, l: Leader)
-          if resp.success && config.leaseReadEnabled =>
-        val active = l.recentlyActive + config.localId
-        if cluster.hasQuorum(active) then
-          Clock[F].monotonic.flatMap(now =>
-            leaseUntilRef.set(now + config.leaderLeaseDuration)
-          )
-        else F.unit
+    (msg, senderOpt, newState) match
+      case (resp: AppendEntriesResponse, Some(peerId), l: Leader)
+          if resp.term == l.term && resp.success && config.leaseReadEnabled =>
+        Clock[F].monotonic.flatMap { now =>
+          peerLastAckRef.updateAndGet(_.updated(peerId, now)).flatMap { acks =>
+            def quorumAckFor(vs: Set[NodeId]): Option[FiniteDuration] =
+              if vs.isEmpty then None
+              else
+                val times = vs.toVector.flatMap { v =>
+                  if v == config.localId then Some(now) else acks.get(v)
+                }
+                val majIdx = vs.size / 2
+                if times.size <= majIdx then None
+                else
+                  val desc = times.sorted(Ordering[FiniteDuration].reverse)
+                  Some(desc(majIdx))
+
+            val quorumAckOpt = cluster.oldVoters match
+              case None        => quorumAckFor(cluster.newVoters)
+              case Some(oldVs) =>
+                for
+                  a <- quorumAckFor(cluster.newVoters)
+                  b <- quorumAckFor(oldVs)
+                yield if a <= b then a else b
+
+            quorumAckOpt match
+              case None            => F.unit
+              case Some(quorumAck) =>
+                val candidateLease = quorumAck + config.leaderLeaseDuration
+                leaseUntilRef.update(prev =>
+                  if candidateLease > prev then candidateLease else prev
+                )
+          }
+        }
       case _ => F.unit
 
   private def maybeRearmCheckQuorum(
@@ -2380,6 +2433,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
       _ <- cancelFiber(transferFiberRef)
       _ <- peerProgressRef.set(Map.empty)
       _ <- leaseUntilRef.set(Duration.Zero)
+      _ <- peerLastAckRef.set(Map.empty)
       err = st match
         case f: Follower => RaftError.NotLeader(f.leaderId)
         case _           => RaftError.NotLeader(None)
@@ -2529,6 +2583,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
         )
       }.toMap
       _ <- peerProgressRef.set(initProgress)
+      _ <- peerLastAckRef.set(Map.empty)
       _ <- stateRef.update {
         case l: Leader =>
           l.initializeIndices(followers, lastLogIndex)

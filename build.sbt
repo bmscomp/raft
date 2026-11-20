@@ -12,7 +12,7 @@ val catsEffectTestingVersion = "1.8.0"
 ThisBuild / organization := "com.github.bmscomp"
 ThisBuild / scalaVersion := scala3Version
 ThisBuild / dynverSeparator := "-"
-ThisBuild / coverageMinimumStmtTotal := 85
+ThisBuild / coverageMinimumStmtTotal := 88
 ThisBuild / coverageFailOnMinimum := true
 Global / concurrentRestrictions += Tags.limit(Tags.Test, 1)
 
@@ -162,6 +162,8 @@ lazy val itest = project
     name := "raft-itest",
     publish / skip := true,
     coverageEnabled := false,
+    Test / fork := true,
+    Test / javaOptions += "--enable-native-access=ALL-UNNAMED",
     Test / parallelExecution := false,
     scalacOptions ++= commonScalacOptions,
     libraryDependencies ++= effectTestDependencies
