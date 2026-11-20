@@ -1,4 +1,4 @@
-# Functional RAFT Library for Scala 3
+# Functional Raft library for Scala 3
 
 A **Sans-I/O, deterministic** implementation of the [Raft consensus algorithm](https://raft.github.io/) in Scala 3. Storage, networking, and execution threads belong to the host system embedding the library: **`raft-core` has zero external dependencies** and isolates pure consensus safety, membership transitions, linearizable reads, and replication progress tracking behind deterministic state machines.
 
