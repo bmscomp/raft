@@ -171,8 +171,12 @@ The safety violation during a partition is not in *writes* — uncommitted write
 This is why the ReadIndex and lease-based read protocols exist (Chapter 10). ReadIndex requires the leader to confirm it holds authority — A would try to send heartbeats to confirm, fail to reach a majority, and correctly reject the read request:
 
 ```scala
-// ReadIndex rejected because leader can't confirm authority
-Effect.ReadIndexRejected(requestId = "read-42", leaderHint = None)
+// ReadIndex rejected because leader can't confirm authority (or stepped down)
+Effect.ReadIndexRejected(
+  id         = "read-42",
+  reason     = "Leader lost quorum",
+  leaderHint = None
+)
 ```
 
 Without ReadIndex (i.e., naive reads directly from the leader's state), stale reads are not just possible — they are *guaranteed* during any nontrivial partition.
@@ -249,7 +253,10 @@ The commit advancement logic in `RaftLogic.onAppendEntriesResponse`:
 case l: Leader if resp.success =>
   val newCommitIndex = l.calculateCommitIndex(clusterSize, getTermAt)
   if newCommitIndex > l.commitIndex then
-    Transition(l.withCommitIndex(newCommitIndex), List(CommitEntries(newCommitIndex)))
+    Transition(
+      l.withCommitIndex(newCommitIndex),
+      List(CommitEntries(LogIndex.unsafeFrom(newCommitIndex)))
+    )
   else Transition.pure(l)
 ```
 
@@ -302,9 +309,12 @@ This is one of those cases where the library's pure logic is correct but the run
 
 ```scala
 trait TimerService[F[_]]:
-  def resetElectionTimer: F[Unit]   // MUST use randomized duration
-  def resetHeartbeatTimer: F[Unit]  // can use fixed interval
+  def scheduleElection(delay: FiniteDuration, onTimeout: F[Unit]): F[Fiber[F, Throwable, Unit]]
+  def scheduleHeartbeat(delay: FiniteDuration, onTimeout: F[Unit]): F[Fiber[F, Throwable, Unit]]
+  def randomElectionTimeout(base: FiniteDuration): F[FiniteDuration] // MUST randomize per reset!
 ```
+
+In `ConsensusKernel` / `RawNode`, randomization is even stronger: an embedded pure **SplitMix64 PRNG** (`prngState: Long` inside `KernelState`) draws a fresh timeout in `[electionTimeoutTicks, 2 * electionTimeoutTicks)` deterministically from `initialSeed` — eliminating split votes in production while staying 100% reproducible in Deterministic Simulation Testing.
 
 ### Quantifying the Risk
 
@@ -410,14 +420,7 @@ This cascading failure pattern is not addressed by the Raft paper (which assumes
 
 ### Where the Library Helps
 
-The `ParallelReplicate` effect instructs the runtime to send concurrently:
-
-```scala
-case ParallelReplicate(targets: Set[NodeId], message: RaftMessage)
-// The runtime should execute sends concurrently for improved throughput.
-```
-
-With parallel replication enabled, commit latency becomes `max(third-fastest)` rather than `sum(all)`. In the example above, that's 2ms instead of 56ms — a 28× improvement.
+With `parallelReplicationEnabled = true` (the default), `RaftNode[F, R]` groups outbound peer actions by target `NodeId`, releases its internal `Mutex[F]`, and dispatches across distinct followers concurrently (`parTraverse_`) while preserving strict FIFO order per follower (`sendBatch`). Commit latency becomes `max(third-fastest)` rather than `sum(all)` — in the example above, 2ms instead of 56ms (a 28× improvement).
 
 ---
 
@@ -446,27 +449,19 @@ Snapshot transfer is essentially a file copy over the network. If the snapshot i
 
 ### The Fix
 
-The library's `TakeSnapshot` effect triggers snapshot creation at configurable intervals:
+The library addresses all three issues across `raft-core` and `raft-runtime`:
+
+- **Configurable Retention & Compaction (`CompactionConfig` + `CompactionManager`)**: `Effect.RequestSnapshot(lastApplied, logSize)` and `CompactionConfig(retainedEntries = 250L, snapshotChunkSize = 64 * 1024, policy = Some(CompactionPolicy.threshold[F](5_000L)))` keep a configurable tail of recent entries after compaction so slightly lagging followers can still catch up via `AppendEntries` instead of re-triggering snapshots!
+- **End-to-End Disk-Backed Streaming (`StateMachine` + `SnapshotTransfer` + `FilePendingSnapshot`)**: The `StateMachine[F, R]` SPI streams `fs2.Stream[F, Byte]` natively — no monolithic `Array[Byte]` in heap memory:
 
 ```scala
-case TakeSnapshot(lastIncludedIndex: Long, lastIncludedTerm: Long)
-// Trigger a snapshot at the given index to compact the log.
+trait StateMachine[F[_], R]:
+  def apply(log: Log): F[R]
+  def snapshot: F[fs2.Stream[F, Byte]]
+  def restore(data: fs2.Stream[F, Byte]): F[Unit]
 ```
 
-The key is compaction frequency. Too infrequent → snapshots are huge and transfers are slow. Too frequent → you're constantly snapshotting, which consumes disk I/O. A reasonable heuristic:
-
-- **Snapshot every N entries** (e.g., N = 10,000). This bounds the maximum snapshot size to N entries' worth of state machine changes.
-- **Snapshot when the log exceeds a size threshold** (e.g., 100 MB). This bounds the disk space used by the log.
-
-For very large state machines (tens of gigabytes), consider **streaming snapshots** — sending the snapshot in chunks so that partial progress is preserved on failure. The library supports this through its `StateMachine` SPI:
-
-```scala
-trait StateMachine[F[_], Response]:
-  def snapshot: F[Array[Byte]]      // capture current state
-  def restore(data: Array[Byte]): F[Unit]  // restore from snapshot
-```
-
-In a production implementation, you would implement these methods to support incremental or streaming serialization rather than capturing the entire state in a single `Array[Byte]`.
+Leaders stream `"RSNP"` v2 chunks via `SnapshotTransfer` under `Supervisor[F]` while followers stream incoming `InstallSnapshotRequest` chunks straight to disk via `FilePendingSnapshot` and pause redundant log RPCs via `ProgressState.Snapshot(pendingSnapshotIndex)`.
 
 ---
 
@@ -507,19 +502,14 @@ The NTP protocol keeps clocks synchronized within a few milliseconds on a well-c
 
 ### The Library's Approach
 
-The `ExtendLease` effect carries a timestamp:
+Both `RaftNode[F, R]` and `ConsensusKernel` defend lease reads with three layers:
 
-```scala
-case ExtendLease(until: Long)
-// until = currentTimeMillis + leaderLeaseDuration - maxClockSkew
-```
-
-The `maxClockSkew` subtraction is the safety margin. If you set `leaderLeaseDuration = 100ms` and `maxClockSkew = 20ms`, the effective lease is 80ms. This means the leader will expire its lease 20ms before followers *could* elect a new leader, providing a safety buffer.
-
-The tradeoff: larger `maxClockSkew` → shorter effective lease → more frequent fallbacks to ReadIndex → higher read latency. Smaller `maxClockSkew` → longer effective lease → lower read latency → higher risk of stale reads if your clock assumption is wrong.
+1. **Monotonic Clocks Only (Never Wall Clock)**: `RaftNode[F, R]` computes lease expiry using `Clock[F].monotonic + config.leaderLeaseDuration` (immune to backward NTP wall-clock jumps!), while `ConsensusKernel` uses deterministic `logicalTick`.
+2. **Mandatory `CheckQuorum` Coupling + Transfer Revocation**: `LeaseRead` only activates when `config.leaseReadEnabled && config.checkQuorumEnabled`, and calling `transferLeader` immediately zeroes `leaseUntil = 0L` so a departing leader can never serve a stale local read while the transferee wins via `TimeoutNowRequest` (see [Chapter 24, Bug 3](24-deterministic-simulation-testing.md)).
+3. **Graceful `Option[Long]` Fallback**: `raftNode.leaseRead` returns `F[Option[Long]]` — `Some(commitIndex)` while the lease is valid, or `None` on expiry so callers fall back seamlessly to clock-free quorum `raftNode.readIndex`.
 
 > [!CAUTION]
-> **Never set `maxClockSkew` to zero.** If you have any physical clock dependence (lease reads, TTL-based locks), you must assume some skew. Even within a single data center, 1-5ms of skew is common. Across data centers, 10-50ms is typical. When in doubt, use ReadIndex instead of lease reads — it's slower but correct regardless of clock behavior.
+> **Size `leaderLeaseDuration` with generous clock-drift headroom.** Always ensure `leaderLeaseDuration < electionTimeoutMin - maxExpectedClockDrift` (for example, `100ms` lease with `300ms` `electionTimeoutMin`). Across multi-region WANs or untrusted hypervisors, disable `leaseReadEnabled` and use 1-RTT `readIndex` instead. Run `sbt "examples/runMain examples.protocol.ReadIndexAndLeaseExample"` to observe both behaviors under a live partition.
 
 ---
 
@@ -534,17 +524,19 @@ You are performing a cluster membership change — adding a fourth node to a thr
 
 If node A (the leader) crashes during the joint phase, the cluster must elect a new leader under joint consensus rules. This is harder than a normal election because the new leader must win a majority in both the old and new configurations. If D is still catching up (not yet fully replicated), it might be impossible to get both majorities simultaneously.
 
-### Why Joint Consensus Is Safer Than Single-Step Changes
+### Why Joint Consensus Is Safer Than Naive Direct Switching
 
-The Raft paper (§6) originally proposed single-step membership changes — directly switching from the old configuration to the new one. This is simpler but creates a window where the old and new configurations could each independently elect a leader, violating Election Safety.
+A naive direct switch from `C_old` to `C_new` creates a window where two disjoint majorities (one under `C_old`, one under `C_new`) can independently elect leaders in the same term, violating Election Safety.
 
-Joint consensus (from the Raft dissertation) eliminates this window by requiring both configurations to agree during the transition. The cost is complexity:
+The original Raft paper (§6) solved this in full generality via **Joint Consensus (`C_old,new` → `C_new`)**, requiring dual majorities during the transition so arbitrary multi-node changes (`{n1,n2,n3} → {n2,n3,n4,n5}`) remain provably safe. Ongaro's PhD dissertation (§4.1) later showed that restricting reconfigurations to **one server at a time** is a simpler safe special case — while also discovering the subtle **current-term commit guard** (`LeaderNotReadyInTerm`, enforced by `ConsensusKernel.proposeConfChange`). This library implements full Joint Consensus (`ConfChangeV2`) plus uncommitted configuration truncation rollback:
 
 ```
 Normal operation:        Majority of {A, B, C} = 2
 Joint consensus:         Majority of {A, B, C} = 2 AND majority of {A, B, C, D} = 3
 After transition:        Majority of {A, B, C, D} = 3
 ```
+
+Run `sbt "examples/runMain examples.cluster.JointConsensusExample"` to step through a live `{n1, n2, n3} → {n2, n3, n4, n5}` dual-quorum migration.
 
 ### Practical Advice
 
@@ -609,7 +601,7 @@ To wrap up, here is a systematic classification of the failure modes we've cover
 | Term inflation | Network | Liveness | Pre-Vote protocol |
 | Slow follower | Node | Throughput | Parallel replication, learner demotion |
 | Snapshot transfer failure | Storage | Availability | Streaming snapshots, compaction tuning |
-| Clock skew | Infrastructure | Linearizability | `maxClockSkew` margin, ReadIndex fallback |
+| Clock skew | Infrastructure | Linearizability | Monotonic `leaderLeaseDuration` headroom, `ReadIndex` fallback |
 | Membership change instability | Protocol | Election Safety | Joint consensus, staged changes |
 | Torn disk writes & snapshot cliff | Storage | Election & State Safety | `MmapHardState` CRC32, atomic `WIDX` fallback, `%020d` numeric snapshots |
 

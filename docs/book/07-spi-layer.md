@@ -159,11 +159,13 @@ trait LogWriter[F[_]]:
   def append(entries: Seq[Log]): F[Unit]
   def truncateFrom(index: LogIndex): F[Unit]
   def clear: F[Unit]
+  def discardBefore(index: LogIndex): F[Unit]
 ```
 
 - **`append(entries)`**: add entries to the end of the log. This must be **atomic** (all entries are appended or none) and **durable** (entries survive process restarts).
-- **`truncateFrom(index)`**: remove all entries at or after the given index. This happens during log conflict resolution — when a follower's log diverges from the leader's, conflicting entries are truncated before appending the correct ones.
-- **`clear`**: remove all entries. Used when restoring from a snapshot (the snapshot replaces the entire log).
+- **`truncateFrom(index)`**: remove all entries at or after the given index (inclusive). Used during §5.3 log conflict resolution when a follower's log diverges from the leader's.
+- **`clear`**: remove all entries. Used when installing a snapshot that replaces the entire log.
+- **`discardBefore(index)`**: discard compacted entries strictly before `index` once a durable snapshot covers them.
 
 ### LogStore (Combined)
 
@@ -173,11 +175,11 @@ trait LogStore[F[_]] extends LogReader[F] with LogWriter[F]
 
 ### The Durability Contract
 
-This is critical: **`append` must durably persist entries before completing**. In practice, this means calling `fsync()` (or the equivalent) on the underlying file. If `append` returns and then the process crashes, the appended entries **must** still be there when the process restarts.
+This is critical: **`append` must durably persist entries before completing**. In practice, this means calling `fsync()` / `msync()` on the underlying WAL. If `append` returns and then the process crashes, the appended entries **must** still be there when the process restarts.
 
 Why? Because the leader might tell a client "your write succeeded" immediately after the entry is replicated to a majority. If any server in that majority subsequently loses the entry due to a non-durable write, a committed entry could be lost — violating Raft's safety guarantees.
 
-> **Note — Batching fsync:** Calling `fsync()` after every single entry is slow. Production implementations typically batch multiple entries into a single `fsync()` — this is safe as long as the batch is synced before any of the entries are acknowledged to the protocol logic. The library's `BatchAppend` effect supports this pattern.
+> **Note — Group-Commit Batching:** Calling `fsync()` after every single entry limits throughput to disk IOPS. Production implementations amortize sync cost by passing a batch of entries into a single `append(entries)` call (`BatchConfig` / `proposeBatchAndApply`), issuing **one** `MmapSegment.forceRange` / `WriteBatch` sync before acknowledging any entry in the batch. See `raft-storage-mmap` (`MmapWalEngine` + `StorageBackedLogStore`, [Chapter 23](23-host-system-integration.md)) for the library's production off-heap FFM implementation.
 
 ### Production Implementation Sketch: RocksDB
 
@@ -304,9 +306,9 @@ Why does this matter? Because if two nodes apply the same entry and get differen
 
 ### Implementation Contract
 
-- **`apply(log)`** is called exactly once per committed entry, in log index order. The runtime guarantees this ordering; the implementation doesn't need to handle out-of-order entries.
-- **`snapshot()`** captures the complete state machine state at the current point. This is used for log compaction (Chapter 3). The returned byte array must be a self-contained representation that `restore` can use to rebuild the state machine.
-- **`restore(data)`** replaces the current state machine state with a previously captured snapshot. After `restore`, subsequent `apply` calls continue from the log entries after the snapshot's last included index.
+- **`apply(log)`** is called exactly once per committed entry, in log index order. Its return value `R` flows straight out of `RaftNode[F, R].proposeAndApply(payload: Bytes): F[Applied[R]]`, eliminating mutable side-channel response maps. Prefer `log.payload.utf8String` or `log.payload.asReadOnlyByteBuffer` to avoid defensive array copies.
+- **`snapshot`** captures a point-in-time stream (`F[Stream[F, Byte]]`) of the complete state machine state for log compaction ([Chapter 3](03-raft-advanced-theory.md)).
+- **`restore(data)`** consumes the snapshot byte stream to replace the current state machine state atomically. After `restore`, subsequent `apply` calls continue from `snapshot.lastIncludedIndex + 1`.
 
 ### Example: A Key-Value Store FSM
 
@@ -349,26 +351,35 @@ class CounterFSM[F[_]: Sync](ref: Ref[F, Long]) extends StateMachine[F, Long]:
 
 ## TimerService: Election and Heartbeat Scheduling
 
-The timer service manages the two clocks that drive Raft's liveness:
+The timer service manages the randomized election timeouts and periodic leader heartbeats that drive Raft's liveness via cancellable Cats Effect `Fiber`s:
 
 ```scala
 trait TimerService[F[_]]:
-  def resetElectionTimer: F[Unit]
-  def resetHeartbeatTimer: F[Unit]
-  def cancelAll: F[Unit]
-  def electionTimeouts: Stream[F, Unit]
-  def heartbeatTicks: Stream[F, Unit]
+  def scheduleElection(delay: FiniteDuration, onTimeout: F[Unit]): F[Fiber[F, Throwable, Unit]]
+  def scheduleHeartbeat(delay: FiniteDuration, onTimeout: F[Unit]): F[Fiber[F, Throwable, Unit]]
+  def randomElectionTimeout(base: FiniteDuration): F[FiniteDuration]
 ```
 
-- **`resetElectionTimer`**: restart the election countdown from scratch. Called whenever the follower hears from a valid leader. The timeout duration is randomly chosen between `electionTimeoutMin` and `electionTimeoutMax` each time it's reset.
-- **`resetHeartbeatTimer`**: restart the heartbeat countdown. Called after the leader sends heartbeats.
-- **`cancelAll`**: stop all timers. Called during shutdown.
-- **`electionTimeouts`**: a stream that emits a unit value each time the election timer fires.
-- **`heartbeatTicks`**: a stream that emits a unit value each time the heartbeat timer fires.
+- **`scheduleElection(delay, onTimeout)`**: schedules a one-shot election timeout firing `onTimeout` after `delay`. Returning a `Fiber[F, Throwable, Unit]` makes timer resets clean and race-free: when a valid leader heartbeat arrives, `RaftNode` simply cancels the previous election fiber and schedules a fresh one.
+- **`scheduleHeartbeat(delay, onTimeout)`**: schedules a leader heartbeat firing after `delay`.
+- **`randomElectionTimeout(base)`**: produces a jittered election timeout (`>= base`, typically 0–50% random jitter) to break split-vote symmetry (Raft §9.3).
 
-The library provides `DefaultTimerService`, which uses `fs2.Stream.sleep` with randomized intervals. For most use cases, this is sufficient. A custom implementation might add jitter, adjust timeouts based on network conditions, or integrate with an existing scheduling system.
+The built-in `DefaultTimerService[F]` schedules via `Async[F].sleep` and accepts a seeded `cats.effect.std.Random[F]` — which means entire `RaftNode[IO, R]` clusters run deterministically under Cats Effect's `TestControl` virtual clock with zero real sleeps! Run the standalone timer walkthrough:
 
-> **Note — Randomized timeouts are critical.** The election timer **must** use a different random duration each time it's reset. Deterministic timeouts would cause all followers to start elections at the same time after a leader failure, leading to persistent split votes and liveness failures. This is directly related to the FLP impossibility result discussed in Chapter 1.
+```bash
+sbt "examples/runMain examples.protocol.TimerServiceExample"
+```
+
+## SnapshotStore, CompactionPolicy & Custom MessageCodecs
+
+Three additional SPIs complete the production extension surface:
+
+1. **`SnapshotStore[F]`** (`save(snapshot: Snapshot[F])`, `loadLatest`, `list`, `delete(index)`): decouples atomic snapshot persistence from the WAL so snapshots can target local disk (`StorageBackedSnapshotStore` with `"RSNP"` v2 CRC32 + directory `fsync`), NFS, or object storage.
+2. **`CompactionPolicy[F]`**: pluggable policy evaluated by `CompactionManager` (e.g., `CompactionPolicy.threshold[F](5_000L)`) to trigger snapshot creation and `LogStore.discardBefore`.
+3. **`SimpleMessageCodec[Wire]` / `MessageCodec[F, Wire]`**: decouples protocol messages from wire serialization. `raft-core` includes zero-dependency `JsonCodec`, `raft-transport-grpc` provides binary `ProtobufMessageCodec` and `ProtobufMultiGroupCodec`, and `examples.counter.CounterWithCodecExample` demonstrates building a custom pipe-delimited `SimpleMessageCodec[TextWireMessage]`:
+   ```bash
+   sbt "examples/runMain examples.counter.CounterWithCodecExample"
+   ```
 
 ## Factory Pattern: Resource-Safe Creation
 
@@ -382,29 +393,20 @@ trait TransportFactory[F[_], Wire]:
   def create(config: TransportConfig): Resource[F, Transport[F, Wire]]
 ```
 
-`Resource` ensures that when the Raft node shuts down, all SPIs are cleanly closed — database connections are released, file handles are closed, network listeners are stopped:
-
-```scala
-val program: Resource[IO, Unit] =
-  for
-    transport <- transportFactory.create(transportConfig)
-    logStore  <- logStoreFactory.create("/data/raft-log")
-    stable    <- stableStoreFactory.create("/data/raft-meta")
-    // ... build and run the Raft node ...
-  yield ()
-  // Everything is automatically cleaned up when `program` completes
-```
+`Resource` ensures that when a node shuts down, all SPIs release in strict LIFO order — background fibers cancel before `GrpcTransport` closes HTTP/2 channels and before `MmapWalEngine` retires `SegmentLease`s and closes FFM `Arena`s.
 
 ## Summary
 
-| SPI | Purpose | Contract | In-Memory Implementation |
+| SPI | Purpose | Contract | Built-In Implementations |
 |-----|---------|----------|-------------------------|
-| **Transport** | Node-to-node messaging | Best-effort delivery, no ordering guarantees needed | `InMemTransport` |
-| **LogStore** | Replicated log persistence | Atomic and durable `append`, ordered `getRange` | `InMemLogStore` |
-| **StableStore** | Term + vote persistence | Durable writes (fsync) for `setCurrentTerm` and `setVotedFor` | `InMemStableStore` |
-| **StateMachine** | Command application | Deterministic `apply`, consistent `snapshot`/`restore` | You implement |
-| **TimerService** | Election and heartbeat scheduling | Randomized election timeouts, regular heartbeat intervals | `DefaultTimerService` |
+| **Transport** | Node-to-node messaging | Best-effort delivery; `sendBatch` for pipelined bursts | `InMemTransport`, `GrpcTransport` (`raft-transport-grpc`), `MultiGroupTransport` |
+| **LogStore** | Replicated log persistence | Atomic & durable `append`, `getRange`, `truncateFrom`, `discardBefore` | `InMemLogStore`, `StorageBackedLogStore` (`MmapWalEngine`) |
+| **StableStore** | Hard-state persistence | Single-flush atomic `setHardState(term, votedFor)` + `hardState` | `InMemStableStore`, `StorageBackedStableStore` (`MmapHardState`) |
+| **SnapshotStore** | Atomic snapshot storage | Streaming `save`/`loadLatest` (`RSNP` v2 CRC32 + dir `fsync`) | `InMemSnapshotStore`, `StorageBackedSnapshotStore` |
+| **StateMachine** | Deterministic domain FSM | Deterministic `apply: Log => F[R]`, streaming `snapshot`/`restore` | Application-defined |
+| **TimerService** | Liveness scheduling | Cancellable `Fiber` timeouts + jittered `randomElectionTimeout` | `DefaultTimerService` (compatible with `TestControl`) |
+| **MessageCodec** | Wire encoding | Total round-trip isomorphism `decode(encode(m)) == Right(m)` | `JsonCodec`, `ProtobufMessageCodec`, `ProtobufMultiGroupCodec` |
 
 ---
 
-*Next: [Chapter 8 — Getting Started](08-getting-started.md) walks through building your first application with the library — from project setup to a running three-node cluster.*
+*Next: [Chapter 8 — Getting Started](08-getting-started.md) walks through building your first application with the library — from project setup and your first election to running all 18 included examples.*

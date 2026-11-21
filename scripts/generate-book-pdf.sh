@@ -31,7 +31,11 @@ BOOK_CHAPTERS=(
   "$BOOK_DIR/19-property-based-testing.md"
   "$BOOK_DIR/20-jepsen-verification.md"
   "$BOOK_DIR/21-multi-raft-groups.md"
+  "$BOOK_DIR/22-sans-io-rawnode-ready.md"
+  "$BOOK_DIR/23-host-system-integration.md"
+  "$BOOK_DIR/24-deterministic-simulation-testing.md"
   "$BOOK_DIR/appendix-a-quick-reference.md"
+  "$BOOK_DIR/appendix-b-examples-catalog.md"
 )
 
 TUTORIAL_FILES=(
@@ -49,6 +53,8 @@ TUTORIAL_FILES=(
   "$TUTORIALS_DIR/12-chaos-testing.md"
   "$TUTORIALS_DIR/13-observability.md"
   "$TUTORIALS_DIR/14-multi-datacenter.md"
+  "$TUTORIALS_DIR/15-batching-and-pipelining.md"
+  "$TUTORIALS_DIR/16-cross-shard-2pc-ledger.md"
 )
 
 PANDOC_OPTS=(
@@ -71,7 +77,7 @@ PANDOC_OPTS=(
 
 case "${1:-all}" in
   book)
-    echo "Generating book PDF (21 chapters + appendix)..."
+    echo "Generating book PDF (24 chapters + 2 appendices)..."
     pandoc "${PANDOC_OPTS[@]}" \
       --metadata title="Raft Consensus: From Theory to Production" \
       --metadata subtitle="A Functional Scala 3 Implementation" \
@@ -82,7 +88,7 @@ case "${1:-all}" in
     ;;
 
   tutorials)
-    echo "Generating tutorials PDF (14 tutorials)..."
+    echo "Generating tutorials PDF (16 tutorials)..."
     pandoc "${PANDOC_OPTS[@]}" \
       --metadata title="Raft Tutorials" \
       --metadata subtitle="Real-World Distributed Systems with Scala 3" \
@@ -98,7 +104,7 @@ case "${1:-all}" in
 
     # Create a part separator for tutorials
     TUTORIALS_SEPARATOR=$(mktemp)
-    printf '\n\n\\newpage\n\n# Part VI — Tutorials\n\n' > "$TUTORIALS_SEPARATOR"
+    printf '\n\n\\newpage\n\n# Part IX — Tutorials\n\n' > "$TUTORIALS_SEPARATOR"
 
     pandoc "${PANDOC_OPTS[@]}" \
       --metadata title="Raft Consensus: From Theory to Production" \
@@ -115,8 +121,8 @@ case "${1:-all}" in
 
   *)
     echo "Usage: $0 [book|tutorials|all]"
-    echo "  book       - Generate book PDF only (21 chapters)"
-    echo "  tutorials  - Generate tutorials PDF only (14 tutorials)"
+    echo "  book       - Generate book PDF only (24 chapters + 2 appendices)"
+    echo "  tutorials  - Generate tutorials PDF only (16 tutorials)"
     echo "  all        - Generate combined PDF (default)"
     exit 1
     ;;

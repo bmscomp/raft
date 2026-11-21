@@ -1,6 +1,6 @@
 # Chapter 18: End-to-End Integration & Full-Stack Cluster Lifecycle
 
-*Previous chapters explored the pure `RaftLogic` state machine, the `RawNode` Sans-I/O harness, the SPI contracts, the FFM `MmapWalEngine`, and the Netty `GrpcTransport`. This chapter shows how all layers compose into a production `Resource` hierarchy using `RaftNode[F]`, how crash recovery reconstructs exact cluster state from disk, and how multi-tier integration suites verify every seam.*
+*Previous chapters explored the pure `RaftLogic` state machine, the `RawNode` Sans-I/O harness, the SPI contracts, the FFM `MmapWalEngine`, and the Netty `GrpcTransport`. This chapter shows how all layers compose into a production `Resource` hierarchy using typed `RaftNode[F, R]`, how crash recovery reconstructs exact cluster state from disk, and how multi-tier integration suites verify every seam.*
 
 ---
 
@@ -50,7 +50,7 @@ final class KvStore(ref: Ref[IO, Map[String, String]])
     extends StateMachine[IO, Unit]:
 
   def apply(log: Log): IO[Unit] =
-    new String(log.data, StandardCharsets.UTF_8).split("=", 2) match
+    log.payload.utf8String.split("=", 2) match
       case Array(k, v) => ref.update(_.updated(k, v))
       case _           => IO.unit
 
@@ -91,7 +91,7 @@ object ProductionNode:
       bindPort: Int,
       peers: Map[NodeId, String],
       bootstrapCluster: ClusterConfig
-  ): Resource[IO, (RaftNode[IO], KvStore)] =
+  ): Resource[IO, (RaftNode[IO, Unit], KvStore)] =
     for
       engine <- MmapWalEngine.resource[IO](dataDir)
       logStore = StorageBackedLogStore(engine)
@@ -176,9 +176,11 @@ sequenceDiagram
 When a node crashes (`SIGKILL` or power loss) and restarts against an existing `MmapWalEngine` directory, `MmapWalEngine.open` and `RaftNode.start` cooperate in four deterministic phases:
 
 1. **HardState Recovery**: `MmapHardState` reads and CRC32-verifies the 280-byte `hard_state.bin` layout, restoring `(term, votedFor, commitIndex)` with hardware-aligned 8-byte `MemorySegment` accesses (`currentTerm` at offset `0`, `crc32` at offset `268`, and `commitIndex` at offset `272`).
-2. **Self-Healing WAL Index Recovery**: `MmapWalEngine` validates `index.ckpt` (`"WIDX"` v1 header + CRC32). If `index.ckpt` is missing, truncated, or fails CRC32 verification due to torn disk writes, `MmapWalEngine` logs a warning, discards the corrupted checkpoint, and deterministically reconstructs the full `WalIndex` by replaying every `.wal` segment header and entry on disk.
-3. **Snapshot & Membership Restoration**: `RaftNode.start` loads the highest numeric `snapshot-%020d.bin` via `SnapshotStore.loadLatest`, streams it into `StateMachine.restore`, advances `lastApplied` to `snap.lastIncludedIndex`, and reconstructs the latest `ClusterConfig` from the snapshot header plus any post-snapshot `LogType.Configuration` WAL entries.
-4. **Follower Catch-Up**: The node enters `Follower(hs.term, hs.votedFor, None)`. On the next leader `AppendEntriesRequest`, `commitIndex` advances and `applyCommittedEntries` replays only the uncompacted tail `(snap.lastIncludedIndex + 1 .. commitIndex)` onto the restored `StateMachine`.
+2. **Torn-Tail Self-Healing & WAL Index Recovery**: `MmapSegment.openForRecovery` truncates any uncommitted torn tail left by an abrupt `SIGKILL -9` (`index > commitIndex`) while failing fast with `CorruptedEntryException` on mid-log/committed bit-rot. `MmapWalEngine` then validates `index.ckpt` (`"WIDX"` v1 header + CRC32), rebuilding the 2-level 64-bit `WalIndexState` from `.wal` segments if `index.ckpt` is missing or torn.
+3. **Snapshot, `TermRingBuffer` & Membership Restoration**: `RaftNode.start` loads the highest numeric `snapshot-%020d.bin` via `SnapshotStore.loadLatest`, streams it into `StateMachine.restore`, advances `lastApplied` to `snap.lastIncludedIndex`, seeds its `O(1)` `TermRingBuffer`, and reconstructs the active `ClusterConfig` from the snapshot header plus any post-snapshot `LogType.Configuration` WAL entries.
+4. **Follower Catch-Up**: The node enters `Follower(hs.term, hs.votedFor, None)`. On the next leader `AppendEntriesRequest`, `commitIndex` advances and `applyCommittedEntries` replays only the uncompacted tail `(snap.lastIncludedIndex + 1 .. commitIndex)` in a single batched `getRange` call onto the restored `StateMachine`.
+
+> **Run the full production stack right now:** `sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"` boots 3 hosts × 4 Raft groups (12 `MmapWalEngine` instances + 3 single-port `GrpcTransport.multiGroupResource` servers + `CoalescedHeartbeatConfig` + cross-shard 2PC + crash recovery) end-to-end!
 
 ---
 

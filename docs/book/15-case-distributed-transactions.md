@@ -6,7 +6,7 @@
 
 ## The Problem
 
-A key-value store (Chapter 10) lets you read and write individual keys atomically. But real applications need **multi-key atomic operations**:
+A key-value store ([Chapter 12](12-case-distributed-kv.md)) lets you read and write individual keys atomically. But real applications need **multi-key atomic operations**:
 
 - **Bank transfer**: debit account A and credit account B — both updates must succeed or neither does
 - **Conditional update**: increment a counter only if a feature flag is enabled
@@ -271,21 +271,25 @@ Because transactions are committed through Raft's replicated log, we get strong 
 Conflict detection with retry is the standard pattern for OCC:
 
 ```scala
+import raft.RaftNode
+import raft.state.Bytes
+
 def submitWithRetry(
+  leader: RaftNode[IO, TxnResult],
   store: TransactionalStore[IO],
   buildTxn: Map[String, String] => Transaction,
   maxRetries: Int = 3
 ): IO[TxnResult] =
   def attempt(remaining: Int): IO[TxnResult] =
     for
-      currentState <- store.getAll         // read current state
-      txn          =  buildTxn(currentState) // build txn based on current values
-      entry        =  Log.command(0, 1, Transaction.encode(txn))
-      result       <- store.apply(entry)
-      finalResult  <- result match
+      _            <- leader.readIndex          // linearizable read barrier before building CAS preconditions
+      currentState <- store.getAll
+      txn          =  buildTxn(currentState)
+      applied      <- leader.proposeAndApply(Bytes.copyFrom(Transaction.encode(txn)))
+      finalResult  <- applied.value match
         case c: TxnResult.ConflictDetected if remaining > 0 =>
-          IO.println(s"Conflict on ${c.key}, retrying (${remaining} left)...") *>
-            IO.sleep(10.millis) *>   // brief backoff before retry
+          IO.println(s"Conflict on ${c.key}, retrying ($remaining left)...") *>
+            IO.sleep(10.millis) *>
             attempt(remaining - 1)
         case other => IO.pure(other)
     yield finalResult
@@ -293,29 +297,33 @@ def submitWithRetry(
   attempt(maxRetries)
 ```
 
+Notice the two-line discipline that makes OCC strictly serializable in production: `leader.readIndex` ensures `store.getAll` never reads stale state from a partitioned leader, and `leader.proposeAndApply` returns the exact `Applied[TxnResult]` directly from the committed log entry!
+
 The `buildTxn` function takes the current state and builds a transaction based on the latest values. On conflict, the function is called again with the updated state, producing a new transaction with the correct expected values.
 
 > **Note — Exponential backoff:** The `10.millis` sleep is simple but naive. In production, use exponential backoff with jitter to avoid thundering herd problems when many clients conflict on the same keys simultaneously. A good formula: `min(maxBackoff, initialBackoff * 2^attempt) * (0.5 + random(0.5))`.
 
-## Scaling Beyond One Group: Cross-Shard 2PC over Multi-Raft
+## Scaling Beyond One Group: Cross-Shard 2PC over Multi-Raft (`ShardedBankLedgerExample`)
 
-Single-log OCC guarantees strict serializability when all keys in a transaction belong to the **same** Raft group. When keys are partitioned across multiple Raft groups (`MultiRaftNode`), a transfer between `acct-1` (on `ledger-shard-0`) and `acct-5` (on `ledger-shard-2`) spans two independent consensus logs.
+Single-log OCC guarantees strict serializability when all keys in a transaction belong to the **same** Raft group (as shown in `DistributedTransactionExample` locally and `RaftTransactionExample` across a 3-node Raft cluster). When accounts are partitioned across multiple Raft groups (`MultiRaftNode`), a transfer between `acct-1` (on `ledger-shard-0`) and `acct-2` (on `ledger-shard-1`) spans two independent consensus logs.
 
-`examples.advanced.ShardedBankLedgerExample` solves cross-shard atomicity by layering **Raft-Backed Two-Phase Commit (2PC)** with **Escrow Holds** and **Client Session Deduplication**:
+Classic textbook Two-Phase Commit (2PC) suffers from a fatal flaw: **the coordinator is a single point of failure**. If the coordinator crashes after participants vote `Prepared` but before broadcasting `Commit`/`Abort`, participants remain blocked holding locks indefinitely.
+
+`examples.advanced.ShardedBankLedgerExample` (1,529 lines — the repository's flagship full-stack application) eliminates that flaw by running the 2PC coordinator itself inside a dedicated Raft group (`tx-coord`), integrating **every production module** (`raft-core`, `raft-runtime`, `raft-storage-mmap`, `raft-transport-grpc`):
 
 ```mermaid
 flowchart LR
-    subgraph Coord["tx-coord Raft Group"]
-        TR["TxRecord: Preparing -> Committed / Aborted -> Completed"]
+    subgraph Coord["tx-coord Raft Group (3 Replicas)"]
+        TR["CoordStateMachine: Begin -> Preparing -> DecideCommit / DecideAbort -> MarkCompleted"]
     end
 
-    subgraph Src["Source Shard (ledger-shard-0)"]
+    subgraph Src["Source Shard (ledger-shard-0, 3 Replicas)"]
         P1["Phase 1: PrepareDebit(txId, acct, amt) -> Escrow Hold"]
         C1["Phase 2: Commit2PC(txId) / Abort2PC(txId)"]
     end
 
-    subgraph Dst["Target Shard (ledger-shard-2)"]
-        P2["Phase 1: PrepareCredit(txId, acct, amt) -> Validate"]
+    subgraph Dst["Target Shard (ledger-shard-1, 3 Replicas)"]
+        P2["Phase 1: PrepareCredit(txId, acct, amt) -> Validate Account"]
         C2["Phase 2: Commit2PC(txId) / Abort2PC(txId)"]
     end
 
@@ -323,22 +331,27 @@ flowchart LR
     P1 & P2 --> C1 & C2
 ```
 
-1. **Same-Shard Fast Path**: When `shardForAccount(from) == shardForAccount(to)`, `ShardedLedgerCluster.transfer` executes a single-entry `SameShardTransfer` with zero 2PC overhead.
-2. **Fault-Tolerant Coordinator**: Cross-shard transactions log `Begin(txId)` -> `DecideCommit(txId)` / `DecideAbort(txId)` -> `MarkCompleted(txId)` inside a dedicated Raft group (`tx-coord`), eliminating the single-coordinator blocking vulnerability of classic 2PC.
-3. **Deterministic Crash Recovery**: On restart or failover, `recoverInFlightTransactions` reads `tx-coord` via `readIndexFromGroup` and rolls back any `Preparing` holds via idempotent `Abort2PC` while rolling forward any `Committed` records via idempotent `Commit2PC`.
+### Anatomy of the Flagship Architecture
 
-See [Tutorial 16 — Building a Multi-Shard Transactional Ledger with Raft-Backed 2PC](../../tutorials/16-cross-shard-2pc-ledger.md) for a complete walkthrough.
+1. **4 Groups × 3 Physical Hosts = 12 Replicas on 3 Single-Port gRPC Servers**: Each host (`host-1`, `host-2`, `host-3`) runs `GrpcTransport.multiGroupResource` with `CoalescedHeartbeatConfig(enabled = true, flushInterval = 12.millis, maxBatchSize = 32, coalesceResponses = true)` and 4 independent `MmapWalEngine` directories (12 total WAL engines with `CompactionPolicy.threshold(20L)`), allocated *before* `MultiRaftNode` in the `Resource` stack so storage always outlives consensus fibers during shutdown.
+2. **Escrow Holds (`availableBalance = balance - reservedFor`)**: In `LedgerShardStateMachine`, `PrepareDebit(txId, acct, amt)` never mutates the committed balance directly — it records an immutable `Hold(txId, acct, amt, isDebit = true)` after verifying `availableBalance >= amt`. Concurrent transfers against the same account cannot double-spend escrowed funds, and `Abort2PC(txId)` cleanly releases the hold.
+3. **Same-Shard Fast Path**: When `shardForAccount(from) == shardForAccount(to)`, `ShardedLedgerCluster.transfer` bypasses `tx-coord` completely and commits a single-entry `SameShardTransfer` in one consensus round.
+4. **Snapshotted `(clientId, seqNum)` Exactly-Once Sessions**: `ShardState` stores `sessions: Map[String, (Long, LedgerResponse)]` *inside* the same binary snapshot stream (`snapshot`/`restore`) as `balances`, `holds`, and `resolvedTxs`. Even if a client retries a deposit *after* a leader failover and WAL compaction, `withSessionDedup` replays the cached `LedgerResponse` without double-crediting the account.
+5. **Deterministic Crash Recovery (`injectInterrupted2PC` & `recoverInFlightTransactions`)**: If a coordinator host crashes mid-2PC, `recoverInFlightTransactions` performs a linearizable `readIndexFromGroup(CoordGroup)` on the surviving `tx-coord` leader, rolls back any `Preparing`/`Aborted` transactions via idempotent `Abort2PC`, and rolls forward any `Committed` decisions via idempotent `Commit2PC` — guaranteeing **global conservation of money** (`auditGlobalBalances`) with zero leaked holds.
+6. **Group-Commit Batching & Zero-RTT `LeaseRead` Audits**: Account seeding batches proposals via `proposeBatchAndCommitToGroup` (`BatchConfig(maxSize = 16, maxWait = 5.millis)` + `PipelineConfig(maxInflight = 6)`), and reads attempt `leaseReadFromGroup` (0 RTTs) with automatic fallback to `readIndexFromGroup` (1 RTT), while `rebalanceLeadership` spreads shard leaders evenly across all three physical hosts.
+
+See [Tutorial 16 — Building a Multi-Shard Transactional Ledger with Raft-Backed 2PC](../../tutorials/16-cross-shard-2pc-ledger.md) and [Appendix B](appendix-b-examples-catalog.md) for the full code walkthrough.
 
 ## Run the Examples
 
 ```bash
-# Single-group OCC transactions with CAS conflict detection
+# 1. Local multi-key OCC state machine (5 scenarios: transfer, CAS ok, CAS conflict, atomic Increment, 4-op txn)
 sbt "examples/runMain examples.distributed.DistributedTransactionExample"
 
-# 3-node replicated transactional state machine
+# 2. 3-node Raft-replicated TransactionalStore proving identical convergence on multi-key CAS transfers
 sbt "examples/runMain examples.distributed.RaftTransactionExample"
 
-# Full production Multi-Raft + gRPC + MmapWalEngine + Cross-Shard 2PC Bank Ledger
+# 3. Flagship full-stack Multi-Raft + single-port gRPC + 12 FFM MmapWalEngines + Cross-Shard 2PC Bank Ledger
 sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"
 ```
 

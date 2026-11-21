@@ -41,7 +41,7 @@ for {
 }
 ```
 
-This pattern should look familiar — it's the same loop from Chapter 7, expressed in Go instead of Scala. The `Ready` struct is etcd/raft's equivalent of our `Transition(newState, effects)`.
+This pattern should look familiar — it's the direct ancestor of our `RawNode` / `Ready` / `LightReady` Sans-I/O protocol ([Chapter 22](22-sans-io-rawnode-ready.md)) and the Go counterpart to `RaftLogic`'s `Transition(newState, effects)`.
 
 **Strengths**:
 - Battle-tested at enormous scale (literally every Kubernetes cluster in the world runs it)
@@ -86,7 +86,7 @@ type FSM interface {
 **Weaknesses**:
 - Less flexible than etcd/raft — the transport, storage, and timer integration points are less modular
 - Tightly coupled to Go's goroutine concurrency model
-- No pre-vote support (as of v1.x), making it susceptible to disruptive rejoining nodes
+- Early v1.x releases lacked Pre-Vote (added in later releases, disabled by default in older clusters)
 - Single Raft group focus — Multi-Raft requires external coordination
 - Performance ceiling is lower than etcd/raft for high-throughput scenarios (single-threaded log processing)
 
@@ -201,26 +201,24 @@ A lightweight, modular Java Raft library emphasizing minimalism and clean abstra
 
 ### Functional RAFT Library (Scala 3) — This Library
 
-**Architecture**: Pure functional approach — `RaftLogic.onMessage()` returns `Transition(newState, effects)` with zero side effects. The effect ADT (`SendMessage`, `PersistHardState`, `CommitEntries`, etc.) describes all I/O as data, and your runtime interprets these effects using whatever infrastructure you choose. This is the purest expression of the "library as state machine" philosophy.
+**Architecture**: Uniquely bridges *both* ends of the spectrum through a **7-module layered design**:
+- At the base sits zero-dependency **`raft-core`** (`0` external JARs): offering both stateless `RaftLogic.onMessage` (returning `Transition(newState, effects)` over a minimal 18-case pure `Effect` ADT) *and* **`ConsensusKernel` / `RawNode`**, a `0`-`var`, `0`-`while`, `0`-`null` Mealy machine emitting `tikv/raft-rs`-style `Ready` / `LightReady` batches with structural Persistence-Before-RPC (`hasUnpersistedTermOrVote`), `ProgressTracker` (`Probe` / `Replicate` / `Snapshot` + `Inflights`), and an embedded SplitMix64 PRNG.
+- Layered optionally above `raft-core` are turnkey production modules: **`raft-runtime`** (typed `RaftNode[F, R]` returning `Applied[R]`, lock-free outbound RPCs outside `Mutex[F]`, `O(1)` `TermRingBuffer`, `MultiRaftNode`, and `CoalescedHeartbeatConfig`), **`raft-storage-mmap`** (JDK 22+ FFM off-heap segmented WAL with lock-free `SegmentLease` pins, 2-level 64-bit `WalIndexState`, CRC32 `MmapHardState`, and torn-tail `SIGKILL` self-healing), and **`raft-transport-grpc`** (`AtomicCell` channel pool, single-RPC `WireEnvelope.payloads` batching, `WireAck` backpressure, and mTLS X.509 `sender_id` binding).
 
 **Strengths**:
-- **Purely functional core** — deterministic, testable, composable, auditable
-- **Explicit effect ADT** gives granular control over side-effect execution (effects can be logged, reordered, filtered, or batched)
-- **Type-safe** with Scala 3 opaque types (`Term`, `LogIndex`, `NodeId`)
-- **Immutable state transitions** — no shared mutable state, no data races possible
-- **Comprehensive feature set**: Pre-Vote, joint consensus, linearizable reads (ReadIndex + lease), leadership transfer, learners, witnesses, Multi-Raft Group, batching, pipelining, parallel replication
-- **Pluggable SPI** for all infrastructure concerns (Transport, LogStore, StableStore, StateMachine, TimerService)
-- **Cats Effect + FS2 integration** for resource-safe, cancellation-aware runtimes
-- **Multi-platform**: runs on JVM, Scala.js, and GraalVM native image
+- **Zero-dependency Sans-I/O core + optional full stack** — embed `raft-core` on JDK 25 Virtual Threads, Netty, ZIO, or Pekko, *or* adopt the complete Cats Effect + FFM WAL + Netty gRPC stack
+- **Deterministic Simulation Testing (DST)** — FoundationDB / TigerBeetle-style single-threaded seeded 5-node chaos simulation (`DeterministicSimulationSpec`) verifying all 5 Raft invariants, split-persist crashes, and `3 → 5 → 3` Joint Consensus in ~1 second
+- **Jepsen WGL Linearizability & Multi-JVM `SIGKILL -9`** — built-in Wing & Gong linearizability checker (`raft-jepsen`) + partition/crash nemesis + 3-JVM `Process.destroyForcibly()` mTLS E2E verification (`raft-itest`)
+- **Type & value safety** — Scala 3 opaque types (`Term`, `LogIndex`, `NodeId`, `GroupId`), canonical `LogId` total order, immutable `Bytes`, error-accumulating `Validated[ConfigError, A]`, typed `Applied[R]` outputs
+- **Comprehensive protocol surface** — Pre-Vote, Leader Stickiness, CheckQuorum, Joint Consensus (`C_old,new` → `C_new` + §4.1 rollback), ReadIndex + LeaseRead, Leadership Transfer (`TimeoutNow`), Learners, payload-stripped Witnesses, Multi-Raft with Coalesced Heartbeats, batching, pipelining, and streaming `"RSNP"` v2 snapshots
 
 **Weaknesses**:
 - Scala ecosystem is smaller than Go, Rust, or Java
-- Multi-Raft Group support is newer and less battle-tested than single-group mode
-- No Jepsen verification yet
-- Young project — no production track record
-- Requires familiarity with functional programming patterns (effects-as-data, ADTs, referential transparency)
+- Younger project without multi-year hyperscale production deployments like `etcd/raft` or `tikv/raft-rs`
+- Full FFM `MmapWalEngine` requires JDK 22+ (`raft-core` and `raft-runtime` target JDK 21+)
+- Effective customization benefits from familiarity with functional programming patterns (ADTs, immutability, Cats Effect `Resource`)
 
-**Best fit**: Scala/JVM projects that value type safety, testability, and functional programming. Excellent for systems where the consensus logic must be auditable, formally verifiable, or embedded in a larger functional architecture (e.g., alongside Cats Effect, http4s, or ZIO).
+**Best fit**: JVM/Scala systems that demand `tikv/raft-rs`-grade Sans-I/O discipline, deterministic simulation testability, type-safe state machines, or a turnkey Multi-Raft + off-heap WAL + mTLS gRPC stack without heavyweight framework lock-in.
 
 ---
 
@@ -228,49 +226,38 @@ A lightweight, modular Java Raft library emphasizing minimalism and clean abstra
 
 | Feature | etcd/raft | HC Raft | tikv/raft-rs | OpenRaft | SOFAJRaft | MicroRaft | **This Library** |
 |---------|:---------:|:-------:|:------------:|:--------:|:---------:|:---------:|:----------------:|
-| **Pure state machine** | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ |
-| **Leader election** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Log replication** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Snapshots** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Streaming snapshots** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Pre-Vote** | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Leader stickiness** | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| **Joint consensus** | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| **ReadIndex** | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Lease-based reads** | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Leadership transfer** | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Learner/non-voting** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| **Witness nodes** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| **Batching** | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **Pipelining** | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
-| **Parallel replication** | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **Multi-Raft Group** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
-| **Property-based tests** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| **Jepsen-verified** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
-| **Built-in transport** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ (SPI + gRPC) |
-| **Built-in storage** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ (SPI + MmapWAL) |
+| **Pure Sans-I/O state machine** | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ (`RaftLogic` + `RawNode`) |
+| **Leader election & Log replication** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Streaming snapshots** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (`RSNP` v2 + `Stream`) |
+| **Pre-Vote & Leader stickiness** | ✅ | ⚠️ (v1.3+) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Joint consensus** | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ (+ §4.1 rollback) |
+| **ReadIndex & Lease-based reads** | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Leadership transfer** | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ (`TimeoutNow`) |
+| **Learners & Witness nodes** | Learners | Learners | Learners | Learners | Learners | ❌ | ✅ (Both + payload strip) |
+| **Batching, Pipelining, Parallelism** | ✅ | ❌ | ✅ | ✅ | ✅ | Partial | ✅ (`BatchConfig` + `Inflights`) |
+| **Multi-Raft + Coalesced Heartbeats** | ❌ | ❌ | ❌ | ❌ | Multi-Raft | ❌ | ✅ (Both + Protobuf frame) |
+| **Property-based & DST chaos tests** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ (ScalaCheck + Seeded DST) |
+| **Jepsen / WGL Linearizability** | ✅ (etcd) | ✅ (Consul) | ✅ (TiKV) | ❌ | ✅ | ❌ | ✅ (`raft-jepsen` + Multi-JVM `SIGKILL`) |
+| **mTLS Peer-Identity Binding** | Host | Host | Host | Host | Host | Host | ✅ (X.509 CN / SAN / SPIFFE) |
+| **Optional Built-in Transport & WAL** | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ (gRPC + FFM `MmapWalEngine`) |
 
 ---
 
 ## The Architectural Spectrum
 
-Libraries fall on a spectrum from **minimal core** (you build everything) to **complete framework** (it handles everything):
+Libraries historically forced a binary choice between a **minimal Sans-I/O core** (you build all I/O) and a **complete framework** (the framework owns your threads, sockets, and disk):
 
 ```
-Minimal Core                                              Complete Framework
+Minimal Sans-I/O Core                                     Complete Framework
      ◄──────────────────────────────────────────────────────────►
      │                           │                              │
  etcd/raft                   OpenRaft                      SOFAJRaft
  tikv/raft-rs                                             HashiCorp Raft
  MicroRaft
- This Library
+ ◄── raft-core (0 deps) ─────────┼──── + raft-runtime + mmap + grpc ──►
 ```
 
-**Minimal core** libraries (etcd/raft, tikv/raft-rs, MicroRaft, this library) give you the consensus algorithm as a pure function or state machine. You build the networking, storage, and timers. This maximizes flexibility — you can use any network stack, any storage engine, any timer implementation — but increases integration effort. It also makes the library **testable in isolation**, which is why this end of the spectrum tends to produce more thoroughly tested consensus logic.
-
-**Complete frameworks** (HashiCorp Raft, SOFAJRaft) provide everything out of the box. You implement a state machine and the framework handles the rest. This minimizes time-to-working-system but limits customization. Want to use QUIC instead of TCP? Write to RocksDB instead of BoltDB? With a framework, you may be fighting the design.
-
-**Middle ground** (OpenRaft) provides the core algorithm plus an async runtime, requiring you to implement storage and networking traits but managing the event loop internally.
+By isolating `raft-core` (`0` external dependencies) from optional `raft-runtime`, `raft-storage-mmap`, and `raft-transport-grpc`, this library lets teams adopt **exactly** the layer they need: embed `RawNode` on JDK 25 Virtual Threads for a custom database engine (`examples.rawnode.RawNodeHostLoopExample`), or compose the full Multi-Raft + gRPC + FFM WAL stack (`examples.advanced.ShardedBankLedgerExample`).
 
 > **Note — Neither end is "better."** The right choice depends on your team's expertise and project requirements. If you're building a database where consensus is the core, the control of a minimal library is essential. If you're adding consensus to an existing service, the convenience of a framework is hard to beat.
 

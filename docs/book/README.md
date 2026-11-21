@@ -113,21 +113,22 @@ Whether you're learning about distributed consensus for the first time or design
 
 | | Appendix | Contents |
 |---|---------|----------|
-| A | [Quick Reference](appendix-a-quick-reference.md) | All types, effects, messages, configuration parameters, and SPI interfaces at a glance |
+| A | [Quick Reference](appendix-a-quick-reference.md) | All domain primitives, `NodeState`s, 17 `RaftMessage`s, 18 `Effect`s, `RaftConfig`, SPI interfaces, and module entry points at a glance |
+| B | [Annotated Guide to All 18 Runnable Examples](appendix-b-examples-catalog.md) | Tier-by-tier walkthrough of all 18 runnable examples — from pure `RaftLogic` mechanics and Virtual-Thread `RawNode` / DST to the 1,529-line `ShardedBankLedgerExample` — plus four guided learning paths |
 
 ---
 
 ## Quick Start
 
-Run an example to see the library in action:
+Run any of the 18 verified examples to see the library in action:
 
 ```bash
 sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"
 sbt "examples/runMain examples.rawnode.RawNodeHostLoopExample"
 sbt "examples/runMain examples.simulation.DeterministicSimulationExample"
+sbt "examples/runMain examples.protocol.ReadIndexAndLeaseExample"
+sbt "examples/runMain examples.cluster.JointConsensusExample"
 sbt "examples/runMain examples.kvstore.KVStoreExample"
-sbt "examples/runMain examples.cluster.ThreeNodeClusterExample"
-sbt "examples/runMain examples.distributed.DistributedTransactionExample"
 sbt "examples/runMain examples.distributed.MultiGroupExample"
 ```
 

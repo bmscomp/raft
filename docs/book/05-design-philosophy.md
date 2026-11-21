@@ -176,33 +176,44 @@ This is the most distinctive architectural choice in the library. Instead of per
 
 ```scala
 enum Effect:
-  case SendMessage(to: NodeId, msg: RaftMessage)
-  case Broadcast(msg: RaftMessage)
+  case SendMessage(to: NodeId, message: RaftMessage)
+  case Broadcast(message: RaftMessage)
   case PersistHardState(term: Long, votedFor: Option[NodeId])
   case AppendLogs(entries: Seq[Log])
   case TruncateLog(fromIndex: Long)
-  case CommitEntries(upToIndex: Long)
+  case CommitEntries(index: LogIndex)
   case BecomeLeader
+  case StopLeader
   case ResetElectionTimer
   case ResetHeartbeatTimer
-  // ... and more
+  // ... 18 total exhaustive, pure data cases (see Chapter 6)
 ```
 
-Each `Effect` is just a case class — a piece of data that says "please do X". The protocol logic constructs these effects; a separate **effect interpreter** in the runtime actually executes them:
+Each `Effect` is just an immutable case value — a piece of data that says "please do X". The protocol logic constructs these effects; a separate **effect interpreter** in the runtime actually executes them:
 
 ```scala
-def executeEffects(effects: List[Effect], transport: RaftTransport[IO]): IO[Unit] =
+def executeEffects(
+  effects: List[Effect],
+  transport: RaftTransport[IO],
+  logStore: LogStore[IO],
+  stableStore: StableStore[IO],
+  rescheduleElection: IO[Unit],
+  rescheduleHeartbeat: IO[Unit]
+): IO[Unit] =
   effects.traverse_ {
+    case PersistHardState(term, v) => stableStore.setHardState(Term.unsafeFrom(term), v)
+    case AppendLogs(entries)       => logStore.append(entries)
+    case TruncateLog(fromIdx)      => logStore.truncateFrom(LogIndex.unsafeFrom(fromIdx))
     case Broadcast(msg)            => transport.broadcast(msg)
     case SendMessage(to, msg)      => transport.send(to, msg)
-    case PersistHardState(term, v) => stableStore.setCurrentTerm(term) *> stableStore.setVotedFor(v)
-    case AppendLogs(entries)       => logStore.append(entries)
     case CommitEntries(upTo)       => applyCommittedEntries(upTo)
-    case ResetElectionTimer        => timerService.resetElectionTimer
-    case ResetHeartbeatTimer       => timerService.resetHeartbeatTimer
+    case ResetElectionTimer        => rescheduleElection
+    case ResetHeartbeatTimer       => rescheduleHeartbeat
     case _                         => IO.unit
   }
 ```
+
+Notice the critical detail on `PersistHardState`: the interpreter invokes atomic `stableStore.setHardState(term, votedFor)` (one durable `msync`/`fsync` record) rather than splitting `setCurrentTerm` and `setVotedFor` into two writes that could tear on crash.
 
 ### What Does This Buy You?
 
@@ -216,15 +227,36 @@ The effect interpreter is **your code**, which means you have total control over
 
 > **Note — Command/Query Separation:** If you're familiar with design patterns, the effects pattern is a specific instance of the Command pattern (GoF, 1994) combined with Command-Query Responsibility Segregation (CQRS). The protocol logic is the "query" side — it computes what should happen. The effect interpreter is the "command" side — it makes it happen. This separation is what makes the system so testable and flexible.
 
+## The Seven Pillars of This Implementation
+
+Beyond pure transitions, this repository applies the same systems-engineering rigor across all seven sbt modules (`raft-core`, `raft-runtime`, `raft-storage-mmap`, `raft-transport-grpc`, `raft-jepsen`, `raft-examples`, `raft-itest`). Understanding *why* each layer is built this way reveals the strong points of the library as a whole:
+
+1. **Two-Tier Zero-Dependency Core (`RaftLogic` + `ConsensusKernel` / `RawNode`)**:
+   - `RaftLogic` exposes single-step pure functions `(NodeState, RaftMessage, ...) => Transition(NodeState, List[Effect])` for transparent inspection and custom interpreters.
+   - `ConsensusKernel` (`raft.kernel.ConsensusKernel`) scales that same pure discipline (`0` `var`s, `0` `while` loops, `0` `null`s, `0` runtime casts, `0` thrown exceptions) into a complete Mealy machine bundling `UnstableLog`, `ProgressTracker` (`Probe`/`Replicate`/`Snapshot` + `Inflights`), multi-chunk snapshot reassembly, Joint Consensus rollback, and an embedded **SplitMix64 PRNG** (`prngState: Long`) for deterministic election jitter — wrapped by the `tikv/raft-rs`-style `RawNode` cursor ([Chapter 22](22-sans-io-rawnode-ready.md)).
+2. **Structural Persistence-Before-RPC (`Ready.messages` vs. `Ready.persistedMessages`)**:
+   - Inside `ConsensusKernel`, `hasUnpersistedTermOrVote(localId)` guards every outbound RPC. Whenever `term` or `votedFor` has changed since `lastPersistedHardState`, every outbound message is automatically routed to `Ready.persistedMessages`, structurally forbidding votes or term acknowledgments from escaping before durable WAL `fsync` — while allowing safe leader `AppendEntries` to overlap with disk writes via `Ready.messages` (§10.2.1).
+3. **Compile-Time Discipline & Zero-Cost Domain Safety**:
+   - Built with `-Wvalue-discard`, `-Wnonunit-statement`, `-Wunused:all`, and `-Werror`, paired with zero-allocation opaque types (`Term`, `LogIndex`, `NodeId`, `GroupId`), canonical `LogId(term, index)` ordering, structural `Bytes`, stack-trace-free `RaftError`, and error-accumulating `Validated[ConfigError, A]`.
+4. **Typed Runtime Outputs & Lock-Free Network Dispatch (`RaftNode[F, R]`)**:
+   - `RaftNode[F, R]` carries the `StateMachine[F, R]` result type `R` all the way to the caller (`proposeAndApply(Bytes): F[Applied[R]]`), eliminating ad-hoc side-channel response maps. Consensus mutations and WAL appends run inside `Mutex[F]` in nanoseconds using an `O(1)` `TermRingBuffer`, while **all network RPCs execute outside the lock** and snapshots stream directly to disk via `FilePendingSnapshot` under `Supervisor[F]`.
+5. **Off-Heap JDK FFM Storage with Lock-Free Leased Reads (`raft-storage-mmap`)**:
+   - `MmapWalEngine` writes segmented `.wal` files through JDK 22+ `Arena` / `MemorySegment` off-heap buffers, guards concurrent readers with reference-counted `SegmentLease[F]` pins (zero `Arena.close()` use-after-free races without holding the write mutex), indexes up to `Long.MaxValue` via a pure immutable 2-level radix `WalIndexState`, verifies CRC32 before heap allocation, and self-heals torn uncommitted tails after `SIGKILL`.
+6. **Zero-Trust Multiplexed Networking & Coalesced Heartbeats (`raft-transport-grpc` + `MultiRaftNode`)**:
+   - `GrpcTransport` manages peer channels inside a lock-free `AtomicCell`, batches pipelined `AppendEntries` into single HTTP/2 `WireEnvelope.payloads` RPCs, propagates receiver queue saturation via `WireAck(accepted = false)` (`RESOURCE_EXHAUSTED` backoff), binds `WireEnvelope.sender_id` to authenticated mTLS X.509 `CN` / `DNS` / SPIFFE `URI` SANs, and packs multi-group heartbeats via `CoalescedHeartbeatConfig` with superseding eviction.
+7. **Deterministic Simulation & Six-Layer Verification**:
+   - Because `ConsensusKernel` has zero clocks, zero threads, and a seeded PRNG, `DeterministicSimulationSpec` and `examples.simulation.DeterministicSimulationExample` compress thousands of partitions, split-persist crashes, and `3 → 5 → 3` Joint Consensus migrations into sub-second, bit-for-bit reproducible runs ([Chapter 24](24-deterministic-simulation-testing.md)), complemented by WGL linearizability and Multi-JVM `SIGKILL -9` verification ([Chapter 20](20-jepsen-verification.md)).
+
 ## Summary
 
 | Design Principle | How It's Implemented | Why It Matters |
 |-----------------|---------------------|---------------|
-| **Pure functions** | `RaftLogic.onMessage` returns `Transition(state, effects)` with no I/O | Testable, deterministic, reproducible |
-| **Explicit effects** | `Effect` ADT describes all side effects as data | Observable, batchable, retryable |
-| **Type safety** | Opaque types for `Term`, `LogIndex`, `NodeId` | Catches misuse at compile time, zero runtime cost |
-| **Immutability** | All state is immutable `case class` values | No locks, no races, no shared mutable state |
-| **Zero coupling** | Protocol logic has no runtime dependencies | Portable across platforms and infrastructure |
+| **Pure consensus cores** | `RaftLogic.onMessage` (`Transition`) & `ConsensusKernel` (`RawNode` / `Ready`) with `0` I/O and `0` `var`s | Sub-millisecond tests, seeded DST, bit-for-bit replay |
+| **Explicit effects & barriers** | 18-case `Effect` ADT + `Ready.messages` vs. `Ready.persistedMessages` | Structural Persistence-Before-RPC (§5.1/§5.2) |
+| **Type & value safety** | Opaque `Term`/`LogIndex`/`NodeId`/`GroupId`, `LogId`, immutable `Bytes`, `Validated` | Compile-time bug prevention at zero allocation cost |
+| **Typed lock-free runtime** | `RaftNode[F, R]` → `Applied[R]`, `TermRingBuffer`, RPC dispatch outside `Mutex[F]` | No response-map hacks, no lock-held network stalls |
+| **Off-heap crash-safe WAL** | `MmapWalEngine`, `SegmentLease`, radix `WalIndexState`, 280-byte `MmapHardState` | Zero-GC log I/O, lock-free reads, `SIGKILL` torn-tail healing |
+| **Zero-dependency portability** | `raft-core` has **0** external compile dependencies | Embeddable on Virtual Threads, Cats Effect, ZIO, Pekko, or simulators |
 
 ---
 

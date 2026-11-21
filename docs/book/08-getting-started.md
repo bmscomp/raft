@@ -6,23 +6,27 @@
 
 ## Setup
 
-Add the library to your `build.sbt`:
+Add the library to your `build.sbt` (Scala `3.3.9` LTS, JDK 21+ for `raft-core` / `raft-runtime`, JDK 22+/25 for `raft-storage-mmap`):
 
 ```scala
-val scala3Version = "3.3.7"
+val scala3Version = "3.3.9"
 
 lazy val root = project
   .in(file("."))
   .settings(
     scalaVersion := scala3Version,
     libraryDependencies ++= Seq(
-      "org.typelevel" %% "cats-effect" % "3.6.3",
-      "co.fs2"        %% "fs2-core"    % "3.12.2"
+      // Zero-dependency pure consensus core (RaftLogic, ConsensusKernel, RawNode)
+      "com.github.bmscomp" % "raft-core"           % "<version>",
+      // Optional turnkey Cats Effect 3.7 + FS2 3.14 runtime, FFM WAL, and Netty gRPC
+      "com.github.bmscomp" % "raft-runtime"        % "<version>",
+      "com.github.bmscomp" % "raft-storage-mmap"   % "<version>",
+      "com.github.bmscomp" % "raft-transport-grpc" % "<version>"
     )
   )
 ```
 
-The core protocol logic — `RaftLogic`, `NodeState`, `RaftMessage`, `Effect` — has **zero runtime dependencies**. It's pure Scala 3 code with no imports from Cats Effect, FS2, or any other library. You only need Cats Effect and FS2 if you use the SPI implementations (`InMemTransport`, `InMemLogStore`, etc.) and the `RaftNode` runtime. This means you can use the protocol logic in any Scala 3 environment, including Scala.js.
+`raft-core` (`RaftLogic`, `ConsensusKernel`, `RawNode`, `Ready`, `ProgressTracker`, `NodeState`, `RaftMessage`, `Effect`, `Bytes`, `LogId`) has **zero external runtime dependencies** — pure Scala 3 standard library only. Add `raft-runtime` (`cats-effect` 3.7.1, `fs2-core` 3.14.0, `log4cats-core` 2.8.0) when you want the turnkey typed `RaftNode[F, R]`, `MultiRaftNode[F]`, `CompactionManager`, and SPI abstractions.
 
 ## Your First Election: A Step-by-Step Walkthrough
 
@@ -142,49 +146,79 @@ flowchart LR
 ```
 
 ```scala
-import cats.effect.IO
+import cats.effect.{Fiber, IO, Ref}
+import cats.effect.std.Queue
 import cats.syntax.all.*
+import fs2.Stream
+import raft.effect.Effect
+import raft.effect.Effect.*
+import raft.logic.RaftLogic
+import raft.message.RaftMessage
+import raft.message.RaftMessage.*
+import raft.spi.*
+import raft.state.*
 
 def eventLoop(
   stateRef: Ref[IO, NodeState],
+  electionFiberRef: Ref[IO, Option[Fiber[IO, Throwable, Unit]]],
+  heartbeatFiberRef: Ref[IO, Option[Fiber[IO, Throwable, Unit]]],
+  timerQueue: Queue[IO, RaftMessage],
   config: RaftConfig,
   transport: RaftTransport[IO],
   logStore: LogStore[IO],
   stableStore: StableStore[IO],
   timerService: TimerService[IO]
 ): IO[Unit] =
-  // Merge all event sources into a single stream
-  val events: Stream[IO, RaftMessage] =
-    transport.receive.map(_._2)                             // messages from peers
-      .merge(timerService.electionTimeouts.as(ElectionTimeout))   // election timer
-      .merge(timerService.heartbeatTicks.as(HeartbeatTimeout))    // heartbeat timer
+  // Merge peer RPCs with logical timer events into one serialized stream
+  val events: Stream[IO, (Option[NodeId], RaftMessage)] =
+    transport.receive
+      .map { case (from, msg) => (Some(from), msg) }
+      .merge(Stream.fromQueueUnterminated(timerQueue).map(msg => (None, msg)))
 
-  // Process each event through the pure logic
-  events.evalMap { msg =>
+  val resetElection: IO[Unit] =
     for
-      state        <- stateRef.get
-      lastIdx      <- logStore.lastIndex
-      lastTerm     <- logStore.termAt(lastIdx).map(_.getOrElse(0L))
-      clusterSize  =  3  // from your cluster config
+      delay <- timerService.randomElectionTimeout(config.electionTimeoutMin)
+      fiber <- timerService.scheduleElection(delay, timerQueue.offer(ElectionTimeout))
+      prev  <- electionFiberRef.getAndSet(Some(fiber))
+      _     <- prev.traverse_(_.cancel)
+    yield ()
 
-      transition   =  RaftLogic.onMessage(
-                         state, msg, config, lastIdx, lastTerm, clusterSize
-                       )
+  val resetHeartbeat: IO[Unit] =
+    for
+      fiber <- timerService.scheduleHeartbeat(config.heartbeatInterval, timerQueue.offer(HeartbeatTimeout))
+      prev  <- heartbeatFiberRef.getAndSet(Some(fiber))
+      _     <- prev.traverse_(_.cancel)
+    yield ()
 
-      _            <- stateRef.set(transition.state)
-      _            <- executeEffects(
-                         transition.effects, transport, logStore,
-                         stableStore, timerService
-                       )
+  // Process each event sequentially through the pure consensus core
+  events.evalMap { case (senderOpt, msg) =>
+    for
+      state    <- stateRef.get
+      lastIdx  <- logStore.lastIndex
+      lastTerm <- logStore.termAt(lastIdx).map(_.map(_.value).getOrElse(0L))
+      transition = RaftLogic.onMessage(
+        state        = state,
+        message      = msg,
+        config       = config,
+        lastLogIndex = lastIdx.value,
+        lastLogTerm  = lastTerm,
+        clusterSize  = 3,
+        sender       = senderOpt
+      )
+      _ <- stateRef.set(transition.state)
+      _ <- executeEffects(
+        transition.effects, transport, logStore, stableStore,
+        resetElection, resetHeartbeat
+      )
     yield ()
   }.compile.drain
 ```
 
-The event sources are merged using FS2's `merge`, which interleaves items from multiple streams concurrently. The `evalMap` processes each event sequentially — this is important because Raft transitions must be applied in order (you can't process two events concurrently on the same node).
+The event sources are merged using FS2's `merge`, while `evalMap` serializes every transition on the local node (preventing concurrent state-machine mutations).
 
 ### The Effect Interpreter
 
-The effect interpreter is a pattern match over the `Effect` ADT. Here's a complete implementation:
+The effect interpreter is a straightforward pattern match over the `Effect` ADT — preserving **atomic** hard-state persistence before outbound network sends:
 
 ```scala
 def executeEffects(
@@ -192,48 +226,60 @@ def executeEffects(
   transport: RaftTransport[IO],
   logStore: LogStore[IO],
   stableStore: StableStore[IO],
-  timerService: TimerService[IO]
+  resetElection: IO[Unit],
+  resetHeartbeat: IO[Unit]
 ): IO[Unit] =
   effects.traverse_ {
+    case PersistHardState(term, v) => stableStore.setHardState(Term.unsafeFrom(term), v)
+    case AppendLogs(entries)       => logStore.append(entries)
+    case TruncateLog(fromIdx)      => logStore.truncateFrom(LogIndex.unsafeFrom(fromIdx))
     case Broadcast(msg)            => transport.broadcast(msg)
     case SendMessage(to, msg)      => transport.send(to, msg)
-    case PersistHardState(term, v) => stableStore.setCurrentTerm(term) *> stableStore.setVotedFor(v)
-    case AppendLogs(entries)       => logStore.append(entries)
-    case TruncateLog(fromIdx)      => logStore.truncateFrom(fromIdx)
-    case CommitEntries(upTo)       => IO.println(s"Committed up to index $upTo")
-    case ResetElectionTimer        => timerService.resetElectionTimer
-    case ResetHeartbeatTimer       => timerService.resetHeartbeatTimer
-    case BecomeLeader              => IO.println("I am the leader!")
+    case CommitEntries(upTo)       => IO.println(s"Committed up to index ${upTo.value}")
+    case ResetElectionTimer        => resetElection
+    case ResetHeartbeatTimer       => resetHeartbeat
+    case BecomeLeader              => IO.println("I am the leader!") *> resetHeartbeat
     case _                         => IO.unit
   }
 ```
 
-> **Note — Effect ordering:** The `traverse_` function processes effects in order. This is important because the protocol logic emits `PersistHardState` effects before `Broadcast` and `SendMessage` effects. Executing them in order ensures that the node persists its state before sending messages — which is required for crash safety (see Chapter 7).
+> **Note — Choosing Your Abstraction Level:** Writing a custom interpreter teaches every moving part of Raft, while in production you rarely need to hand-roll one:
+> - Use **`RawNode` + `Ready` / `LightReady`** (`raft-core`, [Chapter 22](22-sans-io-rawnode-ready.md)) when embedding Raft inside your own Virtual Thread, Netty, ZIO, or Pekko loop with zero external dependencies.
+> - Use **`RaftNode[F, R]`** or **`MultiRaftNode[F]`** (`raft-runtime`, [Chapters 18 & 21](18-end-to-end-integration.md)) when you want a turnkey Cats Effect runtime with `proposeAndApply -> F[Applied[R]]`, lock-free network dispatch, group-commit batching, streaming compaction, and `MmapWalEngine` + `GrpcTransport`.
 
-## Running the Examples
+## Running All 18 Included Examples
 
-The library ships with 11 runnable examples that cover everything from basic protocol mechanics to full distributed applications. Each example is a standalone `main` class you can run with sbt:
+The `modules/examples` project ships **18 runnable, test-verified examples** (`ExamplesVerificationSpec` + `AdvancedShardedLedgerE2ESpec`) covering every tier of the library. Run any example with `sbt "examples/runMain <class>"`:
 
 ```bash
-# Protocol fundamentals
-sbt "runMain examples.protocol.PreVoteExample"
-sbt "runMain examples.protocol.LogMatchingExample"
-sbt "runMain examples.protocol.CommitTrackingExample"
-sbt "runMain examples.protocol.TimerServiceExample"
+# Tier 1: Pure RaftLogic protocol mechanics & single-phase cluster
+sbt "examples/runMain examples.cluster.ThreeNodeClusterExample"
+sbt "examples/runMain examples.protocol.PreVoteExample"
+sbt "examples/runMain examples.protocol.LogMatchingExample"
+sbt "examples/runMain examples.protocol.CommitTrackingExample"
+sbt "examples/runMain examples.protocol.TimerServiceExample"
 
-# Cluster simulation (3-node in-memory cluster with real message passing)
-sbt "runMain examples.cluster.ThreeNodeClusterExample"
+# Tier 2: Zero-dependency Sans-I/O RawNode, Virtual Threads, DST & Advanced Protocol
+sbt "examples/runMain examples.rawnode.RawNodeHostLoopExample"
+sbt "examples/runMain examples.simulation.DeterministicSimulationExample"
+sbt "examples/runMain examples.protocol.ReadIndexAndLeaseExample"
+sbt "examples/runMain examples.protocol.LeadershipTransferExample"
+sbt "examples/runMain examples.cluster.JointConsensusExample"
 
-# Application case studies
-sbt "runMain examples.kvstore.KVStoreExample"
-sbt "runMain examples.lock.DistributedLockExample"
-sbt "runMain examples.counter.CounterWithCodecExample"
-sbt "runMain examples.distributed.DistributedCounterExample"
-sbt "runMain examples.distributed.RaftTransactionExample"
-sbt "runMain examples.distributed.DistributedTransactionExample"
+# Tier 3: Application StateMachines, Custom Codecs & Multi-Raft
+sbt "examples/runMain examples.kvstore.KVStoreExample"
+sbt "examples/runMain examples.lock.DistributedLockExample"
+sbt "examples/runMain examples.counter.CounterWithCodecExample"
+sbt "examples/runMain examples.distributed.DistributedCounterExample"
+sbt "examples/runMain examples.distributed.DistributedTransactionExample"
+sbt "examples/runMain examples.distributed.RaftTransactionExample"
+sbt "examples/runMain examples.distributed.MultiGroupExample"
+
+# Tier 4: Flagship Full-Stack Production System (Multi-Raft + gRPC + FFM WAL + 2PC)
+sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"
 ```
 
-Each example is self-contained and heavily commented. Start with `PreVoteExample` to see how Pre-Vote gates election entry, then move to `ThreeNodeClusterExample` to see a complete cluster simulation, and finally explore the application examples.
+See [Appendix B — Annotated Guide to All 18 Runnable Examples](appendix-b-examples-catalog.md) for a complete walkthrough and learning roadmap across every example.
 
 ## Testing Your Code
 
@@ -277,12 +323,13 @@ class MyRaftSpec extends AnyFlatSpec with Matchers:
   }
 ```
 
-Run the full test suite:
+Run the verification suites across all 7 modules:
 
 ```bash
-sbt test                            # all 527 tests
-sbt "testOnly *ChaosScenarioSpec"   # adversarial network/timing scenarios
-sbt "testOnly *SafetyPropertySpec"  # property-based safety invariants
+sbt test                                          # full unit, property, DST, FFM WAL, gRPC, itest & examples suites
+sbt "core/testOnly *DeterministicSimulationSpec"  # sub-second seeded 5-node DST chaos suite
+sbt "core/testOnly *SafetyPropertySpec"           # ScalaCheck safety invariants
+sbt jepsenSmoke                                   # Wing & Gong linearizability + partition nemesis suite
 ```
 
 The test suite runs in seconds, not minutes, because there are no real network connections or timer waits. This is the payoff of the pure function architecture.

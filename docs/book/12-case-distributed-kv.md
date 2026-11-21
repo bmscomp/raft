@@ -51,84 +51,115 @@ The key insight is the clean separation of concerns. The Raft layer handles repl
 
 ## Step 1: Define the Command Protocol
 
-Every operation the client can perform must be serializable into a byte array for storage in the Raft log. We define an ADT (algebraic data type) for the three command types:
+Every operation the client can perform must be serializable into bytes for storage in the Raft log. Following `examples.kvstore.KVStoreExample`, we define both the command ADT (including atomic Compare-And-Swap) and a typed response ADT:
 
 ```scala
 enum KVCommand:
   case Put(key: String, value: String)
   case Delete(key: String)
   case Get(key: String)
+  case CAS(key: String, expected: String, newValue: String)
+
+enum KVResult:
+  case Ok
+  case Value(v: Option[String])
+  case CasOk
+  case CasFailed(currentValue: Option[String])
+  case Error(msg: String)
 
 object KVCommand:
+  private val SEP = "\t"
+
   def encode(cmd: KVCommand): Array[Byte] = cmd match
-    case Put(k, v) => s"PUT\t$k\t$v".getBytes
-    case Delete(k) => s"DEL\t$k".getBytes
-    case Get(k)    => s"GET\t$k".getBytes
+    case Put(k, v)       => s"PUT$SEP$k$SEP$v".getBytes("UTF-8")
+    case Delete(k)       => s"DEL$SEP$k".getBytes("UTF-8")
+    case Get(k)          => s"GET$SEP$k".getBytes("UTF-8")
+    case CAS(k, exp, nv) => s"CAS$SEP$k$SEP$exp$SEP$nv".getBytes("UTF-8")
 
   def decode(data: Array[Byte]): Either[String, KVCommand] =
-    new String(data).split("\t").toList match
-      case "PUT" :: k :: v :: Nil => Right(Put(k, v))
-      case "DEL" :: k :: Nil      => Right(Delete(k))
-      case "GET" :: k :: Nil      => Right(Get(k))
-      case other                  => Left(s"Invalid command: $other")
+    new String(data, "UTF-8").split(SEP).toList match
+      case "PUT" :: k :: v :: Nil          => Right(Put(k, v))
+      case "DEL" :: k :: Nil               => Right(Delete(k))
+      case "GET" :: k :: Nil               => Right(Get(k))
+      case "CAS" :: k :: exp :: nv :: Nil  => Right(CAS(k, exp, nv))
+      case other                           => Left(s"Invalid command: $other")
 ```
 
-We use tab-delimited strings for simplicity and readability. In a production system, you'd use Protocol Buffers, MessagePack, or another binary codec for:
-- **Schema evolution**: adding new command types without breaking existing entries
-- **Size efficiency**: binary encodings are typically 5-10× smaller
-- **Type safety**: binary codecs catch serialization errors at compile time
+We use tab-delimited UTF-8 strings for readability. In production (as demonstrated by `WireCodec` in `ShardedBankLedgerExample`), use a length-prefixed binary codec or Protobuf for schema evolution, compact framing, and arbitrary binary keys/values.
 
-> **Note — Why is Get in the command protocol?** For strict linearizability, reads can go through the Raft log — this guarantees they see the latest committed state. However, this adds full replication latency to every read. In Step 4 below, we'll add ReadIndex and lease-based reads as faster alternatives. Including `Get` in the command protocol gives you the option of routing reads through the log when maximum consistency is needed (at the cost of latency).
+> **Note — Why include `CAS` and `Get`?** Because Raft serializes every log entry in a single total order, `CAS(key, expected, newValue)` becomes an **atomic, linearizable compare-and-swap** across the entire cluster with zero distributed locks — the primitive behind leader leases, configuration versioning, and optimistic concurrency control. Including `Get` allows routing reads through the log when maximum simplicity is desired, while Step 4 adds faster `ReadIndex` and `LeaseRead` paths.
 
-## Step 2: Implement the State Machine
+## Step 2: Implement the Streaming State Machine
 
-The state machine applies committed commands to an in-memory `Map`. It implements the `StateMachine[F, String]` trait from Chapter 6:
+The state machine applies committed commands to an atomic `Ref[F, Map[String, String]]` and implements the streaming `StateMachine[F, KVResult]` trait from [Chapter 7](07-spi-layer.md):
 
 ```scala
+import java.nio.charset.StandardCharsets
 import cats.effect.*
+import cats.syntax.all.*
+import fs2.Stream
 import raft.spi.StateMachine
 import raft.state.Log
 
 class KVStateMachine[F[_]: Sync](
   store: Ref[F, Map[String, String]]
-) extends StateMachine[F, String]:
+) extends StateMachine[F, KVResult]:
 
-  def apply(log: Log): F[String] =
+  def apply(log: Log): F[KVResult] =
     KVCommand.decode(log.data) match
       case Right(KVCommand.Put(k, v)) =>
-        store.update(_.updated(k, v)).as("OK")
+        store.update(_.updated(k, v)).as(KVResult.Ok)
       case Right(KVCommand.Delete(k)) =>
-        store.update(_ - k).as("OK")
+        store.update(_ - k).as(KVResult.Ok)
       case Right(KVCommand.Get(k)) =>
-        store.get.map(m => m.getOrElse(k, "(not found)"))
+        store.get.map(m => KVResult.Value(m.get(k)))
+      case Right(KVCommand.CAS(k, expected, newValue)) =>
+        store.modify { m =>
+          m.get(k) match
+            case Some(v) if v == expected => (m.updated(k, newValue), KVResult.CasOk)
+            case current                  => (m, KVResult.CasFailed(current))
+        }
       case Left(err) =>
-        Sync[F].pure(s"ERROR: $err")
+        Sync[F].pure(KVResult.Error(err))
 
-  def snapshot: F[Array[Byte]] =
+  def snapshot: F[Stream[F, Byte]] =
     store.get.map { m =>
-      m.map { case (k, v) => s"$k=$v" }.mkString("\n").getBytes
+      val bytes = m.toSeq
+        .sortBy(_._1)
+        .map { case (k, v) => s"$k=$v" }
+        .mkString("\n")
+        .getBytes(StandardCharsets.UTF_8)
+      Stream.emits(bytes).covary[F]
     }
 
-  def restore(data: Array[Byte]): F[Unit] =
-    val entries = new String(data).split("\n").flatMap { line =>
-      line.split("=", 2) match
-        case Array(k, v) => Some(k -> v)
-        case _           => None
-    }.toMap
-    store.set(entries)
+  def restore(data: Stream[F, Byte]): F[Unit] =
+    data.compile.to(Array).flatMap { bytes =>
+      val str = new String(bytes, StandardCharsets.UTF_8)
+      val entries =
+        if str.isEmpty then Map.empty[String, String]
+        else
+          str.split("\n").flatMap { line =>
+            line.split("=", 2) match
+              case Array(k, v) => Some(k -> v)
+              case _           => None
+          }.toMap
+      store.set(entries)
+    }
+
+  def get(key: String): F[Option[String]] = store.get.map(_.get(key))
 ```
 
 Let's examine why each method works correctly:
 
-**`apply`**: The Cats Effect `Ref` provides atomic updates. Even though the state machine is called from a concurrent event loop, `store.update` is thread-safe. The return value (`"OK"`, the value, or an error) is sent back to the client.
+**`apply`**: Returns a strongly typed `F[KVResult]`. When hosted inside `RaftNode[IO, KVResult]`, calling `leader.proposeAndApply(Bytes.copyFrom(KVCommand.encode(cmd)))` suspends until quorum commit *and* local application, returning `Applied[KVResult](logId, value)` directly to the caller — no side-channel mutable maps needed to correlate CAS outcomes!
 
-**`snapshot`**: Serializes the entire map to a newline-delimited string. This is a **point-in-time capture** — the Ref's `get` returns a consistent snapshot of the map at the moment it's called. The library ensures no entries are being applied concurrently.
+**`snapshot`**: Sorts keys deterministically (`sortBy(_._1)`) and emits an `fs2.Stream[F, Byte]` so `CompactionManager` and `MmapWalEngine` can stream `"RSNP"` v2 checksummed snapshots directly to disk and peers without forcing large datasets into contiguous heap arrays.
 
-**`restore`**: Replaces the map atomically with the deserialized snapshot data. After restore, subsequent `apply` calls continue from the entries after the snapshot's last included index.
+**`restore`**: Replaces the map atomically from the streamed bytes. Subsequent `apply` calls continue from `snapshot.lastIncludedIndex + 1`.
 
-**Determinism**: This implementation is deterministic — `apply` doesn't use randomness, system clocks, or external I/O. Given the same sequence of log entries, every node produces the same map state. This is the absolute requirement for replicated state machines (Chapter 7).
+**Determinism**: `apply` uses no randomness, wall clocks, or external I/O. Given the same committed log prefix, every replica produces the exact same `Map[String, String]`.
 
-> **Note — Performance considerations for production:** An in-memory `Map` works well for moderate data sizes. For data sets exceeding available RAM, consider using an embedded database (RocksDB, LevelDB, LMDB) as the backing store. The `StateMachine` interface is the same — only `apply`, `snapshot`, and `restore` change. RocksDB's native snapshot support makes the `snapshot` method efficient even for large data sets.
+> **Note — Exactly-Once Client Retries:** What if a client submits `CAS("counter", "1", "2")`, the leader commits it, and then crashes *before* returning `CasOk`? If the client blindly retries on the new leader, the second execution sees `"2" != "1"` and erroneously receives `CasFailed`. Production KV stores solve this by tagging mutating commands with `(clientId, seqNum)` and storing a bounded per-client response table inside the `StateMachine` (and its snapshots!) — a pattern demonstrated end-to-end in `ShardedBankLedgerExample` ([Chapter 15](15-case-distributed-transactions.md)).
 
 ## Step 3: Wire It Together and See It Work
 
@@ -171,103 +202,86 @@ val program: IO[Unit] = for
 yield ()
 ```
 
-## Step 4: Adding Linearizable Reads
+## Step 4: Adding Linearizable Reads (`ReadIndex` and `LeaseRead`)
 
-The basic implementation routes reads through the Raft log (`Put("user:1", "Alice")` goes through replication), which adds full replication latency to every read. For read-heavy workloads, this is unacceptable. Here are two faster alternatives from Chapter 3:
+Routing reads through the Raft log adds a full WAL `msync` + replication round-trip to every query. Both `RaftNode[IO, KVResult]` and `RawNode` expose the two faster §6.4 alternatives from [Chapter 3](03-raft-advanced-theory.md):
 
-### ReadIndex: One Network Round-Trip
+### ReadIndex: One Network Round-Trip (Clock-Free Linearizability)
 
-ReadIndex confirms the leader's authority with a heartbeat round before serving the read:
+On `RaftNode[IO, KVResult]`, `node.readIndex` executes a quorum heartbeat round and suspends until `lastApplied >= confirmedCommitIndex` before returning:
 
 ```scala
-// The leader confirms it's still the leader
-val readTrans = RaftLogic.handleReadIndex(leaderState, config, clusterSize)
-
-readTrans.effects.collectFirst {
-  case ConfirmLeadership(commitIndex) =>
-    // Runtime: send heartbeat to all followers
-    //          wait for majority acknowledgment
-    //          then serve the read from state applied through commitIndex
-    commitIndex
-}
+def linearizableGet(
+  leader: RaftNode[IO, KVResult],
+  fsm: KVStateMachine[IO],
+  key: String
+): IO[Option[String]] =
+  for
+    _     <- leader.readIndex      // 1-RTT quorum confirmation + wait until lastApplied >= readIndex
+    value <- fsm.get(key)          // safe to read local state machine!
+  yield value
 ```
 
-After receiving majority acknowledgment, the runtime reads from the state machine. The read is linearizable because:
-1. The heartbeat confirms no new leader has been elected
-2. The commitIndex ensures the read sees all committed writes
+At the pure `RaftLogic` level, submitting `ReadIndexRequest(requestId)` emits `ConfirmLeadership(term, roundId)` plus per-peer heartbeats anchored at each follower's `(prevLogIndex, prevLogTerm)` — and once a quorum responds, emits `ReadIndexReady(requestId, commitIndex)`.
 
-### Lease-Based Reads: Zero Network Round-Trips
+### Lease-Based Reads: Zero Network Round-Trips (Monotonic Lease + Fallback)
 
-If bounded clock skew is acceptable, lease-based reads are even faster:
+When `checkQuorumEnabled = true` and `leaseReadEnabled = true` (with `leaderLeaseDuration` sized safely below `electionTimeoutMin - maxClockDrift`), `leader.leaseRead` checks the leader's monotonic lease deadline locally and returns `Option[Long]`:
 
 ```scala
-val config = RaftConfig(
-  localId = n1,
-  leaderLeaseDuration = 100.millis  // conservative for ~10ms clock skew
-)
-
-val leaseTrans = RaftLogic.handleLeaseRead(leaderState, config)
-
-leaseTrans.effects.collectFirst {
-  case LeaseReadReady(commitIndex) =>
-    // Lease is valid — serve the read immediately from local state
-    // No network communication at all!
-    commitIndex
-}
+def fastLinearizableGet(
+  leader: RaftNode[IO, KVResult],
+  fsm: KVStateMachine[IO],
+  key: String
+): IO[Option[String]] =
+  leader.leaseRead.flatMap {
+    case Some(_) => fsm.get(key)                         // 0 RTTs! Lease active
+    case None    => leader.readIndex *> fsm.get(key)     // Safe 1-RTT quorum fallback
+  }
 ```
 
 Here's a comparison of the three read strategies for a KV store:
 
 | Strategy | Per-Read Latency | Consistency | When to Use |
 |----------|-----------------|-------------|-------------|
-| Log reads | ~5-20ms (full replication) | Linearizable | Maximum safety, low read volume |
-| ReadIndex | ~1-5ms (one heartbeat RTT) | Linearizable | General purpose, most deployments |
-| Lease-based | ~0ms (local lookup) | Linearizable* | Read-heavy workloads, trusted clocks |
+| Log reads (`proposeAndApply(Get)`) | ~5–20ms (WAL + replication) | Strict linearizability | Maximum simplicity, low read volume |
+| `ReadIndex` (`node.readIndex`) | ~1–5ms (1 heartbeat RTT, 0 disk I/O) | Strict linearizability | Default for general production deployments |
+| `LeaseRead` (`node.leaseRead`) | ~0ms (local monotonic lookup) | Linearizable* | Read-heavy workloads with bounded clock drift |
 
-\* *Requires bounded clock skew between nodes*
+\* *Requires bounded monotonic clock drift between hosts (`leaderLeaseDuration < electionTimeoutMin - maxClockDrift`).*
 
-## Step 5: Snapshot and Recovery
+## Step 5: Streaming Snapshot and Recovery
 
-As the log grows, you periodically take snapshots to bound storage use and accelerate node recovery. Here's the complete lifecycle:
-
-### Taking a Snapshot
+As the log grows, `CompactionManager` periodically captures a streaming snapshot to bound WAL size and accelerate follower recovery:
 
 ```scala
-// Your runtime periodically triggers a snapshot (e.g., every 10,000 entries)
-val snapshotData: IO[Array[Byte]] = fsm.snapshot
-// Returns bytes representing: "user:1=Alice\nuser:3=Charlie"
-// (user:2 is absent because it was deleted)
+// Capture streaming snapshot from KVStateMachine[IO]
+val snapshotStream: IO[fs2.Stream[IO, Byte]] = fsm.snapshot
+
+// Restore on a newly joined or restarted node
+val recoveredFsm: IO[KVStateMachine[IO]] =
+  for
+    stream <- snapshotStream
+    fsm2   <- KVStateMachine[IO]
+    _      <- fsm2.restore(stream)
+  yield fsm2
 ```
 
-### Recovering from a Snapshot
-
-When a new node joins (or a crashed node restarts with an empty log), it receives the snapshot via `InstallSnapshot` from the leader:
-
-```scala
-val recoveredFsm = for
-  store <- Ref.of[IO, Map[String, String]](Map.empty)
-  fsm   =  new KVStateMachine[IO](store)
-  _     <- fsm.restore(snapshotBytes)
-yield fsm
-// fsm now has {user:1 → Alice, user:3 → Charlie}
-// Ready to receive AppendEntries from the leader for entries after the snapshot
-```
-
-The beauty of this approach: the recovering node doesn't need to replay millions of log entries from the beginning. It loads the snapshot (a single bulk file), restores the state machine, and then only needs to replay entries after the snapshot's last included index. Recovery time drops from minutes to seconds (or less).
+When a lagging replica starts with an empty log, the leader streams `"RSNP"` v2 chunks via `InstallSnapshotRequest`, the follower buffers them safely on disk via `FilePendingSnapshot` without OOM risk, restores `KVStateMachine`, and replays only entries strictly after `snapshot.lastIncludedIndex`.
 
 ## Architecture Summary
 
-Here's the complete data flow from client request to response:
+Here's the complete data flow from client request to typed `Applied[KVResult]` response:
 
 ```
 Client Request: PUT user:1 Alice
         │
         ▼
    ┌───────────┐
-   │  Leader   │   1. Encode: KVCommand.Put("user:1", "Alice") → bytes
+   │  Leader   │   1. Encode: KVCommand.Put("user:1", "Alice") → Bytes
    │ (Node-1)  │   2. Create: Log.command(idx=1, term=1, data=bytes)
-   │           │   3. Append to local log (durable write)
-   │           │   4. Send AppendEntries to all followers
+   │           │   3. Append to local WAL (durable msync)
+   │           │   4. Dispatch AppendEntries outside Mutex[F] to followers
    └─────┬─────┘
          │
    ┌─────┴───────────────────┐
@@ -281,17 +295,17 @@ Client Request: PUT user:1 Alice
    ┌─────┴────────────┐
    │   All nodes      │
    │   apply(entry)   │ → store.update(_.updated("user:1", "Alice"))
-   │   return "OK"    │ → leader sends "OK" to client
+   │   Applied(Ok)    │ → completes caller's Deferred[Applied[KVResult]]
    └──────────────────┘
 ```
 
 ## Run the Example
 
 ```bash
-sbt "runMain examples.kvstore.KVStoreExample"
+sbt "examples/runMain examples.kvstore.KVStoreExample"
 ```
 
-The example creates a complete in-memory cluster, sends multiple PUT/GET/DELETE commands through the Raft log, and demonstrates linearizable reads using both ReadIndex and lease-based approaches.
+`KVStoreExample` defines the full `KVCommand` (`Put`, `Delete`, `Get`, `CAS`) and `KVStateMachine[IO]`, drives a two-phase **Pre-Vote → Real Vote** leader election via `RaftLogic.onMessage(..., clusterOpt = Some(cluster))`, appends `Put` and `Delete` log entries, and applies them sequentially to demonstrate replicated state transitions. To see `ReadIndex` and `LeaseRead` tested under live partitions, also run `sbt "examples/runMain examples.protocol.ReadIndexAndLeaseExample"`.
 
 ---
 

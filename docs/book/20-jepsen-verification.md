@@ -97,11 +97,12 @@ val history = History(ops)
 - **`RegisterModel`**: Arbitrary-typed per-key single-value register (`Read`, `Write`, `CAS`).
 - **`CounterModel`**: Monotonic `Long` counter (`Read`, atomic increment `Write`, and `CAS`).
 
-### 3. Exploiting P-Compositionality (`LinearizabilityChecker`)
+### 3. Exploiting P-Compositionality & Memoized WGL Search (`LinearizabilityChecker`)
 
-General linearizability checking is NP-complete in the number of concurrent operations. However, Maurice Herlihy and Jeannette Wing proved **locality (P-compositionality)**: a history `H` over independent single-key registers is linearizable *if and only if* for every key `k`, the single-key projection `H|k` (`history.forKey(k)`) is linearizable!
+General linearizability checking is NP-complete in the number of concurrent operations. Two insights make `LinearizabilityChecker.check(history, KVModel)` fast enough to run on every CI build:
 
-`LinearizabilityChecker.check(history, KVModel)` partitions a multi-key workload by key (`history.keys`), runs bounded real-time-precedence DFS per key independently, and either returns a complete `witness` ordering or pinpoints the exact offending key and minimal timeline (`history.timeline`).
+1. **Locality / P-Compositionality (Herlihy & Wing, 1990)**: A history $H$ over independent single-key registers is linearizable *if and only if* for every key $k$, the single-key projection $H|_k$ (`history.forKey(k)`) is linearizable. Partitioning a multi-key history by `history.keys` cuts the concurrency width from global cluster traffic down to per-key contention — and when a bug occurs, immediately pinpoints the exact offending key and minimal timeline (`history.timeline`).
+2. **Real-Time Precedence + Visited-State Memoization**: Within each key's projection, an operation $op$ is eligible to be linearized next if and only if no remaining unlinearized operation $op'$ completed strictly before $op$ was invoked ($t_{\text{comp}}(op') < t_{\text{inv}}(op)$). The Wing & Gong / Lowe (WGL) DFS explores eligible transitions against `SequentialModel.step(state, op)` while memoizing visited `(linearizedBitSet, modelState)` pairs so equivalent interleavings are never re-explored exponentially. Indeterminate `Info` operations (timeouts during leader crashes) represent calls that *may or may not* have taken effect before the end of the history — explaining why real-world linearizability testing must distinguish definite `Fail` rejections from open-ended `Info` timeouts.
 
 ---
 
@@ -165,11 +166,12 @@ flowchart TD
 
 | Verification Layer | Command | Typical Runtime | Primary Faults Caught |
 |--------------------|---------|-----------------|-----------------------|
-| **Core Unit & Properties** | `sbt core/test` | `< 3s` | Term/vote rules, codec round-trips, `Ready`/`ProgressTracker` edge cases |
-| **Seeded DST Chaos** | `sbt "core/testOnly *DeterministicSimulationSpec"` | `~1.2s` | Multi-step interleavings across partitions, Joint Consensus, WAL compaction, and snapshot installation |
-| **Runtime Cluster Suites** | `sbt "runtime/testOnly raft.integration.*"` | `~5s` | Fiber races, `Deferred` completion, `CheckQuorum` step-down, `leaseRead` expiry, `MultiGroupTransport` demux |
-| **Full-Stack gRPC + WAL** | `sbt itest/test` | `~6s` | Protobuf wire framing, Netty reconnect backoff, FFM `.wal` rotation, on-disk snapshot + WAL crash recovery |
-| **Jepsen Smoke & Stress** | `sbt jepsenSmoke` / `sbt jepsenStress` | `5s – 60s` | Sustained random partition/heal schedules under multi-client WGL linearizability |
+| **1. Core Unit & Properties** | `sbt core/test` | `< 3s` | Term/vote rules, `LogId` total order, codec round-trips, `Ready`/`ProgressTracker` edge cases |
+| **2. Seeded DST Chaos** | `sbt "core/testOnly *DeterministicSimulationSpec"` | `~1.2s` | Multi-step interleavings across partitions, split-persist crashes, `3→5→3` Joint Consensus, WAL compaction, snapshots |
+| **3. Stateful FFM WAL Model-Checking** | `sbt "storageMmap/testOnly *MmapWalEngineStatefulPropertySpec"` | `~2s` | Segment rotation, `SegmentLease` concurrency, torn-tail `SIGKILL` recovery, 64-bit `WalIndexState`, `RSNP` v2 snapshots |
+| **4. Runtime Cluster Suites** | `sbt "runtime/testOnly raft.integration.*"` | `~5s` | Fiber races, typed `Applied[R]` `Deferred`s, `CheckQuorum` step-down, `leaseRead` expiry, `MultiGroupTransport` demux |
+| **5. Multi-JVM `SIGKILL -9` & Full-Stack E2E** | `sbt itest/test` | `~6s` | Protobuf wire framing, Netty reconnect & backpressure, mTLS identity binding, OS `SIGKILL` crash recovery, WGL linearizability |
+| **6. Jepsen Smoke & Stress** | `sbt jepsenSmoke` / `sbt jepsenStress` | `5s – 60s` | Sustained random partition/heal/leader-hunt schedules under multi-client WGL linearizability |
 
 ---
 

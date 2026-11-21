@@ -147,7 +147,31 @@ private def releaseLock(lockId: String, clientId: String): F[LockResult] =
 
 Only the lock's owner can release it. Attempts by other clients are denied. Releasing a non-existent lock returns `NotFound` — this is idempotent, which is important because release commands might be retried.
 
-> **Note — Determinism and Clock usage:** You might notice that `acquireLock` calls `Clock[F].realTime`, which reads the system clock — a non-deterministic operation. Strictly speaking, this violates the determinism contract from Chapter 6. In production, you'd encode the timestamp in the log entry data (set by the leader at submission time), so that all nodes use the same timestamp when applying the entry. We use `Clock` here for simplicity, but be aware of this subtlety in production designs.
+> **Note — Determinism and Clock usage:** You might notice that `acquireLock` calls `Clock[F].realTime`, which reads the local system clock — a non-deterministic operation. Strictly speaking, this violates the determinism contract from [Chapter 7](07-spi-layer.md): if Follower B applies the entry 500ms after Leader A due to a brief network delay, B could see the lock as expired while A sees it as valid. In production, the leader stamps the absolute expiry epoch into the command payload *before* proposing it to the Raft log, so every replica compares against the exact same deterministic timestamp.
+
+### Fencing Tokens: Why Raft's `LogIndex` Solves GC-Pause Corruption
+
+Even a linearizable lock service cannot stop a client from experiencing a 30-second JVM garbage-collection pause *after* acquiring a lock. Consider what happens without fencing:
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1 (Lock Holder)
+    participant LS as Raft Lock Service
+    participant C2 as Client 2
+    participant DB as Downstream Storage
+
+    C1->>LS: Acquire("db-migration") -> Acquired (fencingToken = logIndex 42)
+    Note over C1: 35s GC Stop-The-World Pause! Lease expires!
+    C2->>LS: Acquire("db-migration") -> Acquired (fencingToken = logIndex 47)
+    C2->>DB: Write(data, token = 47) -> OK (DB records maxToken = 47)
+    Note over C1: Client 1 wakes up, still thinks it holds the lock!
+    C1->>DB: Write(staleData, token = 42)
+    DB-->>C1: REJECTED (42 < 47) — Corruption Prevented!
+```
+
+This is Martin Kleppmann's central insight in *"How to do distributed locking"* (2016): a distributed lock used for **correctness** (not merely efficiency) must issue a **strictly monotonically increasing fencing token** on every acquisition, and the protected storage resource must reject requests carrying an older token.
+
+Because Raft assigns every committed entry a unique, strictly increasing `LogIndex`, **`Applied[LockResult].logId.index`** (or `log.index` inside `StateMachine.apply(log)`) gives you a **cryptographically simple, globally monotonic fencing token for free** — guaranteed never to decrease even across leader crashes and network partitions!
 
 ## Step 3: Using the Lock
 
@@ -232,8 +256,10 @@ This is the fundamental advantage over non-consensus lock services like standalo
 ## Run the Example
 
 ```bash
-sbt "runMain examples.lock.DistributedLockExample"
+sbt "examples/runMain examples.lock.DistributedLockExample"
 ```
+
+`DistributedLockExample` boots a `LockStateMachine[IO]` (implementing streaming `snapshot` / `restore` alongside `Acquire`, `Release`, and `Heartbeat`), runs a two-phase Pre-Vote → Vote election through `RaftLogic.onMessage`, and steps through mutual exclusion: `client-1` acquires `resource-a` (`Acquired`) → `client-2` is rejected (`Denied`) → `client-1` releases (`Released`) → `client-2` retries and acquires (`Acquired`).
 
 ---
 
