@@ -342,7 +342,7 @@ class ProtobufMultiGroupCodecSpec
       val gCfg = GrpcConfig(host = "127.0.0.1", port = 0)
       val coal = CoalescedHeartbeatConfig(
         enabled = true,
-        flushInterval = 15.millis,
+        flushInterval = 10.seconds,
         maxBatchSize = 8,
         coalesceResponses = true
       )
