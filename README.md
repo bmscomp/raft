@@ -28,7 +28,7 @@ Traditional JVM Raft frameworks hijack your threads, force an opinionated RPC st
 
 ---
 
-## 6-Module Architecture
+## 7-Module Architecture
 
 ```mermaid
 flowchart TD
@@ -37,7 +37,8 @@ flowchart TD
     mmap["raft-storage-mmap (JDK 22+ FFM Segmented WAL)"]
     grpc["raft-transport-grpc (ScalaPB + gRPC Netty)"]
     jepsen["raft-jepsen (WGL Linearizability & Nemesis Suite)"]
-    examples["raft-examples (17 Runnable Examples · publish/skip)"]
+    examples["raft-examples (18 Runnable Examples · publish/skip)"]
+    itest["raft-itest (Full-Stack gRPC + WAL + Multi-JVM SIGKILL E2E · publish/skip)"]
 
     core --> runtime
     runtime --> mmap
@@ -45,16 +46,20 @@ flowchart TD
     runtime --> jepsen
     mmap --> examples
     grpc --> examples
+    mmap --> itest
+    grpc --> itest
+    jepsen --> itest
 ```
 
 | Module | Artifact | External Dependencies (`Compile`) | Purpose |
 |--------|----------|-----------------------------------|---------|
-| `modules/core` | `raft-core` | **Zero** (Scala 3 stdlib only) | `RaftLogic`, `RawNode`, `Ready`/`LightReady`, `ProgressTracker` (`Probe`/`Replicate`/`Snapshot` + `Inflights`), `RaftStorage`/`MemStorage`, `LogId`, `JsonCodec` |
-| `modules/runtime` | `raft-runtime` | `cats-effect`, `fs2-core`, `log4cats-core` | `RaftNode`, `MultiRaftNode`, `CompactionManager`, streaming `Snapshot[F]`, `LogStore`/`StableStore`/`SnapshotStore`/`Transport` SPIs |
-| `modules/storage-mmap` | `raft-storage-mmap` | `raft-runtime` (JDK `java.lang.foreign`) | Off-heap memory-mapped segmented WAL (`Arena`/`MemorySegment`), CRC32 validation, segment rotation & compaction |
-| `modules/transport-grpc` | `raft-transport-grpc` | `scalapb-runtime-grpc`, `grpc-netty-shaded` | Protobuf wire protocol + live Netty HTTP/2 client/server `GrpcTransport` with cached channel pooling |
+| `modules/core` | `raft-core` | **Zero** (Scala 3 stdlib only) | `RaftLogic`, `ConsensusKernel`, `RawNode`, `Ready`/`LightReady`, `ProgressTracker` (`Probe`/`Replicate`/`Snapshot` + `Inflights`), `RaftStorage`/`MemStorage`, `LogId`, `Bytes`, `JsonCodec` |
+| `modules/runtime` | `raft-runtime` | `cats-effect`, `fs2-core`, `fs2-io`, `log4cats-core` | Typed `RaftNode[F, R]`, `MultiRaftNode` + `CoalescedHeartbeatConfig`, `CompactionManager`, streaming `Snapshot[F]`, `LogStore`/`StableStore`/`SnapshotStore`/`Transport` SPIs |
+| `modules/storage-mmap` | `raft-storage-mmap` | `raft-runtime` (JDK `java.lang.foreign`) | Lease-safe off-heap memory-mapped segmented WAL (`Arena`/`MemorySegment`), CRC32 `MmapHardState`, torn-tail self-healing, `"RSNP"` v2 streaming snapshots |
+| `modules/transport-grpc` | `raft-transport-grpc` | `scalapb-runtime-grpc`, `grpc-netty-shaded` | Protobuf wire protocol + pure `AtomicCell`-pooled Netty HTTP/2 `GrpcTransport`, `WireEnvelope.payloads` batching, `WireAck` backpressure, mTLS X.509 `sender_id` binding |
 | `modules/jepsen` | *(unpublished)* | `raft-runtime` | Wing & Gong (WGL) linearizability checker, partition/crash/split-brain `NemesisScheduler`, chaos & stress harnesses |
-| `modules/examples` | *(unpublished)* | `raft-storage-mmap`, `raft-transport-grpc`, `logback` | 17 runnable end-to-end protocol, Virtual Thread Sans-I/O, DST, KV, Lock, Transaction, and Multi-Raft examples |
+| `modules/examples` | *(unpublished)* | `raft-storage-mmap`, `raft-transport-grpc`, `logback` | 18 runnable end-to-end examples: flagship Sharded Bank Ledger (2PC + Multi-Raft + gRPC + FFM WAL), Virtual Thread Sans-I/O, DST, KV, Lock, Transaction, and protocol demos |
+| `modules/itest` | *(unpublished)* | `raft-storage-mmap`, `raft-transport-grpc`, `raft-jepsen` | Full-stack cross-module resilience, mTLS identity enforcement, and Multi-JVM `SIGKILL -9` crash-recovery E2E suites |
 
 ---
 
@@ -81,15 +86,19 @@ flowchart TD
 
 ### Coordinates (`build.sbt`)
 
+Artifacts are published to [GitHub Packages](https://github.com/bmscomp/raft/packages) and attached to [GitHub Releases](https://github.com/bmscomp/raft/releases) (see [CHANGELOG.md](CHANGELOG.md)):
+
 ```scala
+resolvers += "GitHub Packages" at "https://maven.pkg.github.com/bmscomp/raft"
+
 // Pure Sans-I/O consensus engine (zero transitive third-party dependencies!)
-libraryDependencies += "com.github.bmscomp" % "raft-core" % "<version>"
+libraryDependencies += "com.github.bmscomp" % "raft-core" % "0.2.0"
 
 // Optional Cats Effect + FS2 runtime, FFM WAL, and gRPC Netty transport
 libraryDependencies ++= Seq(
-  "com.github.bmscomp" % "raft-runtime"        % "<version>",
-  "com.github.bmscomp" % "raft-storage-mmap"   % "<version>",
-  "com.github.bmscomp" % "raft-transport-grpc" % "<version>"
+  "com.github.bmscomp" % "raft-runtime"        % "0.2.0",
+  "com.github.bmscomp" % "raft-storage-mmap"   % "0.2.0",
+  "com.github.bmscomp" % "raft-transport-grpc" % "0.2.0"
 )
 ```
 
@@ -110,9 +119,12 @@ val t2      = RaftLogic.onVoteResponse(t1.state.asInstanceOf[Candidate], NodeId(
 
 ---
 
-## Runnable Examples (17 Included)
+## Runnable Examples (18 Included)
 
 ```bash
+# Flagship full-stack Multi-Raft + gRPC + FFM MmapWalEngine + Cross-Shard 2PC Ledger
+sbt "examples/runMain examples.advanced.ShardedBankLedgerExample"
+
 # Sans-I/O RawNode on JDK Virtual Threads & Seeded Deterministic Simulation
 sbt "examples/runMain examples.rawnode.RawNodeHostLoopExample"
 sbt "examples/runMain examples.simulation.DeterministicSimulationExample"
@@ -142,11 +154,12 @@ sbt "examples/runMain examples.distributed.MultiGroupExample"
 ## Testing & Verification
 
 ```bash
-sbt test                    # Fast unit, property, DST, WAL, gRPC, and WGL checker tests (~530 tests)
+sbt test                    # Fast unit, property, DST, WAL, gRPC, examples & E2E tests (625+ tests)
 sbt "core/test"             # Pure zero-dependency raft-core suite + DeterministicSimulationSpec
 sbt jepsenSmoke             # Jepsen WGL linearizability suite under partitions, restarts & CAS
 sbt jepsenStress            # Long-running 7-node Jepsen chaos & leader-hunting stress suite
-sbt scalafmtCheckAll doc    # Formatting & API Scaladoc verification
+sbt mimaReportBinaryIssues  # Binary compatibility verification (MiMa) against v0.2.0
+sbt scalafmtCheckAll scalafmtSbtCheck doc  # Formatting & API Scaladoc verification
 ```
 
 ---

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   lint-and-docs:
-    name: Format & Scaladoc (JDK 25)
+    name: Format, Docs & MiMa (JDK 25)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -32,6 +32,9 @@ jobs:
 
       - name: Check formatting & generate API docs
         run: sbt -batch scalafmtCheckAll scalafmtSbtCheck doc
+
+      - name: Check binary compatibility (MiMa)
+        run: sbt -batch mimaReportBinaryIssues
 
   compat-jdk21:
     name: JDK 21 Bytecode Compatibility (core & runtime)

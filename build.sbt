@@ -1,4 +1,10 @@
+import java.net.URI
+import java.net.http.{HttpClient, HttpRequest, HttpResponse}
+import java.nio.file.{Files, StandardCopyOption}
+
 val scala3Version = "3.3.9"
+
+val mimaBinaryCompatibleVersions = Set("0.2.0")
 
 val catsEffectVersion = "3.7.1"
 val fs2Version = "3.14.0"
@@ -51,6 +57,65 @@ lazy val publishSettings = Seq(
   )
 )
 
+def fetchReleaseJar(
+    cacheDir: File,
+    moduleName: String,
+    version: String,
+    log: sbt.util.Logger
+): File = {
+  val targetJar = cacheDir / s"$moduleName-$version.jar"
+  if (!targetJar.exists() || targetJar.length() == 0L) {
+    Files.createDirectories(cacheDir.toPath)
+    val url =
+      s"https://github.com/bmscomp/raft/releases/download/v$version/$moduleName-$version.jar"
+    log.info(s"Downloading MiMa baseline artifact: $url")
+    val client = HttpClient
+      .newBuilder()
+      .followRedirects(HttpClient.Redirect.NORMAL)
+      .build()
+    val request = HttpRequest.newBuilder(URI.create(url)).GET().build()
+    val tmpPath =
+      Files.createTempFile(
+        cacheDir.toPath,
+        s"$moduleName-$version-",
+        ".jar.tmp"
+      )
+    try {
+      val response =
+        client.send(request, HttpResponse.BodyHandlers.ofFile(tmpPath))
+      if (response.statusCode() != 200) {
+        sys.error(
+          s"Failed to download MiMa baseline $url (HTTP ${response.statusCode()})"
+        )
+      }
+      Files.move(tmpPath, targetJar.toPath, StandardCopyOption.REPLACE_EXISTING)
+    } finally {
+      Files.deleteIfExists(tmpPath)
+    }
+  }
+  targetJar
+}
+
+lazy val mimaSettings = Seq(
+  mimaFailOnNoPrevious := true,
+  mimaCheckDirection := "backward",
+  mimaPreviousArtifacts := mimaBinaryCompatibleVersions.map { v =>
+    organization.value % name.value % v
+  },
+  mimaPreviousClassfiles := {
+    val log = streams.value.log
+    val cacheDir = (ThisBuild / baseDirectory).value / "target" / "mima-cache"
+    mimaPreviousArtifacts.value.map { m =>
+      m -> fetchReleaseJar(cacheDir, m.name, m.revision, log)
+    }.toMap
+  }
+)
+
+lazy val noMimaSettings = Seq(
+  mimaFailOnNoPrevious := false,
+  mimaPreviousArtifacts := Set.empty
+)
+
 lazy val commonTestDependencies = Seq(
   "org.scalatest" %% "scalatest" % scalatestVersion % Test,
   "org.scalatestplus" %% "scalacheck-1-19" % scalatestScalaCheckVersion % Test
@@ -65,7 +130,7 @@ lazy val effectTestDependencies = commonTestDependencies ++ Seq(
 
 lazy val core = project
   .in(file("modules/core"))
-  .settings(publishSettings, strictMainSettings)
+  .settings(publishSettings, strictMainSettings, mimaSettings)
   .settings(
     name := "raft-core",
     scalacOptions ++= commonScalacOptions ++ Seq("-java-output-version", "21"),
@@ -75,7 +140,7 @@ lazy val core = project
 lazy val runtime = project
   .in(file("modules/runtime"))
   .dependsOn(core)
-  .settings(publishSettings, strictMainSettings)
+  .settings(publishSettings, strictMainSettings, mimaSettings)
   .settings(
     name := "raft-runtime",
     Test / parallelExecution := false,
@@ -91,7 +156,7 @@ lazy val runtime = project
 lazy val storageMmap = project
   .in(file("modules/storage-mmap"))
   .dependsOn(runtime)
-  .settings(publishSettings, strictMainSettings)
+  .settings(publishSettings, strictMainSettings, mimaSettings)
   .settings(
     name := "raft-storage-mmap",
     scalacOptions ++= commonScalacOptions,
@@ -101,7 +166,7 @@ lazy val storageMmap = project
 lazy val transportGrpc = project
   .in(file("modules/transport-grpc"))
   .dependsOn(runtime)
-  .settings(publishSettings, strictMainSettings)
+  .settings(publishSettings, strictMainSettings, mimaSettings)
   .settings(
     name := "raft-transport-grpc",
     Test / parallelExecution := false,
@@ -125,6 +190,7 @@ lazy val transportGrpc = project
 lazy val jepsen = project
   .in(file("modules/jepsen"))
   .dependsOn(runtime)
+  .settings(noMimaSettings)
   .settings(
     name := "raft-jepsen",
     publish / skip := true,
@@ -143,6 +209,7 @@ lazy val jepsen = project
 lazy val examples = project
   .in(file("modules/examples"))
   .dependsOn(core, runtime, storageMmap, transportGrpc)
+  .settings(noMimaSettings)
   .settings(
     name := "raft-examples",
     publish / skip := true,
@@ -159,6 +226,7 @@ lazy val examples = project
 lazy val itest = project
   .in(file("modules/itest"))
   .dependsOn(core, runtime, storageMmap, transportGrpc, jepsen)
+  .settings(noMimaSettings)
   .settings(
     name := "raft-itest",
     publish / skip := true,
@@ -173,6 +241,7 @@ lazy val itest = project
 lazy val root = project
   .in(file("."))
   .aggregate(core, runtime, storageMmap, transportGrpc, jepsen, examples, itest)
+  .settings(noMimaSettings)
   .settings(
     name := "raft-root",
     publish / skip := true,
