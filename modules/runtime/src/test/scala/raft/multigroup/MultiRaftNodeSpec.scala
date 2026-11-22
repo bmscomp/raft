@@ -189,3 +189,133 @@ class MultiRaftNodeSpec extends AnyFunSuite with Matchers:
       yield ()).unsafeRunSync()
     }
     err.groupId shouldBe GroupId("ghost")
+    err.toRaftError shouldBe RaftError.GroupNotFound(GroupId("ghost"))
+
+  test(
+    "should execute proposeToGroup, proposeBytesToGroup, proposeBatchAndCommitToGroup, readIndexFromGroup, leaseReadFromGroup, and rebalanceLeadership on live single-node groups"
+  ):
+    import scala.concurrent.duration.*
+    import raft.state.NodeState.Leader
+
+    val node1 = NodeId("solo-1")
+    val voters = Set(node1)
+    val gid = GroupId("solo-shard")
+
+    def awaitLeader(multi: MultiRaftNode[IO], retries: Int = 200): IO[Unit] =
+      multi.getGroupState(gid).flatMap {
+        case Some(_: Leader) => IO.unit
+        case _               =>
+          if retries <= 0 then
+            IO.raiseError(new RuntimeException("Solo shard did not elect"))
+          else IO.sleep(15.millis) *> awaitLeader(multi, retries - 1)
+      }
+
+    val prog = MultiGroupTransport
+      .resource[IO](node1, _ => IO.unit)
+      .flatMap(tp => MultiRaftNode.resource[IO](node1, tp))
+      .use { multi =>
+        for
+          ls <- InMemLogStore[IO]()
+          ss <- InMemStableStore[IO]()
+          ts <- DefaultTimerService[IO]
+          cfg = GroupConfig[IO](
+            raftConfig = RaftConfig(
+              localId = node1,
+              electionTimeoutMin = 60.millis,
+              electionTimeoutMax = 120.millis,
+              heartbeatInterval = 20.millis,
+              leaseReadEnabled = true,
+              leaderLeaseDuration = 250.millis
+            ),
+            cluster = ClusterConfig(voters),
+            logStore = ls,
+            stableStore = ss,
+            stateMachine = new StateMachine[IO, Unit]:
+              def apply(log: Log): IO[Unit] = IO.unit
+              def snapshot: IO[Stream[IO, Byte]] = IO.pure(Stream.empty)
+              def restore(data: Stream[IO, Byte]): IO[Unit] = data.compile.drain
+            ,
+            timerService = ts
+          )
+          _ <- multi.createGroup(gid, cfg)
+          _ <- awaitLeader(multi)
+          id1 <- multi.proposeToGroup(gid, "k1=v1".getBytes("UTF-8"))
+          id2 <- multi.proposeBytesToGroup(gid, Bytes.fromUtf8("k2=v2"))
+          batch <- multi.proposeBatchAndCommitToGroup(
+            gid,
+            Seq("k3=v3".getBytes("UTF-8"), "k4=v4".getBytes("UTF-8"))
+          )
+          rIdx <- multi.readIndexFromGroup(gid)
+          lIdx <- multi.leaseReadFromGroup(gid)
+          rebalSelf <- multi.rebalanceLeadership(Map(gid -> node1))
+          e1 <- multi
+            .proposeToGroup(GroupId("missing"), Array.emptyByteArray)
+            .attempt
+          e2 <- multi
+            .proposeAndCommitToGroup(GroupId("missing"), Array.emptyByteArray)
+            .attempt
+          e3 <- multi
+            .proposeAndApplyToGroup(GroupId("missing"), Bytes.empty)
+            .attempt
+          e4 <- multi
+            .proposeBatchAndCommitToGroup(GroupId("missing"), Seq.empty)
+            .attempt
+          e5 <- multi.readIndexFromGroup(GroupId("missing")).attempt
+          e6 <- multi.leaseReadFromGroup(GroupId("missing")).attempt
+          e7 <- multi.transferGroupLeadership(GroupId("missing"), node1).attempt
+        yield
+          id2.index should be > id1.index
+          batch should have size 2
+          rIdx should be >= batch.last.index
+          lIdx.isDefined shouldBe true
+          rebalSelf shouldBe 0
+          List(e1, e2, e3, e4, e5, e6, e7).foreach { res =>
+            res.left.toOption.get shouldBe GroupNotFoundException(
+              GroupId("missing")
+            )
+          }
+      }
+
+    prog.timeout(20.seconds).unsafeRunSync()
+
+  test("should roll back transport registration if group initialization fails"):
+    val node1 = NodeId("node1")
+    val gid = GroupId("failing-shard")
+    val brokenStableStore = new raft.spi.StableStore[IO]:
+      def currentTerm: IO[Term] =
+        IO.raiseError(new RuntimeException("disk boom"))
+      def setCurrentTerm(term: Term): IO[Unit] = IO.unit
+      def votedFor: IO[Option[NodeId]] = IO.pure(None)
+      def setVotedFor(nodeId: Option[NodeId]): IO[Unit] = IO.unit
+      def hardState: IO[HardState] =
+        IO.raiseError(new RuntimeException("disk boom"))
+      def setHardState(term: Term, votedFor: Option[NodeId]): IO[Unit] = IO.unit
+
+    val result = (for
+      transport <- MultiGroupTransport[IO](node1, _ => IO.unit)
+      multi <- MultiRaftNode[IO](node1, transport)
+      ls <- InMemLogStore[IO]()
+      ts <- DefaultTimerService[IO]
+      badCfg = GroupConfig[IO](
+        raftConfig = RaftConfig.default(node1),
+        cluster = ClusterConfig(Set(node1)),
+        logStore = ls,
+        stableStore = brokenStableStore,
+        stateMachine = new StateMachine[IO, Unit]:
+          def apply(log: Log): IO[Unit] = IO.unit
+          def snapshot: IO[Stream[IO, Byte]] = IO.pure(Stream.empty)
+          def restore(data: Stream[IO, Byte]): IO[Unit] = data.compile.drain
+        ,
+        timerService = ts
+      )
+      attempt <- multi.createGroup(gid, badCfg).attempt
+      groupsAfter <- multi.listGroups
+      goodCfg <- mkGroupConfig(node1, Set(node1))
+      _ <- multi.createGroup(gid, goodCfg)
+      groupsRecovered <- multi.listGroups
+      _ <- multi.shutdown
+    yield (attempt, groupsAfter, groupsRecovered)).unsafeRunSync()
+
+    result._1.isLeft shouldBe true
+    result._2 shouldBe empty
+    result._3 shouldBe Set(gid)

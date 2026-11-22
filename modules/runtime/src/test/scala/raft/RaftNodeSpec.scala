@@ -161,12 +161,26 @@ class RaftNodeSpec extends AnyFlatSpec with Matchers:
           )
           _ = logId2.index should be > logId1.index
 
-          // Follower should reject proposeAndCommit with NotLeader
+          // Follower should reject proposeAndCommit, proposeConfChange, readIndex, and leaseRead with NotLeader
           followerNode = nodes.find(_._1 != leaderId).get._2
           followerAttempt <- followerNode
             .proposeAndCommit("bad=write".getBytes(StandardCharsets.UTF_8))
             .attempt
           _ = followerAttempt.left.toOption.get shouldBe a[RaftError.NotLeader]
+          followerConfAttempt <- followerNode
+            .proposeConfChange(cluster)
+            .attempt
+          _ = followerConfAttempt.left.toOption.get shouldBe a[
+            RaftError.NotLeader
+          ]
+          followerReadAttempt <- followerNode.readIndex.attempt
+          _ = followerReadAttempt.left.toOption.get shouldBe a[
+            RaftError.NotLeader
+          ]
+          followerLeaseAttempt <- followerNode.leaseRead.attempt
+          _ = followerLeaseAttempt.left.toOption.get shouldBe a[
+            RaftError.NotLeader
+          ]
 
           // Quorum ReadIndex
           rIdx <- leaderNode.readIndex

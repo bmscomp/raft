@@ -240,12 +240,15 @@ private final class MultiRaftNodeImpl[F[_]: Async](
           snapshotStoreOpt = snapshotStore,
           loggerOpt = Some(logger)
         )
-        pair <- poll(nodeResource.allocated).onCancel(
-          transport.unregisterGroup(groupId)
-        )
+        pair <- poll(nodeResource.allocated).guaranteeCase {
+          case Outcome.Succeeded(_) => F.unit
+          case _                    => transport.unregisterGroup(groupId)
+        }
         (node, release) = pair
-        _ <- poll(node.start).onError { case _ =>
-          release *> transport.unregisterGroup(groupId)
+        _ <- poll(node.start).guaranteeCase {
+          case Outcome.Succeeded(_) => F.unit
+          case _                    =>
+            release *> transport.unregisterGroup(groupId)
         }
         _ <- logger.info(s"Group ${groupId.value} started")
       yield (node, release)

@@ -257,5 +257,45 @@ class MmapSegmentSpec extends AnyFreeSpec with Matchers:
           Files.deleteIfExists(segPath)
           Files.deleteIfExists(tmpDir)
       }
+
+      "should reject invalid offsets, inconsistent recordLen/dataLen, and invalid LogType ordinal before heap allocation" in {
+        import java.nio.{ByteBuffer, ByteOrder}
+
+        val tmpDir = Files.createTempDirectory("raft-seg-bounds-")
+        val segPath = tmpDir.resolve("bounds.wal")
+        val seg = MmapSegment.create(segPath, 1L, 4096L)
+        val off = seg.appendEntry(mkLog(1L, 1L, "payload"))
+        seg.force()
+        try
+          intercept[CorruptedEntryException] { seg.readEntry(0L) }
+          intercept[CorruptedEntryException] { seg.readEntry(4090L) }
+        finally seg.close()
+
+        val raw1 = Files.readAllBytes(segPath)
+        ByteBuffer
+          .wrap(raw1)
+          .order(ByteOrder.nativeOrder())
+          .putInt(off.toInt, 10)
+        Files.write(segPath, raw1)
+        intercept[CorruptedEntryException] {
+          val s1 = MmapSegment.open(segPath, readOnly = true)
+          s1.close()
+        }
+
+        val fresh = MmapSegment.create(segPath, 1L, 4096L)
+        val off2 = fresh.appendEntry(mkLog(1L, 1L, "payload"))
+        fresh.force()
+        fresh.close()
+
+        val raw2 = Files.readAllBytes(segPath)
+        raw2((off2 + 20L).toInt) = 99.toByte
+        Files.write(segPath, raw2)
+        val s2 = MmapSegment.open(segPath, readOnly = true)
+        try intercept[CorruptedEntryException] { s2.readEntry(off2) }
+        finally
+          s2.close()
+          Files.deleteIfExists(segPath)
+          Files.deleteIfExists(tmpDir)
+      }
     }
   }

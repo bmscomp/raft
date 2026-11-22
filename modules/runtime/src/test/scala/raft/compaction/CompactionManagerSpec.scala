@@ -281,6 +281,83 @@ class CompactionManagerSpec extends AnyFlatSpec with Matchers:
     test.unsafeRunSync()
   }
 
+  it should "respect recordInstalledSnapshot, clusterProvider, onCompacted callback, retainedEntries, and RaftMetrics" in {
+    val cluster = ClusterConfig(Set(nodeId, NodeId("n2"), NodeId("n3")))
+
+    val test = for
+      logStore <- mkLogStore
+      snapshotStore = new InMemSnapshotStore
+      dataRef <- Ref.of[IO, String]("")
+      sm = mkStateMachine(dataRef)
+      compactedMetas <- Ref.of[IO, Vector[raft.state.SnapshotMetadata]](
+        Vector.empty
+      )
+      metricSnapshots <- Ref.of[IO, Vector[(NodeId, Long)]](Vector.empty)
+      metrics = new RaftMetrics[IO]:
+        def onBecomeLeader(id: NodeId, term: Long): IO[Unit] = IO.unit
+        def onStepDown(id: NodeId, term: Long): IO[Unit] = IO.unit
+        def onElectionStarted(id: NodeId, term: Long): IO[Unit] = IO.unit
+        def onVoteGranted(id: NodeId, to: NodeId, term: Long): IO[Unit] =
+          IO.unit
+        def onEntriesAppended(id: NodeId, count: Int): IO[Unit] = IO.unit
+        def onEntriesCommitted(id: NodeId, commitIndex: Long): IO[Unit] =
+          IO.unit
+        def onEntriesApplied(id: NodeId, lastApplied: Long): IO[Unit] = IO.unit
+        def onSnapshotTaken(id: NodeId, lastIndex: Long): IO[Unit] =
+          metricSnapshots.update(_ :+ (id, lastIndex))
+        def onHeartbeatSent(id: NodeId, followerCount: Int): IO[Unit] = IO.unit
+        def onReplicationFailure(id: NodeId, followerId: NodeId): IO[Unit] =
+          IO.unit
+
+      config = CompactionConfig(
+        level = CompactionLevel.Custom,
+        retainedEntries = 5L,
+        policy = Some(CompactionPolicy.threshold[IO](10L))
+      )
+      manager <- CompactionManager.create[IO](
+        config = config,
+        logStore = logStore,
+        snapshotStore = snapshotStore,
+        stateMachine = sm,
+        nodeId = nodeId,
+        metrics = metrics,
+        logger = logger,
+        clusterProvider = Some(IO.pure(Some(cluster))),
+        onCompacted = Some(meta => compactedMetas.update(_ :+ meta))
+      )
+
+      _ <- manager.recordInstalledSnapshot(50L)
+      entries = (51L to 65L).map(i => Log.command(i, 3L, s"v$i".getBytes))
+      _ <- logStore.append(entries)
+      _ <- entries.toList.traverse(sm.apply)
+
+      _ <- manager.maybeCompact(58L, 15L)
+      snapsBefore <- snapshotStore.list
+
+      _ <- manager.maybeCompact(62L, 15L)
+      latestSnap <- snapshotStore.loadLatest
+      callbacks <- compactedMetas.get
+      recordedMetrics <- metricSnapshots.get
+      droppedEntry <- logStore.get(LogIndex.unsafeFrom(56L))
+      retainedEntry <- logStore.get(LogIndex.unsafeFrom(57L))
+    yield {
+      snapsBefore shouldBe empty
+      latestSnap shouldBe defined
+      latestSnap.get.lastIncludedIndex shouldBe 62L
+      latestSnap.get.lastIncludedTerm shouldBe 3L
+      latestSnap.get.config shouldBe Some(cluster)
+      callbacks should have size 1
+      callbacks.head.lastIncludedIndex shouldBe 62L
+      callbacks.head.lastIncludedTerm shouldBe 3L
+      callbacks.head.config shouldBe Some(cluster)
+      recordedMetrics shouldBe Vector(nodeId -> 62L)
+      droppedEntry shouldBe None
+      retainedEntry shouldBe defined
+    }
+
+    test.unsafeRunSync()
+  }
+
   private implicit class TraverseOps[A](as: List[A]):
     def traverse(f: A => IO[Unit]): IO[Unit] =
       as.foldLeft(IO.unit)((acc, a) => acc *> f(a))

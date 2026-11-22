@@ -321,3 +321,68 @@ class SnapshotTransferSpec extends AnyFlatSpec with Matchers:
 
     test.unsafeRunSync()
   }
+
+  it should "override RPC term with explicit leaderTerm and clamp non-positive chunkSize/maxInFlight" in {
+    val test = for
+      transport <- IO(new RecordingTransport)
+      transfer = new SnapshotTransfer[IO](
+        chunkSize = 0,
+        transport = transport,
+        logger = logger,
+        maxInFlight = -2
+      )
+      snapshot = Snapshot[IO](
+        lastIncludedIndex = 75,
+        lastIncludedTerm = 3,
+        data = Stream.emits("ABC".getBytes).covary[IO]
+      )
+      chunks <- transfer.sendSnapshotPipelined(
+        leaderId,
+        followerId,
+        snapshot,
+        leaderTerm = 11L
+      )
+    yield
+      chunks shouldBe 3
+      val reqs = transport.sentMessages.collect {
+        case (_, r: InstallSnapshotRequest) => r
+      }
+      reqs.map(_.term) shouldBe Vector(11L, 11L, 11L)
+      reqs.map(_.lastIncludedTerm) shouldBe Vector(3L, 3L, 3L)
+      reqs.map(_.offset) shouldBe Vector(0L, 1L, 2L)
+      reqs.map(_.done) shouldBe Vector(false, false, true)
+
+    test.unsafeRunSync()
+  }
+
+  it should "fail with TimeoutException when a snapshot chunk send exceeds chunkTimeout" in {
+    import java.util.concurrent.TimeoutException
+    import scala.concurrent.duration.*
+
+    val stallingTransport = new RaftTransport[IO]:
+      def send(to: NodeId, msg: RaftMessage): IO[Unit] = IO.sleep(2.seconds)
+      def broadcast(msg: RaftMessage): IO[Unit] = IO.unit
+      def receive: Stream[IO, (NodeId, RaftMessage)] = Stream.empty
+      def localAddress: IO[String] = IO.pure("localhost:0")
+      def sendBatch(to: NodeId, msgs: Seq[RaftMessage]): IO[Unit] = IO.unit
+      def shutdown: IO[Unit] = IO.unit
+
+    val transfer = new SnapshotTransfer[IO](
+      chunkSize = 4,
+      transport = stallingTransport,
+      logger = logger,
+      chunkTimeout = 50.millis
+    )
+    val snapshot = Snapshot[IO](
+      lastIncludedIndex = 10,
+      lastIncludedTerm = 2,
+      data = Stream.emits("01234567".getBytes).covary[IO]
+    )
+
+    val result =
+      transfer
+        .sendSnapshot(leaderId, followerId, snapshot)
+        .attempt
+        .unsafeRunSync()
+    result.left.toOption.get shouldBe a[TimeoutException]
+  }
