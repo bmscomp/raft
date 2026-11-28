@@ -30,7 +30,8 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
             prevLogIndex = m.prevLogIndex,
             prevLogTerm = m.prevLogTerm,
             entries = m.entries.map(encodeLogEntry),
-            leaderCommit = m.leaderCommit
+            leaderCommit = m.leaderCommit,
+            heartbeatRound = m.heartbeatRound
           )
         )
 
@@ -43,7 +44,8 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
             hasConflictIndex = m.conflictIndex.isDefined,
             conflictIndex = m.conflictIndex.getOrElse(0L),
             hasConflictTerm = m.conflictTerm.isDefined,
-            conflictTerm = m.conflictTerm.getOrElse(0L)
+            conflictTerm = m.conflictTerm.getOrElse(0L),
+            heartbeatRound = m.heartbeatRound
           )
         )
 
@@ -205,7 +207,8 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
             prevLogIndex = m.prevLogIndex,
             prevLogTerm = m.prevLogTerm,
             entries = entries,
-            leaderCommit = m.leaderCommit
+            leaderCommit = m.leaderCommit,
+            heartbeatRound = m.heartbeatRound
           )
         }
 
@@ -218,7 +221,8 @@ object ProtobufMessageCodec extends SimpleMessageCodec[Array[Byte]]:
             conflictIndex =
               if m.hasConflictIndex then Some(m.conflictIndex) else None,
             conflictTerm =
-              if m.hasConflictTerm then Some(m.conflictTerm) else None
+              if m.hasConflictTerm then Some(m.conflictTerm) else None,
+            heartbeatRound = m.heartbeatRound
           )
         )
 

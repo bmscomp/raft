@@ -95,10 +95,10 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
     }
 
     "should create a file of the expected size" in withHardState { (_, path) =>
-      Files.size(path) shouldBe 280L
+      Files.size(path) shouldBe MmapHardState.FileBytes
     }
 
-    "should detect single-bit CRC32 corruption on read" in {
+    "should detect single-bit CRC32 corruption on read when no intact sibling slot exists" in {
       val tmpDir = Files.createTempDirectory("raft-hs-crc-")
       val hsPath = tmpDir.resolve("hard_state.bin")
 
@@ -106,9 +106,11 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
       hs1.write(HardState(Term.unsafeFrom(17L), Some(NodeId("voter-alpha"))))
       hs1.close()
 
-      // Flip 1 bit in the term field on disk without updating CRC32
+      // Flip 1 bit in BOTH slots (slot 0 + slot 1) so no valid slot survives
       val raw = Files.readAllBytes(hsPath)
       raw(7) = (raw(7) ^ 0x01).toByte
+      raw(MmapHardState.SlotBytes.toInt + 7) =
+        (raw(MmapHardState.SlotBytes.toInt + 7) ^ 0x01).toByte
       Files.write(hsPath, raw)
 
       val hs2 = MmapHardState.open(hsPath)
@@ -117,6 +119,38 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
           hs2.read
         }
         ex.reason should include("CRC32 mismatch")
+      finally
+        hs2.close()
+        Files.deleteIfExists(hsPath)
+        Files.deleteIfExists(tmpDir)
+    }
+
+    "should recover intact previous generation when latest ping-pong slot suffers a torn write" in {
+      val tmpDir = Files.createTempDirectory("raft-hs-torn-ab-")
+      val hsPath = tmpDir.resolve("hard_state.bin")
+
+      val hs1 = MmapHardState.open(hsPath)
+      val statePrev =
+        HardState(10L, Some(NodeId("leader-10")), commitIndex = 40L)
+      val stateLatest =
+        HardState(11L, Some(NodeId("leader-11")), commitIndex = 55L)
+      hs1.write(statePrev) // gen 2 -> slot 1
+      hs1.write(stateLatest) // gen 3 -> slot 0
+      hs1.close()
+
+      // Simulate a mid-write crash tearing slot 0 (gen 3) while slot 1 (gen 2) remains intact
+      val raw = Files.readAllBytes(hsPath)
+      raw(0) = (raw(0) ^ 0xff).toByte
+      Files.write(hsPath, raw)
+
+      val hs2 = MmapHardState.open(hsPath)
+      try
+        hs2.read shouldBe statePrev
+        // Subsequent write should target the torn slot (slot 0) with gen 3 and heal cleanly
+        val stateNext =
+          HardState(12L, Some(NodeId("leader-12")), commitIndex = 60L)
+        hs2.write(stateNext)
+        hs2.read shouldBe stateNext
       finally
         hs2.close()
         Files.deleteIfExists(hsPath)
@@ -136,11 +170,14 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
           )
         )
         hs.write(HardState(Term.unsafeFrom(3L), Some(NodeId("n1"))))
-        hs.read shouldBe HardState(Term.unsafeFrom(3L), Some(NodeId("n1")))
+        hs.write(HardState(Term.unsafeFrom(4L), Some(NodeId("n2"))))
+        hs.read shouldBe HardState(Term.unsafeFrom(4L), Some(NodeId("n2")))
 
         val raw = Files.readAllBytes(hsPath)
-        // Bytes [14..268) must be strictly zero-padded
+        val s1 = MmapHardState.SlotBytes.toInt
+        // Both slots' trailing votedFor bytes [14..268) must be strictly zero-padded
         raw.slice(14, 268).forall(_ == 0.toByte) shouldBe true
+        raw.slice(s1 + 14, s1 + 268).forall(_ == 0.toByte) shouldBe true
       finally
         hs.close()
         Files.deleteIfExists(hsPath)
@@ -178,9 +215,11 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
         )
       finally hs2.close()
 
-      // Flip 1 bit in commitIndex at offset 279 and verify CRC32 detects corruption
+      // Flip 1 bit in commitIndex in BOTH slots and verify CRC32 detects corruption
       val raw = Files.readAllBytes(hsPath)
       raw(279) = (raw(279) ^ 0x01).toByte
+      raw(MmapHardState.SlotBytes.toInt + 279) =
+        (raw(MmapHardState.SlotBytes.toInt + 279) ^ 0x01).toByte
       Files.write(hsPath, raw)
 
       val hs3 = MmapHardState.open(hsPath)
@@ -204,7 +243,7 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
     "should read an all-zero existing file as HardState.Empty" in {
       val tmpDir = Files.createTempDirectory("raft-hs-zero-")
       val hsPath = tmpDir.resolve("hard_state.bin")
-      Files.write(hsPath, new Array[Byte](280))
+      Files.write(hsPath, new Array[Byte](MmapHardState.FileBytes.toInt))
       val hs = MmapHardState.open(hsPath)
       try hs.read shouldBe HardState.Empty
       finally
@@ -223,16 +262,19 @@ class MmapHardStateSpec extends AnyFreeSpec with Matchers:
           votedForLen: Int,
           commitIdx: Long
       ): Unit =
-        val buf = ByteBuffer.allocate(280).order(ByteOrder.nativeOrder())
+        val full = new Array[Byte](MmapHardState.FileBytes.toInt)
+        val slotLen = MmapHardState.SlotBytes.toInt
+        val buf =
+          ByteBuffer.wrap(full, 0, slotLen).order(ByteOrder.nativeOrder())
         buf.putLong(0, term)
         buf.putInt(8, votedForLen)
         buf.putLong(272, commitIdx)
-        val arr = buf.array()
+        buf.putLong(280, 1L)
         val crc = new CRC32()
-        crc.update(arr, 0, 268)
-        crc.update(arr, 272, 8)
+        crc.update(full, 0, 268)
+        crc.update(full, 272, 16)
         buf.putInt(268, crc.getValue.toInt)
-        val _ = Files.write(path, arr)
+        val _ = Files.write(path, full)
 
       val cases = List(
         ("negative term", -5L, 0, 0L, "negative term"),

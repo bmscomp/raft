@@ -15,7 +15,8 @@ import raft.state.NodeState.*
 final case class UnstableLog(
     truncateFrom: Option[Long] = None,
     entries: Vector[Log] = Vector.empty,
-    pendingSnapshot: Option[SnapshotMetadata] = None
+    pendingSnapshot: Option[SnapshotMetadata] = None,
+    snapshotDiscardsStorageLog: Boolean = false
 )
 
 /** Complete, immutable state snapshot of a single Raft consensus replica driven
@@ -44,7 +45,9 @@ final case class KernelState(
     transferElapsed: Int = 0,
     prePersistMsgs: Vector[OutboundMessage] = Vector.empty,
     postPersistMsgs: Vector[OutboundMessage] = Vector.empty,
-    readyReadStates: Vector[ReadState] = Vector.empty
+    readyReadStates: Vector[ReadState] = Vector.empty,
+    roundSendTicks: Map[Long, Long] = Map.empty,
+    peerLeaseAckTick: Map[NodeId, Long] = Map.empty
 ):
   def currentTerm: Long = roleState.term
 
@@ -61,6 +64,7 @@ final case class KernelState(
   def currentHardState(localId: NodeId): HardState =
     val votedForOpt = roleState match
       case f: Follower                              => f.votedFor
+      case p: PreCandidate                          => p.votedFor
       case c: Candidate if c.votesReceived(localId) => Some(localId)
       case _: Leader                                => Some(localId)
       case _                                        =>
@@ -144,8 +148,16 @@ object ConsensusKernel:
   def lastLogIndex(st: KernelState, storage: RaftStorage): Long =
     st.unstable.entries.lastOption
       .map(_.index)
+      .orElse(
+        if st.unstable.snapshotDiscardsStorageLog then
+          st.unstable.pendingSnapshot.map(_.lastIncludedIndex)
+        else None
+      )
       .orElse(st.unstable.truncateFrom.map(t => math.max(0L, t - 1L)))
-      .orElse(st.unstable.pendingSnapshot.map(_.lastIncludedIndex))
+      .orElse(
+        st.unstable.pendingSnapshot
+          .map(s => math.max(s.lastIncludedIndex, storage.lastIndex))
+      )
       .getOrElse(storage.lastIndex)
 
   def termAt(
@@ -155,16 +167,22 @@ object ConsensusKernel:
   ): Option[Long] =
     if index == 0L then Some(0L)
     else
-      st.unstable.pendingSnapshot
-        .collect {
-          case s if s.lastIncludedIndex == index => s.lastIncludedTerm
-        }
-        .orElse(st.unstable.entries.find(_.index == index).map(_.term))
-        .orElse {
-          st.unstable.truncateFrom match
-            case Some(cut) if index >= cut => None
-            case _                         => storage.term(index)
-        }
+      st.unstable.pendingSnapshot match
+        case Some(s) if index == s.lastIncludedIndex =>
+          Some(s.lastIncludedTerm)
+        case Some(s) if index < s.lastIncludedIndex =>
+          None
+        case _ =>
+          st.unstable.entries
+            .find(_.index == index)
+            .map(_.term)
+            .orElse {
+              if st.unstable.snapshotDiscardsStorageLog then None
+              else
+                st.unstable.truncateFrom match
+                  case Some(cut) if index >= cut => None
+                  case _                         => storage.term(index)
+            }
 
   def lastLogTerm(st: KernelState, storage: RaftStorage): Long =
     termAt(st, storage, lastLogIndex(st, storage)).getOrElse(0L)
@@ -175,26 +193,31 @@ object ConsensusKernel:
       low: Long,
       high: Long
   ): Vector[Log] =
-    if low >= high then Vector.empty
+    val snapFloor =
+      st.unstable.pendingSnapshot.map(_.lastIncludedIndex + 1L).getOrElse(0L)
+    val effLow = math.max(low, snapFloor)
+    if effLow >= high then Vector.empty
+    else if st.unstable.snapshotDiscardsStorageLog then
+      st.unstable.entries.filter(e => e.index >= effLow && e.index < high)
     else
       val storageLimit = st.unstable.truncateFrom match
         case Some(cut) => math.min(high, cut)
         case None      => high
       st.unstable.entries.headOption.map(_.index) match
         case None =>
-          if low >= storageLimit then Vector.empty
-          else storage.entries(low, storageLimit)
+          if effLow >= storageLimit then Vector.empty
+          else storage.entries(effLow, storageLimit)
         case Some(uStart) if high <= uStart =>
           val capped = math.min(storageLimit, uStart)
-          if low >= capped then Vector.empty
-          else storage.entries(low, capped)
-        case Some(uStart) if low >= uStart =>
-          st.unstable.entries.filter(e => e.index >= low && e.index < high)
+          if effLow >= capped then Vector.empty
+          else storage.entries(effLow, capped)
+        case Some(uStart) if effLow >= uStart =>
+          st.unstable.entries.filter(e => e.index >= effLow && e.index < high)
         case Some(uStart) =>
           val persistedEnd = math.min(storageLimit, uStart)
           val persistedPrefix =
-            if low >= persistedEnd then Vector.empty
-            else storage.entries(low, persistedEnd)
+            if effLow >= persistedEnd then Vector.empty
+            else storage.entries(effLow, persistedEnd)
           persistedPrefix ++
             st.unstable.entries.filter(e => e.index >= uStart && e.index < high)
 
@@ -415,16 +438,22 @@ object ConsensusKernel:
           )
           (next, Right(()))
         else
+          val (stRound, roundId) = allocateLeaderRound(st, l)
+          val lRound = stRound.roleState.asInstanceOf[Leader]
           val pending = PendingRead(
             requestId = requestCtx,
-            readIndex = st.commitIndex,
-            acks = Set(config.localId)
+            readIndex = stRound.commitIndex,
+            acks = Set(config.localId),
+            minRound = roundId
           )
-          val updatedLeader = l.copy(
-            pendingReads = l.pendingReads.updated(requestCtx, pending)
+          val updatedLeader = lRound.copy(
+            pendingReads = lRound.pendingReads.updated(requestCtx, pending)
           )
-          val withPending = st.copy(roleState = updatedLeader)
-          (bcastHeartbeat(withPending, config, storage), Right(()))
+          val withPending = stRound.copy(roleState = updatedLeader)
+          (
+            bcastHeartbeatWithRound(withPending, config, storage, roundId),
+            Right(())
+          )
       case f: Follower =>
         (st, Left(RaftError.NotLeader(f.leaderId)))
       case _ =>
@@ -490,7 +519,8 @@ object ConsensusKernel:
   ): KernelState =
     msg match
       case ElectionTimeout =>
-        if !st.roleState.isLeader && st.tracker.config.canCampaign(
+        if from != config.localId then st
+        else if !st.roleState.isLeader && st.tracker.config.canCampaign(
             config.localId
           )
         then
@@ -505,23 +535,26 @@ object ConsensusKernel:
         else st
 
       case HeartbeatTimeout =>
-        if st.roleState.isLeader then bcastHeartbeat(st, config, storage)
+        if from != config.localId then st
+        else if st.roleState.isLeader then bcastHeartbeat(st, config, storage)
         else st
 
       case CheckQuorumTimeout =>
-        st.roleState match
-          case l: Leader if config.checkQuorumEnabled =>
-            if st.tracker.quorumRecentlyActive(config.localId) then
-              st.copy(tracker = st.tracker.resetRecentActive(config.localId))
-            else
-              stepDownToFollower(
-                st,
-                config,
-                l.term,
-                votedFor = Some(config.localId),
-                leader = None
-              )
-          case _ => st
+        if from != config.localId then st
+        else
+          st.roleState match
+            case l: Leader if config.checkQuorumEnabled =>
+              if st.tracker.quorumRecentlyActive(config.localId) then
+                st.copy(tracker = st.tracker.resetRecentActive(config.localId))
+              else
+                stepDownToFollower(
+                  st,
+                  config,
+                  l.term,
+                  votedFor = Some(config.localId),
+                  leader = None
+                )
+            case _ => st
 
       case req: ReadIndexRequest =>
         val (st1, res) = readIndex(st, req.requestId, config, storage)
@@ -674,7 +707,9 @@ object ConsensusKernel:
       unstable = UnstableLog(
         truncateFrom = None,
         entries = remainingUnstableEntries,
-        pendingSnapshot = nextPendingSnap
+        pendingSnapshot = nextPendingSnap,
+        snapshotDiscardsStorageLog =
+          nextPendingSnap.isDefined && st0.unstable.snapshotDiscardsStorageLog
       ),
       prePersistMsgs = Vector.empty,
       postPersistMsgs = Vector.empty,
@@ -791,11 +826,22 @@ object ConsensusKernel:
     st.commitIndex > st.appliedIndex &&
       collectEntriesToApply(st, storage).nonEmpty
 
+  private def hasUnpersistedLogState(
+      st: KernelState,
+      upToIndex: Long
+  ): Boolean =
+    st.unstable.pendingSnapshot.isDefined ||
+      st.unstable.truncateFrom.isDefined ||
+      st.unstable.entries.headOption.exists(_.index <= upToIndex)
+
   private def collectEntriesToApply(
       st: KernelState,
       storage: RaftStorage
   ): Vector[Log] =
-    val start = math.max(st.appliedIndex + 1L, storage.firstIndex)
+    val snapFloor =
+      st.unstable.pendingSnapshot.map(_.lastIncludedIndex + 1L).getOrElse(0L)
+    val start =
+      math.max(math.max(st.appliedIndex + 1L, storage.firstIndex), snapFloor)
     if st.commitIndex < start then Vector.empty
     else entriesBetween(st, storage, start, st.commitIndex + 1L)
 
@@ -818,7 +864,9 @@ object ConsensusKernel:
       randomizedElectionTimeout = nextRand,
       ticksSinceLeaderContact = contactTicks,
       roleState = Follower(newTerm, votedFor, leader, st.commitIndex),
-      tracker = st.tracker.resetVotes
+      tracker = st.tracker.resetVotes,
+      roundSendTicks = Map.empty,
+      peerLeaseAckTick = Map.empty
     )
 
   private def campaign(
@@ -842,9 +890,20 @@ object ConsensusKernel:
       becomeLeader(st1, config, storage, st1.currentTerm + 1L)
     else if isPreVote then
       val prospectiveTerm = st1.currentTerm + 1L
+      val existingVote = st1.roleState match
+        case f: Follower                                     => f.votedFor
+        case p: PreCandidate                                 => p.votedFor
+        case c: Candidate if c.votesReceived(config.localId) =>
+          Some(config.localId)
+        case _: Leader => Some(config.localId)
+        case _         => None
       val stPre = st1.copy(
-        roleState =
-          PreCandidate(st1.currentTerm, Set(config.localId), st1.commitIndex)
+        roleState = PreCandidate(
+          st1.currentTerm,
+          Set(config.localId),
+          st1.commitIndex,
+          votedFor = existingVote
+        )
       )
       val req = RequestVoteRequest(
         term = prospectiveTerm,
@@ -902,14 +961,14 @@ object ConsensusKernel:
     val peers = nextTracker.config.allNodes - config.localId
     val nextMap = peers.map(_ -> (baseLast + 2L)).toMap
     val matchMap = peers.map(_ -> 0L).toMap
-    val leaseTicks = math.max(1L, (config.electionTimeoutTicks * 2L) / 3L)
     val leaderRole = Leader(
       term = term,
       nextIndex = nextMap,
       matchIndex = matchMap,
       commitIndex = st0.commitIndex,
-      leaseUntil = st0.logicalTick + leaseTicks,
-      recentlyActive = Set(config.localId)
+      leaseUntil = 0L,
+      recentlyActive = Set(config.localId),
+      heartbeatRound = 0L
     )
     val stLeader = st0.copy(
       electionElapsed = 0,
@@ -917,7 +976,9 @@ object ConsensusKernel:
       transferElapsed = 0,
       ticksSinceLeaderContact = 0,
       tracker = nextTracker,
-      roleState = leaderRole
+      roleState = leaderRole,
+      roundSendTicks = Map.empty,
+      peerLeaseAckTick = Map.empty
     )
     // Mandatory §5.4.2 / Figure 8 NoOp entry in the new leader's own term!
     val (stWithNoOp, _) =
@@ -1023,10 +1084,54 @@ object ConsensusKernel:
       sendAppend(cur, config, storage, peer, forceSendEmpty = forceSendEmpty)
     }
 
+  private val MaxTrackedLeaseRounds: Int = 64
+
+  private def allocateLeaderRound(
+      st: KernelState,
+      leader: Leader
+  ): (KernelState, Long) =
+    val nextRound = leader.heartbeatRound + 1L
+    val updatedTicks = st.roundSendTicks.updated(nextRound, st.logicalTick)
+    val prunedTicks =
+      if updatedTicks.size > MaxTrackedLeaseRounds then
+        val minKeep = nextRound - MaxTrackedLeaseRounds.toLong + 1L
+        updatedTicks.filter(_._1 >= minKeep)
+      else updatedTicks
+    (
+      st.copy(
+        roleState = leader.copy(heartbeatRound = nextRound),
+        roundSendTicks = prunedTicks
+      ),
+      nextRound
+    )
+
+  private def ensureLeaderRoundForCurrentTick(
+      st: KernelState
+  ): (KernelState, Long) =
+    st.roleState match
+      case l: Leader =>
+        if l.heartbeatRound > 0L &&
+          st.roundSendTicks.get(l.heartbeatRound).contains(st.logicalTick)
+        then (st, l.heartbeatRound)
+        else allocateLeaderRound(st, l)
+      case _ => (st, 0L)
+
   private def bcastHeartbeat(
       st: KernelState,
       config: RaftConfig,
       storage: RaftStorage
+  ): KernelState =
+    st.roleState match
+      case l: Leader =>
+        val (stRound, roundId) = allocateLeaderRound(st, l)
+        bcastHeartbeatWithRound(stRound, config, storage, roundId)
+      case _ => st
+
+  private def bcastHeartbeatWithRound(
+      st: KernelState,
+      config: RaftConfig,
+      storage: RaftStorage,
+      roundId: Long
   ): KernelState =
     val peers =
       (st.tracker.config.allNodes - config.localId).toVector.sortBy(_.value)
@@ -1046,7 +1151,8 @@ object ConsensusKernel:
           prevLogIndex = prevIdx,
           prevLogTerm = prevTerm,
           entries = Seq.empty,
-          leaderCommit = commitForPeer
+          leaderCommit = commitForPeer,
+          heartbeatRound = roundId
         ),
         prePersist = true
       )
@@ -1121,17 +1227,20 @@ object ConsensusKernel:
               ),
               config
             )
+            val (stWithRound, roundId) =
+              ensureLeaderRoundForCurrentTick(stUpdatedTracker)
             val stSent = enqueueMessage(
-              stUpdatedTracker,
+              stWithRound,
               config,
               peer,
               AppendEntriesRequest(
-                term = stUpdatedTracker.currentTerm,
+                term = stWithRound.currentTerm,
                 leaderId = config.localId,
                 prevLogIndex = prevIdx,
                 prevLogTerm = prevTerm,
                 entries = ents,
-                leaderCommit = stUpdatedTracker.commitIndex
+                leaderCommit = stWithRound.commitIndex,
+                heartbeatRound = roundId
               ),
               prePersist = true
             )
@@ -1356,7 +1465,7 @@ object ConsensusKernel:
                 st1,
                 config,
                 p.term,
-                votedFor = None,
+                votedFor = p.votedFor,
                 leader = None
               )
             case VoteResult.Pending => st1
@@ -1393,7 +1502,12 @@ object ConsensusKernel:
         st,
         config,
         from,
-        AppendEntriesResponse(st.currentTerm, success = false, matchIndex = 0L),
+        AppendEntriesResponse(
+          st.currentTerm,
+          success = false,
+          matchIndex = 0L,
+          heartbeatRound = req.heartbeatRound
+        ),
         prePersist = true
       )
     else
@@ -1402,6 +1516,7 @@ object ConsensusKernel:
         else
           st.roleState match
             case f: Follower                                     => f.votedFor
+            case p: PreCandidate                                 => p.votedFor
             case c: Candidate if c.votesReceived(config.localId) =>
               Some(config.localId)
             case _: Leader => Some(config.localId)
@@ -1425,9 +1540,10 @@ object ConsensusKernel:
           AppendEntriesResponse(
             req.term,
             success = true,
-            matchIndex = st1.commitIndex
+            matchIndex = st1.commitIndex,
+            heartbeatRound = req.heartbeatRound
           ),
-          prePersist = true
+          prePersist = !hasUnpersistedLogState(st1, st1.commitIndex)
         )
       else
         val (effectivePrevIdx, effectiveEntries, prevMatches) =
@@ -1435,7 +1551,7 @@ object ConsensusKernel:
             val skip = (st1.commitIndex - req.prevLogIndex).toInt
             val anchorTerm = req.entries(skip - 1).term
             val matches =
-              termAt(st1, storage, st1.commitIndex).forall(_ == anchorTerm)
+              termAt(st1, storage, st1.commitIndex).contains(anchorTerm)
             (st1.commitIndex, req.entries.drop(skip), matches)
           else
             val matches =
@@ -1460,7 +1576,8 @@ object ConsensusKernel:
               success = false,
               matchIndex = 0L,
               conflictIndex = Some(cIdx),
-              conflictTerm = cTerm
+              conflictTerm = cTerm,
+              heartbeatRound = req.heartbeatRound
             ),
             prePersist = true
           )
@@ -1519,9 +1636,10 @@ object ConsensusKernel:
             AppendEntriesResponse(
               term = req.term,
               success = true,
-              matchIndex = lastNewIdx
+              matchIndex = lastNewIdx,
+              heartbeatRound = req.heartbeatRound
             ),
-            prePersist = !mutatedLog
+            prePersist = !mutatedLog && !hasUnpersistedLogState(st3, lastNewIdx)
           )
 
   private def applyAppendedConfigs(
@@ -1593,18 +1711,34 @@ object ConsensusKernel:
         case l0: Leader if resp.term == l0.term =>
           val trActive =
             st.tracker.updateProgress(from, _.copy(recentActive = true))
-          val stActive =
-            if trActive.quorumRecentlyActive(config.localId) then
-              val leaseTicks =
-                math.max(1L, (config.electionTimeoutTicks * 2L) / 3L)
-              st.copy(
-                tracker = trActive,
-                roleState = l0.copy(
-                  recentlyActive = l0.recentlyActive + from,
-                  leaseUntil = st.logicalTick + leaseTicks
-                )
-              )
-            else st.copy(tracker = trActive)
+          val (nextPeerLeaseTicks, nextLeaseUntil) =
+            st.roundSendTicks.get(resp.heartbeatRound) match
+              case Some(sendTick) =>
+                val prevPeerTick = st.peerLeaseAckTick.getOrElse(from, -1L)
+                val updatedPeerTicks =
+                  if sendTick > prevPeerTick then
+                    st.peerLeaseAckTick.updated(from, sendTick)
+                  else st.peerLeaseAckTick
+                val leaseTicks =
+                  math.max(1L, (config.electionTimeoutTicks * 2L) / 3L)
+                val candidateLease =
+                  computeQuorumLeaseSendTick(
+                    trActive.config,
+                    config.localId,
+                    st.logicalTick,
+                    updatedPeerTicks
+                  ).map(_ + leaseTicks).getOrElse(l0.leaseUntil)
+                (updatedPeerTicks, math.max(l0.leaseUntil, candidateLease))
+              case None =>
+                (st.peerLeaseAckTick, l0.leaseUntil)
+          val stActive = st.copy(
+            tracker = trActive,
+            peerLeaseAckTick = nextPeerLeaseTicks,
+            roleState = l0.copy(
+              recentlyActive = l0.recentlyActive + from,
+              leaseUntil = nextLeaseUntil
+            )
+          )
 
           val lIdx = lastLogIndex(stActive, storage)
 
@@ -1642,7 +1776,14 @@ object ConsensusKernel:
             )
             val stReads = stSynced.roleState match
               case curL: Leader =>
-                resolveLeaderReads(stSynced, curL, from, config, storage)
+                resolveLeaderReads(
+                  stSynced,
+                  curL,
+                  from,
+                  resp.heartbeatRound,
+                  config,
+                  storage
+                )
               case _ => stSynced
 
             val stCommitted =
@@ -1791,7 +1932,7 @@ object ConsensusKernel:
                   cur,
                   config,
                   leader.term,
-                  votedFor = None,
+                  votedFor = Some(config.localId),
                   leader = None
                 )
               else cur
@@ -1801,13 +1942,45 @@ object ConsensusKernel:
 
       stAfterCfgs.roleState match
         case lNow: Leader if lNow.pendingReads.nonEmpty =>
-          resolveLeaderReads(stAfterCfgs, lNow, config.localId, config, storage)
+          resolveLeaderReads(
+            stAfterCfgs,
+            lNow,
+            config.localId,
+            Long.MaxValue,
+            config,
+            storage
+          )
         case _ => stAfterCfgs
+
+  private def computeQuorumLeaseSendTick(
+      cluster: ClusterConfig,
+      localId: NodeId,
+      selfTick: Long,
+      peerAckTicks: Map[NodeId, Long]
+  ): Option[Long] =
+    def quorumFor(voters: Set[NodeId]): Option[Long] =
+      if voters.isEmpty then None
+      else
+        val ticks = voters.toVector.flatMap { v =>
+          if v == localId then Some(selfTick) else peerAckTicks.get(v)
+        }
+        val majIdx = voters.size / 2
+        if ticks.size <= majIdx then None
+        else Some(ticks.sorted(Ordering[Long].reverse)(majIdx))
+
+    cluster.oldVoters match
+      case None        => quorumFor(cluster.newVoters)
+      case Some(oldVs) =>
+        for
+          a <- quorumFor(cluster.newVoters)
+          b <- quorumFor(oldVs)
+        yield math.min(a, b)
 
   private def resolveLeaderReads(
       st: KernelState,
       leader: Leader,
       ackFrom: NodeId,
+      ackRound: Long,
       config: RaftConfig,
       storage: RaftStorage
   ): KernelState =
@@ -1818,7 +1991,10 @@ object ConsensusKernel:
         leader.pendingReads.foldLeft(
           (Map.empty[String, PendingRead], Vector.empty[ReadState])
         ) { case ((remAcc, rsAcc), (ctx, pending)) =>
-          val acks = pending.acks + config.localId + ackFrom
+          val acks =
+            if ackFrom == config.localId || ackRound >= pending.minRound then
+              pending.acks + config.localId + ackFrom
+            else pending.acks + config.localId
           if st.tracker.config.hasQuorum(acks) && readyInTerm then
             val effectiveReadIdx = math.max(pending.readIndex, st.commitIndex)
             (remAcc, rsAcc :+ ReadState(effectiveReadIdx, ctx))
@@ -1836,7 +2012,9 @@ object ConsensusKernel:
       config: RaftConfig,
       storage: RaftStorage
   ): KernelState =
-    if req.term < st.currentTerm then
+    if req.term < st.currentTerm ||
+      (req.term == st.currentTerm && st.roleState.isLeader)
+    then
       enqueueMessage(
         st,
         config,
@@ -1853,8 +2031,12 @@ object ConsensusKernel:
         if req.term > st.currentTerm then None
         else
           st.roleState match
-            case f: Follower => f.votedFor
-            case _           => None
+            case f: Follower                                     => f.votedFor
+            case p: PreCandidate                                 => p.votedFor
+            case c: Candidate if c.votesReceived(config.localId) =>
+              Some(config.localId)
+            case _: Leader => Some(config.localId)
+            case _         => None
 
       val st1 = stepDownToFollower(
         st,
@@ -1875,7 +2057,7 @@ object ConsensusKernel:
             success = true,
             matchIndex = stClean.commitIndex
           ),
-          prePersist = true
+          prePersist = !hasUnpersistedLogState(stClean, stClean.commitIndex)
         )
       else
         val chunkAccOpt: Option[PendingSnapshot] =
@@ -1944,13 +2126,15 @@ object ConsensusKernel:
                 st1.unstable.copy(
                   entries = st1.unstable.entries
                     .dropWhile(_.index <= req.lastIncludedIndex),
-                  pendingSnapshot = Some(meta)
+                  pendingSnapshot = Some(meta),
+                  snapshotDiscardsStorageLog = false
                 )
               else
                 UnstableLog(
                   truncateFrom = None,
                   entries = Vector.empty,
-                  pendingSnapshot = Some(meta)
+                  pendingSnapshot = Some(meta),
+                  snapshotDiscardsStorageLog = true
                 )
 
             val nextCommit = math.max(st1.commitIndex, req.lastIncludedIndex)

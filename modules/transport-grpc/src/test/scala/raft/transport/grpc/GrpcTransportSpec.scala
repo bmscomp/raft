@@ -746,3 +746,59 @@ class GrpcTransportSpec extends AnyFlatSpec with Matchers:
       Files.deleteIfExists(pkiDir.resolve("peer.crt"))
       Files.deleteIfExists(pkiDir)
   }
+
+  it should "not classify oversized RESOURCE_EXHAUSTED as transient and must drop spoofed Multi-Raft envelopes" in {
+    import io.grpc.Status
+    import raft.multigroup.GroupEnvelope
+    import raft.state.GroupId
+
+    val oversized = Status.RESOURCE_EXHAUSTED
+      .withDescription("gRPC message exceeds maximum size 4194304: 5000000")
+      .asRuntimeException()
+    GrpcTransport.transientStatusCode(oversized) shouldBe None
+
+    val backpressure = Status.RESOURCE_EXHAUSTED
+      .withDescription("Receiver inbound queue full")
+      .asRuntimeException()
+    GrpcTransport.transientStatusCode(backpressure) shouldBe Some(
+      Status.Code.RESOURCE_EXHAUSTED
+    )
+
+    val gid = GroupId("g-auth")
+    val spoofTest = (for
+      pair1 <- GrpcTransport.multiGroupResource[IO](
+        GrpcConfig(host = "127.0.0.1", port = 0),
+        TransportConfig(n1, "127.0.0.1:0", Map.empty)
+      )
+      pair2 <- GrpcTransport.multiGroupResource[IO](
+        GrpcConfig(host = "127.0.0.1", port = 0),
+        TransportConfig(n2, "127.0.0.1:0", Map.empty)
+      )
+    yield (pair1, pair2)).use { case ((raw1, _), (raw2, mg2)) =>
+      for
+        addr2 <- raw2.localAddress
+        _ <- raw1.updatePeers(Map(n2 -> addr2))
+        t2 <- mg2.registerGroup(gid)
+        // raw1 sends with WireEnvelope.sender_id = n1, but inner GroupEnvelope claims from = n3 (spoofed!)
+        spoofedEnv = GroupEnvelope(
+          gid,
+          from = NodeId("n3"),
+          message = TimeoutNowRequest(1L, NodeId("n3")),
+          to = Some(n2)
+        )
+        validEnv = GroupEnvelope(
+          gid,
+          from = n1,
+          message = TimeoutNowRequest(2L, n1),
+          to = Some(n2)
+        )
+        _ <- raw1.send(
+          n2,
+          ProtobufMultiGroupCodec.encodeBatch(Vector(spoofedEnv, validEnv))
+        )
+        received <- t2.receive.head.compile.lastOrError.timeout(5.seconds)
+      yield received shouldBe (n1 -> TimeoutNowRequest(2L, n1))
+    }
+
+    spoofTest.unsafeRunSync()
+  }

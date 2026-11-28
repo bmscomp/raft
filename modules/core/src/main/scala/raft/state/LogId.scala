@@ -90,5 +90,6 @@ final case class ReadState(
 final case class PendingRead(
     requestId: String,
     readIndex: Long,
-    acks: Set[NodeId]
+    acks: Set[NodeId],
+    minRound: Long = 0L
 )

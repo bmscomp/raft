@@ -97,8 +97,26 @@ class LeaseReadSpec extends AnyFlatSpec with Matchers:
     storage.persistReady(r2)
     raw.advance(r2)
 
-    // Follower node-2 acks the leader's term-1 no-op entry -> extends lease AND commits term-1 entry!
-    raw.step(node2, AppendEntriesResponse(1L, success = true, matchIndex = 1L))
+    // Follower node-2 acks the leader's term-1 no-op entry (echoing its heartbeatRound) -> extends lease AND commits term-1 entry!
+    val noOpRound = r2.messages
+      .collectFirst {
+        case env if env.to == node2 =>
+          env.message match
+            case ae: AppendEntriesRequest => ae.heartbeatRound
+            case _                        => 0L
+      }
+      .getOrElse(0L)
+    noOpRound should be > 0L
+
+    raw.step(
+      node2,
+      AppendEntriesResponse(
+        1L,
+        success = true,
+        matchIndex = 1L,
+        heartbeatRound = noOpRound
+      )
+    )
     val r3 = raw.ready()
     storage.persistReady(r3)
     raw.advance(r3)

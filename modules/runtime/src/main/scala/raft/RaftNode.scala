@@ -273,7 +273,7 @@ object RaftNode:
           peerLastAckRef <- Ref.of[F, Map[NodeId, FiniteDuration]](Map.empty)
           peerPendingSendsRef <- Ref.of[
             F,
-            Map[NodeId, Vector[(Long, FiniteDuration)]]
+            Map[NodeId, Map[(Long, Long), FiniteDuration]]
           ](Map.empty)
           snapshotInFlightRef <- Ref.of[F, Set[NodeId]](Set.empty)
           proposalQueue <- Queue.bounded[F, QueuedProposal[F, R]](
@@ -444,7 +444,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
     ],
     leaseUntilRef: Ref[F, FiniteDuration],
     peerLastAckRef: Ref[F, Map[NodeId, FiniteDuration]],
-    peerPendingSendsRef: Ref[F, Map[NodeId, Vector[(Long, FiniteDuration)]]],
+    peerPendingSendsRef: Ref[F, Map[NodeId, Map[(Long, Long), FiniteDuration]]],
     stickinessUntilRef: Ref[F, FiniteDuration],
     snapshotInFlightRef: Ref[F, Set[NodeId]],
     peerMailboxesCell: AtomicCell[
@@ -626,7 +626,11 @@ private final class RaftNodeImpl[F[_]: Async, R](
               )
             )
           }
-          _ <- items.traverse_(pair => offerProposalOrFail(pair._2))
+          _ <- items
+            .traverse_(pair => offerProposalOrFail(pair._2))
+            .onError { case _ =>
+              items.traverse_(_._2.cancelled.set(true))
+            }
           results <- poll(items.traverse(_._1.get)).onCancel(
             items.traverse_(_._2.cancelled.set(true))
           )
@@ -650,7 +654,11 @@ private final class RaftNodeImpl[F[_]: Async, R](
               QueuedProposal(cmd, QueuedReply.CommitApplied(waiter), cancelled)
             )
           }
-          _ <- items.traverse_(pair => offerProposalOrFail(pair._2))
+          _ <- items
+            .traverse_(pair => offerProposalOrFail(pair._2))
+            .onError { case _ =>
+              items.traverse_(_._2.cancelled.set(true))
+            }
           waitersSet = items.map(_._1).toSet
           results <- poll(items.traverse(_._1.get)).onCancel(
             items.traverse_(_._2.cancelled.set(true)) *>
@@ -781,7 +789,13 @@ private final class RaftNodeImpl[F[_]: Async, R](
       yield ()
 
     Stream
-      .repeatEval(step)
+      .repeatEval(
+        step.handleErrorWith(err =>
+          logger.error(err)(
+            s"Unexpected error in proposal batcher loop on ${config.localId.value}"
+          )
+        )
+      )
       .interruptWhen(shutdownRef)
       .compile
       .drain
@@ -876,7 +890,10 @@ private final class RaftNodeImpl[F[_]: Async, R](
         .flatMap { case (reqId, waiter, outActions) =>
           dispatchOutbound(outActions) *>
             poll(waiter.get)
-              .onCancel(pendingReadsRef.update(_ - reqId))
+              .onCancel(
+                pendingReadsRef.update(_ - reqId) *>
+                  readApplyWaitersRef.update(_.filterNot(_._2 eq waiter))
+              )
               .flatMap(F.fromEither)
         }
     }
@@ -934,10 +951,12 @@ private final class RaftNodeImpl[F[_]: Async, R](
           case None               => F.pure(None)
           case Some(Left(idx))    => F.pure(Some(idx))
           case Some(Right(await)) =>
-            poll(await.get).flatMap {
-              case Right(idx) => F.pure(Some(idx))
-              case Left(err)  => F.raiseError(err)
-            }
+            poll(await.get)
+              .onCancel(readApplyWaitersRef.update(_.filterNot(_._2 eq await)))
+              .flatMap {
+                case Right(idx) => F.pure(Some(idx))
+                case Left(err)  => F.raiseError(err)
+              }
         }
     }
 
@@ -1223,11 +1242,27 @@ private final class RaftNodeImpl[F[_]: Async, R](
 
   private def runEventLoop: F[Unit] =
     val networkStream = transport.receive.evalMap { case (from, msg) =>
-      processEvent(Some(from), msg)
+      msg match
+        case ElectionTimeout | HeartbeatTimeout | CheckQuorumTimeout =>
+          logger.warn(
+            s"Ignoring remote local-only timer signal $msg from ${from.value} on ${config.localId.value}"
+          )
+        case _ =>
+          processEvent(Some(from), msg).handleErrorWith { err =>
+            logger.error(err)(
+              s"Error processing network message from ${from.value} on ${config.localId.value}"
+            )
+          }
     }
     val timerStream = Stream
       .repeatEval(msgQueue.take)
-      .evalMap(msg => processEvent(None, msg))
+      .evalMap { msg =>
+        processEvent(None, msg).handleErrorWith { err =>
+          logger.error(err)(
+            s"Error processing internal signal $msg on ${config.localId.value}"
+          )
+        }
+      }
 
     networkStream
       .merge(timerStream)
@@ -1307,8 +1342,8 @@ private final class RaftNodeImpl[F[_]: Async, R](
       msg: RaftMessage
   ): F[Vector[OutboundAction]] =
     for
-      chunkValid <- accumulateSnapshotChunk(msg)
       state <- stateRef.get
+      chunkValid <- accumulateSnapshotChunk(msg, state)
       stickyPreVote <- isStickyFollowerOrLeader(state, msg)
       out <-
         if stickyPreVote then
@@ -1403,36 +1438,39 @@ private final class RaftNodeImpl[F[_]: Async, R](
           yield effOut ++ catchUpOut
     yield out
 
-  private def recordLeaseSend(to: NodeId, term: Long): F[Unit] =
-    if !config.leaseReadEnabled then F.unit
+  private def recordLeaseSend(
+      to: NodeId,
+      term: Long,
+      heartbeatRound: Long
+  ): F[Unit] =
+    if !config.leaseReadEnabled || heartbeatRound <= 0L then F.unit
     else
       Clock[F].monotonic.flatMap { now =>
         peerPendingSendsRef.update { m =>
-          val cur = m.getOrElse(to, Vector.empty).dropWhile(_._1 < term)
-          val next =
-            if cur.size >= 256 then cur
-            else cur :+ (term -> now)
-          m.updated(to, next)
+          val cur = m.getOrElse(to, Map.empty).filter(_._1._1 == term)
+          val key = (term, heartbeatRound)
+          val effectiveTime =
+            cur.get(key).fold(now)(prev => if prev < now then prev else now)
+          val updated = cur.updated(key, effectiveTime)
+          val bounded =
+            if updated.size > 256 then
+              val minRoundKeep = heartbeatRound - 255L
+              updated.filter(_._1._2 >= minRoundKeep)
+            else updated
+          m.updated(to, bounded)
         }
       }
 
-  private def popLeaseSendTime(
+  private def lookupLeaseSendTime(
       peerId: NodeId,
-      term: Long
+      term: Long,
+      heartbeatRound: Long
   ): F[Option[FiniteDuration]] =
-    peerPendingSendsRef.modify { m =>
-      val cur = m.getOrElse(peerId, Vector.empty).dropWhile(_._1 < term)
-      cur.headOption match
-        case Some((t, sendTime)) if t == term =>
-          val tail = cur.tail
-          val updated =
-            if tail.isEmpty then m - peerId else m.updated(peerId, tail)
-          (updated, Some(sendTime))
-        case _ =>
-          val updated =
-            if cur.isEmpty then m - peerId else m.updated(peerId, cur)
-          (updated, None)
-    }
+    if heartbeatRound <= 0L then F.pure(None)
+    else
+      peerPendingSendsRef.get.map { m =>
+        m.get(peerId).flatMap(_.get((term, heartbeatRound)))
+      }
 
   private def maybeRefreshLeaderLease(
       msg: RaftMessage,
@@ -1445,7 +1483,11 @@ private final class RaftNodeImpl[F[_]: Async, R](
           if resp.term == l.term && resp.success && config.leaseReadEnabled =>
         for
           now <- Clock[F].monotonic
-          sendTimeOpt <- popLeaseSendTime(peerId, l.term)
+          sendTimeOpt <- lookupLeaseSendTime(
+            peerId,
+            l.term,
+            resp.heartbeatRound
+          )
           _ <- sendTimeOpt match
             case None           => F.unit
             case Some(sendTime) =>
@@ -1500,35 +1542,42 @@ private final class RaftNodeImpl[F[_]: Async, R](
 
   /** Stream incoming `InstallSnapshotRequest` chunks to disk via
     * [[FilePendingSnapshot]], cleaning up any prior temp file on offset `0` or
-    * gapped chunks.
+    * gapped chunks. Stale-term requests (or same-term requests on a Leader) are
+    * rejected before touching any active pending snapshot file.
     */
-  private def accumulateSnapshotChunk(msg: RaftMessage): F[Boolean] =
+  private def accumulateSnapshotChunk(
+      msg: RaftMessage,
+      state: NodeState
+  ): F[Boolean] =
     msg match
       case req: InstallSnapshotRequest =>
-        pendingSnapRef.get.flatMap {
-          case priorOpt if req.offset == 0L =>
-            for
-              _ <- priorOpt.traverse_(_.cleanup)
-              fresh <- FilePendingSnapshot.create[F](
-                req.lastIncludedIndex,
-                req.lastIncludedTerm
-              )
-              appended <- fresh.appendChunkBytes(req.payload)
-              _ <- pendingSnapRef.set(Some(appended))
-            yield true
+        if req.term < state.term || (req.term == state.term && state.isLeader)
+        then F.pure(true)
+        else
+          pendingSnapRef.get.flatMap {
+            case priorOpt if req.offset == 0L =>
+              for
+                _ <- priorOpt.traverse_(_.cleanup)
+                fresh <- FilePendingSnapshot.create[F](
+                  req.lastIncludedIndex,
+                  req.lastIncludedTerm
+                )
+                appended <- fresh.appendChunkBytes(req.payload)
+                _ <- pendingSnapRef.set(Some(appended))
+              yield true
 
-          case Some(cur)
-              if cur.lastIncludedIndex == req.lastIncludedIndex &&
-                cur.lastIncludedTerm == req.lastIncludedTerm &&
-                cur.offset == req.offset =>
-            cur
-              .appendChunkBytes(req.payload)
-              .flatMap(updated => pendingSnapRef.set(Some(updated)).as(true))
+            case Some(cur)
+                if cur.lastIncludedIndex == req.lastIncludedIndex &&
+                  cur.lastIncludedTerm == req.lastIncludedTerm &&
+                  cur.offset == req.offset =>
+              cur
+                .appendChunkBytes(req.payload)
+                .flatMap(updated => pendingSnapRef.set(Some(updated)).as(true))
 
-          case priorOpt =>
-            priorOpt.traverse_(_.cleanup) *>
-              pendingSnapRef.set(None).as(false)
-        }
+            case priorOpt =>
+              priorOpt.traverse_(_.cleanup) *>
+                pendingSnapRef.set(None).as(false)
+          }
       case _ => F.pure(true)
 
   /** Resolve synchronous `Long => Option[Long]` term lookups using the
@@ -1826,7 +1875,8 @@ private final class RaftNodeImpl[F[_]: Async, R](
                       case ProgressState.Probe =>
                         pr.copy(nextIdx = leaderNext, probeSent = false)
                       case ProgressState.Replicate
-                          if pr.inflights.isFull || pr.nextIdx > lastLogIndex =>
+                          if pr.inflights.isFull ||
+                            (pr.matched < lastLogIndex && pr.nextIdx > lastLogIndex) =>
                         pr.copy(
                           state = ProgressState.Probe,
                           nextIdx = leaderNext,
@@ -1913,11 +1963,35 @@ private final class RaftNodeImpl[F[_]: Async, R](
       peers: Set[NodeId],
       lastIdx: LogIndex
   ): F[Vector[OutboundAction]] =
-    peers.toList
-      .flatTraverse { peerId =>
-        preparePeerReplication(leader, peerId, lastIdx).map(_.toList)
-      }
-      .map(_.toVector)
+    if peers.isEmpty then F.pure(Vector.empty)
+    else
+      stateRef
+        .modify[Leader] {
+          case l: Leader if l.term == leader.term =>
+            val next = new Leader(
+              term = l.term,
+              nextIndex = l.nextIndex,
+              matchIndex = l.matchIndex,
+              commitIndex = l.commitIndex,
+              transferTarget = l.transferTarget,
+              pendingReads = l.pendingReads,
+              leaseUntil = l.leaseUntil,
+              recentlyActive = l.recentlyActive,
+              heartbeatRound = l.heartbeatRound + 1L
+            )
+            (next, next)
+          case other =>
+            (other, leader)
+        }
+        .flatMap { updatedLeader =>
+          peers.toList
+            .flatTraverse { peerId =>
+              preparePeerReplication(updatedLeader, peerId, lastIdx).map(
+                _.toList
+              )
+            }
+            .map(_.toVector)
+        }
 
   /** Build pipelined `AppendEntriesRequest` batches inside `mutex` (stripping
     * `Command` payloads for `Witness` peers) and return [[OutboundAction]]s to
@@ -2033,7 +2107,8 @@ private final class RaftNodeImpl[F[_]: Async, R](
               leaderCommit = math.min(
                 leader.commitIndex,
                 prevIdx + entries.size.toLong
-              )
+              ),
+              heartbeatRound = leader.heartbeatRound
             )
             val nextPr = curPr.optimisticUpdate(entries.last.index)
             buildPipelinedBatches(
@@ -2122,8 +2197,14 @@ private final class RaftNodeImpl[F[_]: Async, R](
   private def enqueuePeerSend(to: NodeId, item: PeerSend): F[Unit] =
     if !config.parallelReplicationEnabled then
       item match
-        case PeerSend.Single(m) => sendMessageWithMetrics(to, m)
-        case PeerSend.Batch(ms) => transport.sendBatch(to, ms)
+        case PeerSend.Single(m) =>
+          sendMessageWithMetrics(to, m).handleErrorWith { err =>
+            logger.debug(err)(s"Outbound send to ${to.value} failed")
+          }
+        case PeerSend.Batch(ms) =>
+          transport.sendBatch(to, ms).handleErrorWith { err =>
+            logger.debug(err)(s"Outbound sendBatch to ${to.value} failed")
+          }
     else
       peerMailboxesCell
         .evalModify { map =>
@@ -2143,8 +2224,9 @@ private final class RaftNodeImpl[F[_]: Async, R](
       actions.traverse_ {
         case OutboundAction.SendOne(to, msg) =>
           val leaseRec = msg match
-            case ae: AppendEntriesRequest => recordLeaseSend(to, ae.term)
-            case _                        => F.unit
+            case ae: AppendEntriesRequest =>
+              recordLeaseSend(to, ae.term, ae.heartbeatRound)
+            case _ => F.unit
           val hbMetric = msg match
             case ae: AppendEntriesRequest if ae.entries.isEmpty =>
               metrics.onHeartbeatSent(config.localId, 1)
@@ -2153,8 +2235,9 @@ private final class RaftNodeImpl[F[_]: Async, R](
 
         case OutboundAction.SendBatch(to, msgs) =>
           val leaseRec = msgs.traverse_ {
-            case ae: AppendEntriesRequest => recordLeaseSend(to, ae.term)
-            case _                        => F.unit
+            case ae: AppendEntriesRequest =>
+              recordLeaseSend(to, ae.term, ae.heartbeatRound)
+            case _ => F.unit
           }
           leaseRec *> enqueuePeerSend(to, PeerSend.Batch(msgs))
 
@@ -2165,8 +2248,9 @@ private final class RaftNodeImpl[F[_]: Async, R](
           hbMetric *> byPeer.traverse_ { case (peer, msgs) =>
             msgs.traverse_ { m =>
               val leaseRec = m match
-                case ae: AppendEntriesRequest => recordLeaseSend(peer, ae.term)
-                case _                        => F.unit
+                case ae: AppendEntriesRequest =>
+                  recordLeaseSend(peer, ae.term, ae.heartbeatRound)
+                case _ => F.unit
               leaseRec *> enqueuePeerSend(peer, PeerSend.Single(m))
             }
           }
@@ -2179,7 +2263,9 @@ private final class RaftNodeImpl[F[_]: Async, R](
                   Set.empty
                 )).toList
                   .filterNot(_ == config.localId)
-                  .traverse_(p => recordLeaseSend(p, ae.term))
+                  .traverse_(p =>
+                    recordLeaseSend(p, ae.term, ae.heartbeatRound)
+                  )
               }
             case _ => F.unit
           val bcastMetric = msg match
@@ -2557,11 +2643,15 @@ private final class RaftNodeImpl[F[_]: Async, R](
       props <- pendingProposalsRef.getAndSet(Map.empty)
       joints <- jointWaiterRef.getAndSet(Map.empty)
       reads <- pendingReadsRef.getAndSet(Map.empty)
+      applyWaiters <- readApplyWaitersRef.getAndSet(Vector.empty)
       _ <- props.values.toList.traverse_ { case (_, w) => w.fail(proposalErr) }
       _ <- joints.values.toList.traverse_(d =>
         d.complete(Left(proposalErr)).void
       )
       _ <- reads.values.toList.traverse_(d => d.complete(Left(readErr)).void)
+      _ <- applyWaiters.traverse_ { case (_, d) =>
+        d.complete(Left(readErr)).void
+      }
     yield ()
 
   private def failAllPending(err: RaftError): F[Unit] =
@@ -2711,7 +2801,7 @@ private final class RaftNodeImpl[F[_]: Async, R](
         stateMachine.apply(entry).map(r => (Some(r), None))
       case LogType.Configuration =>
         ClusterConfig.decodeBytes(entry.payload) match
-          case Right(cfg) => clusterRef.set(cfg).as((None, Some(cfg)))
+          case Right(cfg) => F.pure((None, Some(cfg)))
           case Left(_)    => F.pure((None, None))
       case LogType.NoOp =>
         F.pure((None, None))
@@ -2858,7 +2948,12 @@ private final class RaftNodeImpl[F[_]: Async, R](
           s"Leader ${config.localId.value} removed from voters at index $committedIdx; stepping down"
         ) *>
           stateRef.set(
-            Follower(l.term, None, None, math.max(l.commitIndex, committedIdx))
+            Follower(
+              l.term,
+              Some(config.localId),
+              None,
+              math.max(l.commitIndex, committedIdx)
+            )
           ) *>
           handleLeaderStepDown).as(Vector.empty)
 

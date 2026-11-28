@@ -49,6 +49,7 @@ message AppendEntriesRequest {
   int64 prev_log_term = 4;
   repeated LogEntry entries = 5;
   int64 leader_commit = 6;
+  int64 heartbeat_round = 7;
 }
 
 message AppendEntriesResponse {
@@ -59,6 +60,7 @@ message AppendEntriesResponse {
   int64 conflict_index = 5;
   bool has_conflict_term = 6;
   int64 conflict_term = 7;
+  int64 heartbeat_round = 8;
 }
 
 message RequestVoteRequest {
@@ -188,6 +190,7 @@ message CoalescedHeartbeatBeatProto {
   int64 conflict_index = 10;
   bool has_conflict_term = 11;
   int64 conflict_term = 12;
+  int64 heartbeat_round = 13;
 }
 
 message CoalescedHeartbeatBatchProto {

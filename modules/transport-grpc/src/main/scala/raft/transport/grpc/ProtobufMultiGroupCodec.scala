@@ -166,7 +166,8 @@ object ProtobufMultiGroupCodec:
                 if ae.leaderId == first.from then "" else ae.leaderId.value,
               prevLogIndex = ae.prevLogIndex,
               prevLogTerm = ae.prevLogTerm,
-              leaderCommit = ae.leaderCommit
+              leaderCommit = ae.leaderCommit,
+              heartbeatRound = ae.heartbeatRound
             )
           }
           Some(
@@ -188,7 +189,8 @@ object ProtobufMultiGroupCodec:
               hasConflictIndex = r.conflictIndex.isDefined,
               conflictIndex = r.conflictIndex.getOrElse(0L),
               hasConflictTerm = r.conflictTerm.isDefined,
-              conflictTerm = r.conflictTerm.getOrElse(0L)
+              conflictTerm = r.conflictTerm.getOrElse(0L),
+              heartbeatRound = r.heartbeatRound
             )
           }
           Some(
@@ -221,7 +223,8 @@ object ProtobufMultiGroupCodec:
             prevLogIndex = b.prevLogIndex,
             prevLogTerm = b.prevLogTerm,
             entries = Seq.empty,
-            leaderCommit = b.leaderCommit
+            leaderCommit = b.leaderCommit,
+            heartbeatRound = b.heartbeatRound
           )
         )
       }.toVector
@@ -238,7 +241,8 @@ object ProtobufMultiGroupCodec:
             conflictIndex =
               if b.hasConflictIndex then Some(b.conflictIndex) else None,
             conflictTerm =
-              if b.hasConflictTerm then Some(b.conflictTerm) else None
+              if b.hasConflictTerm then Some(b.conflictTerm) else None,
+            heartbeatRound = b.heartbeatRound
           )
         )
       }.toVector

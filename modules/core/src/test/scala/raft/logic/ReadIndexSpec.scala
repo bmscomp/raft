@@ -70,12 +70,36 @@ class ReadIndexSpec extends AnyFlatSpec with Matchers:
     followerAck shouldBe AppendEntriesResponse(
       term = 5,
       success = true,
-      matchIndex = 100L
+      matchIndex = 100L,
+      heartbeatRound = peerHeartbeats(node2).heartbeatRound
     )
+    followerAck.heartbeatRound should be > 0L
 
-    // Peer node-2 acknowledges heartbeat -> quorum {node-1, node-2} reached!
-    val step2 = RaftLogic.onMessage(
+    // A stale pre-request response (heartbeatRound = 0) MUST NOT confirm ReadIndex!
+    val staleStep = RaftLogic.onMessage(
       step1.state,
+      AppendEntriesResponse(
+        term = 5,
+        success = true,
+        matchIndex = 100L,
+        heartbeatRound = 0L
+      ),
+      config,
+      lastLogIndex = 100L,
+      lastLogTerm = 5L,
+      clusterSize = 3,
+      getTermAt = { case 100L => Some(5L); case _ => None },
+      sender = Some(node2),
+      clusterOpt = Some(cluster)
+    )
+    staleStep.effects.collect { case r: ReadIndexReady => r } shouldBe empty
+    staleStep.state
+      .asInstanceOf[Leader]
+      .pendingReads should contain key "read-123"
+
+    // Peer node-2 acknowledges the post-request heartbeat round -> quorum {node-1, node-2} reached!
+    val step2 = RaftLogic.onMessage(
+      staleStep.state,
       followerAck,
       config,
       lastLogIndex = 100L,

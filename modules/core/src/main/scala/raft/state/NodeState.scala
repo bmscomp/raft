@@ -55,7 +55,8 @@ enum NodeState:
   case PreCandidate(
       term: Long,
       preVotesReceived: ImmutableSet[NodeId] = ImmutableSet.empty,
-      commitIndex: Long = 0L
+      commitIndex: Long = 0L,
+      votedFor: Option[NodeId] = None
   )
 
   /** Active election candidate state (§5.2). */
@@ -74,7 +75,8 @@ enum NodeState:
       transferTarget: Option[NodeId] = None,
       pendingReads: Map[String, PendingRead] = Map.empty,
       leaseUntil: Long = 0L,
-      recentlyActive: ImmutableSet[NodeId] = ImmutableSet.empty
+      recentlyActive: ImmutableSet[NodeId] = ImmutableSet.empty,
+      heartbeatRound: Long = 0L
   )
 
 object NodeState:

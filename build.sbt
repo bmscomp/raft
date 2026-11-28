@@ -1,6 +1,11 @@
 import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.file.{Files, StandardCopyOption}
+import com.typesafe.tools.mima.core.{
+  DirectMissingMethodProblem,
+  IncompatibleResultTypeProblem,
+  ProblemFilters
+}
 
 val scala3Version = "3.3.9"
 
@@ -134,6 +139,74 @@ lazy val core = project
   .settings(
     name := "raft-core",
     scalacOptions ++= commonScalacOptions ++ Seq("-java-output-version", "21"),
+    // Source-compatible default-valued field additions required for P0 consensus
+    // safety fixes (PreCandidate.votedFor, ReadIndex/LeaseRead heartbeatRound &
+    // minRound correlation, and UnstableLog snapshot overlay flag).
+    mimaBinaryIssueFilters ++= Seq(
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.kernel.KernelState.this"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.kernel.KernelState.copy"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.kernel.KernelState.apply"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.kernel.UnstableLog.this"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.kernel.UnstableLog.copy"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.kernel.UnstableLog.apply"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.message.RaftMessage#AppendEntriesRequest.this"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.message.RaftMessage#AppendEntriesRequest.copy"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.message.RaftMessage#AppendEntriesRequest.apply"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.message.RaftMessage#AppendEntriesResponse.this"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.message.RaftMessage#AppendEntriesResponse.copy"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.message.RaftMessage#AppendEntriesResponse.apply"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.NodeState#Leader.this"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.NodeState#Leader.copy"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.NodeState#Leader.apply"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.NodeState#PreCandidate.this"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.NodeState#PreCandidate.copy"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.NodeState#PreCandidate.apply"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.PendingRead.this"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.PendingRead.copy"
+      ),
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.state.PendingRead.apply"
+      )
+    ),
     libraryDependencies ++= commonTestDependencies
   )
 
@@ -172,6 +245,16 @@ lazy val transportGrpc = project
     Test / parallelExecution := false,
     scalacOptions ++= commonScalacOptions,
     coverageExcludedFiles := ".*src_managed.*",
+    // Wire-compatible proto3 optional field additions (heartbeat_round) on
+    // ScalaPB-generated classes in src_managed.
+    mimaBinaryIssueFilters ++= Seq(
+      ProblemFilters.exclude[DirectMissingMethodProblem](
+        "raft.transport.grpc.proto.*"
+      ),
+      ProblemFilters.exclude[IncompatibleResultTypeProblem](
+        "raft.transport.grpc.proto.*"
+      )
+    ),
     Compile / PB.targets := Seq(
       scalapb.gen(
         grpc = true,

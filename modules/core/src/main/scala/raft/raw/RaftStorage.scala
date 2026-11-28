@@ -122,10 +122,19 @@ final case class MemStorageState(
 
   def applySnapshot(meta: SnapshotMetadata): MemStorageState =
     val nextCfg = meta.config.getOrElse(clusterConfig)
+    // Raft §7 Rules 6–7: only retain log suffix after the snapshot when an
+    // existing entry matches both lastIncludedIndex and lastIncludedTerm;
+    // otherwise discard the entire log to prevent retaining a divergent suffix.
+    val matchesPrefix = logs
+      .find(_.index == meta.lastIncludedIndex)
+      .exists(_.term == meta.lastIncludedTerm)
+    val nextLogs =
+      if matchesPrefix then logs.dropWhile(_.index <= meta.lastIncludedIndex)
+      else Vector.empty
     copy(
       snapshot = Some(meta),
       clusterConfig = nextCfg,
-      logs = logs.dropWhile(_.index <= meta.lastIncludedIndex)
+      logs = nextLogs
     )
 
   def compactTo(compactIndex: Long, snapshotPayload: Bytes): MemStorageState =
