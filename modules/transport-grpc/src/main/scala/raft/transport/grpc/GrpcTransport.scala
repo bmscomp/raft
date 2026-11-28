@@ -198,29 +198,66 @@ class GrpcTransport[F[_]: Async](
         st <- cell.get
         _ <- st.peers.get(to) match
           case Some(address) =>
-            val envelope = WireEnvelope(
-              senderId = transportConfig.localId.value,
-              payloads = msgs.map(ByteString.copyFrom)
-            )
-            statsRef.update(s =>
-              s.copy(
-                envelopesSent = s.envelopesSent + 1L,
-                batchesSent = s.batchesSent + 1L
+            val maxBatchBytes = math.max(1024, config.maxMessageSize - 4096)
+            val chunks = chunkByByteBudget(msgs, maxBatchBytes)
+            chunks.traverse_ { chunk =>
+              val envelope = WireEnvelope(
+                senderId = transportConfig.localId.value,
+                payloads = chunk.map(ByteString.copyFrom)
               )
-            ) *>
-              sendWithRetry(to, address, envelope, attempt = 0, cell, statsRef)
-                .handleErrorWith { err =>
-                  logger.warn(
-                    s"gRPC batch delivery (${msgs.size} frames) to ${to.value}@$address failed: ${err.getMessage}"
-                  )
-                }
+              statsRef.update(s =>
+                s.copy(
+                  envelopesSent = s.envelopesSent + 1L,
+                  batchesSent = s.batchesSent + 1L
+                )
+              ) *>
+                sendWithRetry(
+                  to,
+                  address,
+                  envelope,
+                  attempt = 0,
+                  cell,
+                  statsRef
+                )
+                  .handleErrorWith { err =>
+                    logger.warn(
+                      s"gRPC batch delivery (${chunk.size} frames) to ${to.value}@$address failed: ${err.getMessage}"
+                    )
+                  }
+            }
           case None =>
             logger.warn(s"Unknown peer: ${to.value}")
       yield ()
 
+  private def chunkByByteBudget(
+      msgs: Seq[Array[Byte]],
+      budget: Int
+  ): Vector[Vector[Array[Byte]]] =
+    val out = Vector.newBuilder[Vector[Array[Byte]]]
+    val cur = Vector.newBuilder[Array[Byte]]
+    var curBytes = 0
+    var curCount = 0
+    msgs.foreach { m =>
+      val cost = m.length + 16
+      if curCount > 0 && curBytes + cost > budget then
+        out += cur.result()
+        cur.clear()
+        curBytes = 0
+        curCount = 0
+      cur += m
+      curBytes += cost
+      curCount += 1
+    }
+    if curCount > 0 then out += cur.result()
+    out.result()
+
   def broadcast(msg: Array[Byte]): F[Unit] =
     poolCell
-      .flatMap(_.get.map(_.peers.keys.toList))
+      .flatMap(
+        _.get.map(
+          _.peers.keys.filterNot(_ == transportConfig.localId).toList
+        )
+      )
       .flatMap(_.parTraverse_(peer => send(peer, msg)))
 
   def receive: Stream[F, (NodeId, Array[Byte])] =
@@ -245,11 +282,25 @@ class GrpcTransport[F[_]: Async](
         )
       }
       _ <- F.blocking {
-        toClose.foreach(shutdownChannel(_, 2L))
+        // Initiate server & all channel shutdowns upfront in parallel
         serverOpt.foreach { srv =>
           val _ = srv.shutdown()
-          if !srv.awaitTermination(5, TimeUnit.SECONDS) then
+        }
+        toClose.foreach { ch =>
+          val _ = ch.shutdown()
+        }
+
+        val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L)
+        toClose.foreach { ch =>
+          val rem = math.max(1L, deadlineNanos - System.nanoTime())
+          if !ch.awaitTermination(rem, TimeUnit.NANOSECONDS) then
+            val _ = ch.shutdownNow()
+        }
+        serverOpt.foreach { srv =>
+          val rem = math.max(1L, deadlineNanos - System.nanoTime())
+          if !srv.awaitTermination(rem, TimeUnit.NANOSECONDS) then
             val _ = srv.shutdownNow()
+            val _ = srv.awaitTermination(1L, TimeUnit.SECONDS)
         }
       }
     yield ()
@@ -334,7 +385,8 @@ class GrpcTransport[F[_]: Async](
       address: String,
       cell: AtomicCell[F, GrpcTransport.ChannelPoolState]
   ): F[ManagedChannel] =
-    cell.evalModify { st =>
+    // Fast path: lock-free read via cell.get avoids serializing healthy RPCs
+    cell.get.flatMap { st =>
       if st.closed then
         F.raiseError(
           Status.UNAVAILABLE
@@ -345,12 +397,41 @@ class GrpcTransport[F[_]: Async](
         st.channels.get(address) match
           case Some(existing)
               if !existing.isShutdown && !existing.isTerminated =>
-            F.pure((st, existing))
-          case priorOpt =>
-            F.blocking {
-              priorOpt.foreach(shutdownChannel(_, 1L))
-              val built = buildNettyChannel(address)
-              (st.copy(channels = st.channels.updated(address, built)), built)
+            F.pure(existing)
+          case _ =>
+            // Slow path: construct channel in F.blocking OUTSIDE AtomicCell lock,
+            // then atomically install (shutting down any duplicate/evicted channel outside lock).
+            F.blocking(buildNettyChannel(address)).flatMap { built =>
+              cell
+                .modify { cur =>
+                  if cur.closed then
+                    (cur, Left((built, "GrpcTransport is shut down")))
+                  else
+                    cur.channels.get(address) match
+                      case Some(live)
+                          if !live.isShutdown && !live.isTerminated =>
+                        (cur, Right((live, Some(built))))
+                      case priorOpt =>
+                        (
+                          cur.copy(channels =
+                            cur.channels.updated(address, built)
+                          ),
+                          Right((built, priorOpt))
+                        )
+                }
+                .flatMap {
+                  case Left((toDispose, reason)) =>
+                    F.blocking(shutdownChannel(toDispose, 1L)) *>
+                      F.raiseError(
+                        Status.UNAVAILABLE
+                          .withDescription(reason)
+                          .asRuntimeException()
+                      )
+                  case Right((winner, toDisposeOpt)) =>
+                    toDisposeOpt.traverse_(ch =>
+                      F.blocking(shutdownChannel(ch, 1L))
+                    ) *> F.pure(winner)
+                }
             }
     }
 
@@ -401,15 +482,23 @@ object GrpcTransport:
     Context.keyWithDefault("raft-mtls-peer-ids", None)
 
   private[grpc] def transientStatusCode(err: Throwable): Option[Status.Code] =
-    val codeOpt = err match
-      case sre: StatusRuntimeException => Some(sre.getStatus.getCode)
-      case se: StatusException         => Some(se.getStatus.getCode)
+    val statusOpt = err match
+      case sre: StatusRuntimeException => Some(sre.getStatus)
+      case se: StatusException         => Some(se.getStatus)
       case _                           => None
-    codeOpt.filter(c =>
-      c == Status.Code.UNAVAILABLE ||
-        c == Status.Code.DEADLINE_EXCEEDED ||
-        c == Status.Code.RESOURCE_EXHAUSTED
-    )
+    statusOpt.flatMap { st =>
+      val code = st.getCode
+      val desc = Option(st.getDescription).getOrElse("").toLowerCase
+      val isOversized =
+        code == Status.Code.RESOURCE_EXHAUSTED &&
+          (desc.contains("exceeds maximum") || desc.contains("maximum size"))
+      if isOversized then None
+      else if code == Status.Code.UNAVAILABLE ||
+        code == Status.Code.DEADLINE_EXCEEDED ||
+        code == Status.Code.RESOURCE_EXHAUSTED
+      then Some(code)
+      else None
+    }
 
   /** Extract authenticated peer identities (`CN`, non-loopback `DNS` SANs, and
     * SPIFFE `URI` SANs) from a verified X.509 client certificate.
@@ -502,6 +591,9 @@ object GrpcTransport:
           queue <- Queue.bounded[F, (NodeId, Array[Byte])](
             grpcConfig.maxInboundQueueSize
           )
+          batchQueue <- Queue.bounded[F, (NodeId, Vector[Array[Byte]])](
+            grpcConfig.maxInboundQueueSize
+          )
           poolCell <- AtomicCell[F].of(
             ChannelPoolState(
               peers = transportConfig.peers,
@@ -514,15 +606,17 @@ object GrpcTransport:
               grpcConfig.tlsClientAuth &&
               grpcConfig.verifyPeerIdentity
           service = buildService(
-            queue,
+            batchQueue,
             dispatcher,
             enforceIdentity,
             statsRef
           )
           server <- Sync[F].blocking(startServer(grpcConfig, service))
-          _ <- logger.info(
-            s"Started gRPC Raft server for ${transportConfig.localId.value} on ${grpcConfig.host}:${server.getPort}"
-          )
+          _ <- logger
+            .info(
+              s"Started gRPC Raft server for ${transportConfig.localId.value} on ${grpcConfig.host}:${server.getPort}"
+            )
+            .attempt
         yield new GrpcTransport[F](
           grpcConfig,
           transportConfig,
@@ -531,7 +625,12 @@ object GrpcTransport:
           Some(server),
           Some(poolCell),
           Some(statsRef)
-        )
+        ):
+          override def receive: Stream[F, (NodeId, Array[Byte])] =
+            Stream.fromQueueUnterminated(batchQueue).flatMap {
+              case (sender, frames) =>
+                Stream.emits(frames.map(sender -> _))
+            }
       )(_.shutdown)
     }
 
@@ -589,10 +688,22 @@ object GrpcTransport:
         coalescing = coalescing
       )
       _ <- raw.receive
-        .evalMap { case (_, bytes) =>
+        .evalMap { case (verifiedSender, bytes) =>
           ProtobufMultiGroupCodec.decode(bytes) match
-            case Right(envs) => mg.dispatchBatch(envs)
-            case Left(err)   =>
+            case Right(envs) =>
+              val (valid, spoofed) = envs.partition(_.from == verifiedSender)
+              val warnEff =
+                if spoofed.nonEmpty then
+                  logger.warn(
+                    s"Dropping ${spoofed.size} spoofed Multi-Raft envelope(s) on ${transportConfig.localId.value}: " +
+                      s"transport sender '${verifiedSender.value}' != inner from '${spoofed.head.from.value}'"
+                  )
+                else Async[F].unit
+              val dispatchEff =
+                if valid.nonEmpty then mg.dispatchBatch(valid)
+                else Async[F].unit
+              warnEff *> dispatchEff
+            case Left(err) =>
               logger.warn(
                 s"Dropping malformed Multi-Raft frame on ${transportConfig.localId.value}: ${err.message}"
               )
@@ -673,7 +784,7 @@ object GrpcTransport:
     configured.build().start()
 
   private def buildService[F[_]: Async](
-      incomingQueue: Queue[F, (NodeId, Array[Byte])],
+      incomingBatchQueue: Queue[F, (NodeId, Vector[Array[Byte]])],
       dispatcher: Dispatcher[F],
       enforcePeerIdentity: Boolean,
       statsRef: Ref[F, GrpcTransportStats]
@@ -686,6 +797,12 @@ object GrpcTransport:
           Future.failed(
             Status.INVALID_ARGUMENT
               .withDescription("WireEnvelope.sender_id must be non-empty")
+              .asRuntimeException()
+          )
+        else if request.payloads.isEmpty && request.payload.isEmpty then
+          Future.failed(
+            Status.INVALID_ARGUMENT
+              .withDescription("WireEnvelope must carry payload or payloads")
               .asRuntimeException()
           )
         else
@@ -715,13 +832,12 @@ object GrpcTransport:
                 request.payloads.iterator.map(_.toByteArray).toVector
               else Vector(request.payload.toByteArray)
 
-            val offerAll = frames.foldLeftM(true) { (accOk, bytes) =>
-              if !accOk then F.pure(false)
-              else incomingQueue.tryOffer((sender, bytes))
-            }
+            // Single atomic tryOffer per WireEnvelope prevents partial batch
+            // enqueue + duplicate/reordered frames on backpressure retry.
+            val offerBatch = incomingBatchQueue.tryOffer((sender, frames))
 
             dispatcher
-              .unsafeToFuture(offerAll)
+              .unsafeToFuture(offerBatch)
               .map(accepted => WireAck(accepted = accepted))(
                 ExecutionContext.parasitic
               )

@@ -20,7 +20,8 @@ object RaftMessage:
       prevLogIndex: Long,
       prevLogTerm: Long,
       entries: Seq[Log],
-      leaderCommit: Long
+      leaderCommit: Long,
+      heartbeatRound: Long = 0L
   ) extends RaftMessage
 
   /** Response to [[AppendEntriesRequest]] with optional §5.3 fast-backtracking
@@ -31,7 +32,8 @@ object RaftMessage:
       success: Boolean,
       matchIndex: Long,
       conflictIndex: Option[Long] = None,
-      conflictTerm: Option[Long] = None
+      conflictTerm: Option[Long] = None,
+      heartbeatRound: Long = 0L
   ) extends RaftMessage
 
   /** Request a vote or speculative pre-vote (§5.2, §9.6, §3.10). */

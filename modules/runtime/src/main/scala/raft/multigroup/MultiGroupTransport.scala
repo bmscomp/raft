@@ -84,7 +84,7 @@ class MultiGroupTransport[F[_]: Async] private (
             envelopesCoalesced = s.envelopesCoalesced + totalCoalesced
           )
         ) *>
-          slices.parTraverse_(slice => sendBatchEnvelopes(slice))
+          slices.parTraverse_(slice => sendBatchEnvelopes(slice).attempt.void)
     }
 
   /** Eagerly allocate (or re-activate) the bounded mailbox for `groupId`,

@@ -99,11 +99,19 @@ object TextMessageCodec extends SimpleMessageCodec[TextWireMessage]:
             prev,
             prevTerm,
             entries,
-            commit
+            commit,
+            _
           ) =>
         s"AE_REQ|$term|${leader.value}|$prev|$prevTerm|${entries.size}|$commit"
 
-      case RaftMessage.AppendEntriesResponse(term, success, matchIdx, _, _) =>
+      case RaftMessage.AppendEntriesResponse(
+            term,
+            success,
+            matchIdx,
+            _,
+            _,
+            _
+          ) =>
         s"AE_RESP|$term|$success|$matchIdx"
 
       case RaftMessage.RequestVoteRequest(

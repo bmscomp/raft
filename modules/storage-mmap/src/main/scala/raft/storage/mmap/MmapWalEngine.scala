@@ -13,7 +13,7 @@ import scala.annotation.tailrec
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
-import cats.effect.{Async, Ref, Resource}
+import cats.effect.{Async, Deferred, Ref, Resource}
 import cats.effect.std.Mutex
 import cats.syntax.all.*
 import fs2.{Pull, Stream}
@@ -29,7 +29,12 @@ import raft.state.{
   Snapshot,
   Term
 }
-import raft.storage.{HardState, StorageEngine, StorageEngineFactory}
+import raft.storage.{
+  AtomicHardStateStore,
+  HardState,
+  StorageEngine,
+  StorageEngineFactory
+}
 
 /** Crash-safe, lease-protected off-heap FFM WAL & streaming snapshot engine.
   *
@@ -57,7 +62,8 @@ class MmapWalEngine[F[_]: Async] private (
     stateRef: Ref[F, MmapWalEngine.EngineState[F]],
     hardState: MmapHardState,
     segmentSize: Long
-) extends StorageEngine[F]:
+) extends StorageEngine[F]
+    with AtomicHardStateStore[F]:
   import MmapWalEngine.*
 
   private val F = Async[F]
@@ -88,7 +94,7 @@ class MmapWalEngine[F[_]: Async] private (
           val segId = st.activeLease.segmentId
           val batchStart = seg.currentWriteOffset
           for
-            results <- F.delay {
+            results <- F.blocking {
               val appended = seg.appendBatch(batch)
               seg.forceRange(batchStart, seg.currentWriteOffset)
               appended
@@ -121,10 +127,13 @@ class MmapWalEngine[F[_]: Async] private (
     val newId = st.nextSegmentId
     val nextFirstIdx = st.walIndex.lastIndex + 1L
     for
-      _ <- F.delay(oldLease.segment.force())
-      newSeg <- F.delay(
-        MmapSegment.create(segmentPath(newId), nextFirstIdx, allocBytes)
-      )
+      _ <- F.blocking(oldLease.segment.force())
+      newSeg <- F.blocking {
+        val seg =
+          MmapSegment.create(segmentPath(newId), nextFirstIdx, allocBytes)
+        fsyncDirectory(walDir)
+        seg
+      }
       newLease <- SegmentLease.create[F](newId, newSeg)
       _ <- stateRef.set(
         st.copy(
@@ -136,38 +145,80 @@ class MmapWalEngine[F[_]: Async] private (
       )
     yield ()
 
+  private def awaitTruncationOrRetry[A](
+      prevLease: SegmentLease[F],
+      segId: Int,
+      retry: => F[A],
+      fallback: A
+  ): F[A] =
+    stateRef.get.flatMap { st2 =>
+      st2.truncationGate match
+        case Some(gate) => gate.get *> retry
+        case None       =>
+          st2.findLease(segId) match
+            case Some(nextLease) if !(nextLease eq prevLease) => retry
+            case _ => F.pure(fallback)
+    }
+
   def readEntry(index: LogIndex): F[Option[Log]] =
     stateRef.get.flatMap { st =>
-      val segId = st.walIndex.getSegmentId(index.value)
-      if segId == -1 then F.pure(None)
-      else
-        val offset = st.walIndex.getFileOffset(index.value)
-        st.findLease(segId) match
-          case None        => F.pure(None)
-          case Some(lease) =>
-            lease.withReader(seg => F.delay(seg.readEntryUnchecked(offset)))
+      st.truncationGate match
+        case Some(gate) if st.walIndex.getSegmentId(index.value) != -1 =>
+          gate.get *> readEntry(index)
+        case _ =>
+          val segId = st.walIndex.getSegmentId(index.value)
+          if segId == -1 then F.pure(None)
+          else
+            val offset = st.walIndex.getFileOffset(index.value)
+            st.findLease(segId) match
+              case None        => F.pure(None)
+              case Some(lease) =>
+                lease
+                  .withReader(seg => F.delay(seg.readEntryUnchecked(offset)))
+                  .flatMap {
+                    case some @ Some(_) => F.pure(some)
+                    case None           =>
+                      awaitTruncationOrRetry(
+                        lease,
+                        segId,
+                        readEntry(index),
+                        None
+                      )
+                  }
     }
 
   def readRange(start: LogIndex, end: LogIndex): F[Vector[Log]] =
     if end.value < start.value then F.pure(Vector.empty)
     else
       stateRef.get.flatMap { st =>
-        val locations = st.walIndex.rangeLocations(start.value, end.value)
-        if locations.isEmpty then F.pure(Vector.empty)
-        else
-          val grouped = groupBySegmentOrder(locations)
-          grouped
-            .flatTraverse { case (segId, offsets) =>
-              st.findLease(segId) match
-                case None        => F.pure(Vector.empty[Log])
-                case Some(lease) =>
-                  lease
-                    .withReader { seg =>
-                      F.delay(offsets.map(seg.readEntryUnchecked))
+        st.truncationGate match
+          case Some(gate) => gate.get *> readRange(start, end)
+          case None       =>
+            val locations = st.walIndex.rangeLocations(start.value, end.value)
+            if locations.isEmpty then F.pure(Vector.empty)
+            else
+              val grouped = groupBySegmentOrder(locations)
+              grouped
+                .traverse { case (segId, offsets) =>
+                  st.findLease(segId) match
+                    case None        => F.pure(Some(Vector.empty[Log]))
+                    case Some(lease) =>
+                      lease.withReader { seg =>
+                        F.delay(offsets.map(seg.readEntryUnchecked))
+                      }
+                }
+                .flatMap { results =>
+                  if results.exists(_.isEmpty) then
+                    stateRef.get.flatMap { st2 =>
+                      st2.truncationGate match
+                        case Some(gate) => gate.get *> readRange(start, end)
+                        case None       =>
+                          F.pure(
+                            results.flatten.flatten.sortBy(_.index)
+                          )
                     }
-                    .map(_.getOrElse(Vector.empty[Log]))
-            }
-            .map(_.sortBy(_.index))
+                  else F.pure(results.flatten.flatten.sortBy(_.index))
+                }
       }
 
   def lastLogIndex: F[LogIndex] =
@@ -176,16 +227,31 @@ class MmapWalEngine[F[_]: Async] private (
   /** Zero-allocation `O(1)` term read directly from the mapped header bytes. */
   def termAt(index: LogIndex): F[Option[Term]] =
     stateRef.get.flatMap { st =>
-      val segId = st.walIndex.getSegmentId(index.value)
-      if segId == -1 then F.pure(None)
-      else
-        val offset = st.walIndex.getFileOffset(index.value)
-        st.findLease(segId) match
-          case None        => F.pure(None)
-          case Some(lease) =>
-            lease.withReader(seg =>
-              F.delay(Term.unsafeFrom(seg.readTerm(offset)))
-            )
+      st.truncationGate match
+        case Some(gate) if st.walIndex.getSegmentId(index.value) != -1 =>
+          gate.get *> termAt(index)
+        case _ =>
+          val segId = st.walIndex.getSegmentId(index.value)
+          if segId == -1 then F.pure(None)
+          else
+            val offset = st.walIndex.getFileOffset(index.value)
+            st.findLease(segId) match
+              case None        => F.pure(None)
+              case Some(lease) =>
+                lease
+                  .withReader(seg =>
+                    F.delay(Term.unsafeFrom(seg.readTerm(offset)))
+                  )
+                  .flatMap {
+                    case some @ Some(_) => F.pure(some)
+                    case None           =>
+                      awaitTruncationOrRetry(
+                        lease,
+                        segId,
+                        termAt(index),
+                        None
+                      )
+                  }
     }
 
   def logIsEmpty: F[Boolean] =
@@ -194,17 +260,38 @@ class MmapWalEngine[F[_]: Async] private (
   def truncateFrom(index: LogIndex): F[Unit] =
     writeMutex.lock.surround {
       stateRef.get.flatMap { st =>
-        st.walIndex.get(index.value) match
-          case None      => F.unit
-          case Some(loc) =>
-            val nextIdxState = st.walIndex.truncateFrom(index.value)
-            if nextIdxState.isEmpty then
-              val newId = st.nextSegmentId
-              for
-                newSeg <- F.delay(
-                  MmapSegment
-                    .create(segmentPath(newId), index.value, segmentSize)
+        if st.walIndex.isEmpty || index.value > st.walIndex.lastIndex then
+          F.unit
+        else
+          val nextIdxState = st.walIndex.truncateFrom(index.value)
+          if nextIdxState.isEmpty then
+            val newId = st.nextSegmentId
+            Deferred[F, Unit].flatMap { gate =>
+              val work = for
+                _ <- stateRef.set(
+                  st.copy(
+                    walIndex = WalIndexState.empty,
+                    lastCheckpointedCount = 0,
+                    truncationGate = Some(gate)
+                  )
                 )
+                // Delete descending so a crash never leaves a mid-log gap
+                _ <- st.activeLease.retire(deleteFile = true)
+                _ <- st.sealedOrder.reverse.traverse_ { sid =>
+                  st.sealedLeases
+                    .get(sid)
+                    .traverse_(_.retire(deleteFile = true))
+                }
+                _ <- F.blocking(fsyncDirectory(walDir))
+                newSeg <- F.blocking {
+                  val seg = MmapSegment.create(
+                    segmentPath(newId),
+                    math.max(1L, index.value),
+                    segmentSize
+                  )
+                  fsyncDirectory(walDir)
+                  seg
+                }
                 newLease <- SegmentLease.create[F](newId, newSeg)
                 _ <- stateRef.set(
                   EngineState(
@@ -213,100 +300,169 @@ class MmapWalEngine[F[_]: Async] private (
                     sealedOrder = Vector.empty,
                     walIndex = WalIndexState.empty,
                     nextSegmentId = newId + 1,
-                    lastCheckpointedCount = 0
+                    lastCheckpointedCount = 0,
+                    truncationGate = None
                   )
                 )
-                _ <- st.sealedLeases.values.toList
-                  .traverse_(_.retire(deleteFile = true))
-                _ <- st.activeLease.retire(deleteFile = true)
-                _ <- F.delay { val _ = JFiles.deleteIfExists(checkpointPath) }
-              yield ()
-            else if loc.segmentId == st.activeLease.segmentId then
-              for
-                _ <- F.delay {
-                  val keepCount = st.activeLease.segment
-                    .countEntriesBeforeOffset(loc.fileOffset)
-                  st.activeLease.segment.truncateAt(loc.fileOffset, keepCount)
+                _ <- F.blocking {
+                  val _ = JFiles.deleteIfExists(checkpointPath)
                 }
-                _ <- stateRef.set(
-                  st.copy(
-                    walIndex = nextIdxState,
-                    lastCheckpointedCount = nextIdxState.size
-                  )
-                )
-                _ <- F.delay(
-                  writeCheckpointAtomicallySync(
-                    checkpointTmpPath,
-                    checkpointPath,
-                    nextIdxState.serialize
-                  )
-                )
               yield ()
-            else
-              // Truncation crossed back into an earlier sealed segment:
-              // 1. Publish updated state removing > loc.segmentId & promoting reopened RW segment
-              val droppedSealedIds =
-                st.sealedOrder.filter(_ > loc.segmentId)
-              val keptSealedOrder =
-                st.sealedOrder.filter(_ < loc.segmentId)
-              val keptSealedMap =
-                keptSealedOrder
-                  .flatMap(id => st.sealedLeases.get(id).map(id -> _))
-                  .toMap
-              val targetLeaseOpt = st.sealedLeases.get(loc.segmentId)
-              val oldActive = st.activeLease
-
-              targetLeaseOpt match
-                case None =>
-                  stateRef.set(
-                    st.copy(
-                      walIndex = nextIdxState,
-                      lastCheckpointedCount = nextIdxState.size
-                    )
-                  )
-                case Some(targetSealed) =>
-                  val keepCount = targetSealed.segment
-                    .countEntriesBeforeOffset(loc.fileOffset)
-                  val targetPath = targetSealed.segment.path
-                  for
-                    // Retire target RO lease first so all active readers drain before RW reopen
-                    _ <- targetSealed.retire(deleteFile = false)
-                    rwSeg <- F.delay {
-                      val opened =
-                        MmapSegment.open(targetPath, readOnly = false)
-                      opened.truncateAt(loc.fileOffset, keepCount)
-                      opened
-                    }
-                    rwLease <- SegmentLease.create[F](loc.segmentId, rwSeg)
-                    _ <- stateRef.set(
-                      st.copy(
-                        activeLease = rwLease,
-                        sealedLeases = keptSealedMap,
-                        sealedOrder = keptSealedOrder,
-                        walIndex = nextIdxState,
-                        lastCheckpointedCount = nextIdxState.size
-                      )
-                    )
-                    _ <- droppedSealedIds.traverse_ { sid =>
-                      st.sealedLeases
-                        .get(sid)
-                        .traverse_(_.retire(deleteFile = true))
-                    }
-                    _ <- oldActive.retire(deleteFile = true)
-                    _ <-
-                      if nextIdxState.nonEmpty then
-                        F.delay(
-                          writeCheckpointAtomicallySync(
-                            checkpointTmpPath,
-                            checkpointPath,
-                            nextIdxState.serialize
-                          )
+              F.guarantee(
+                work,
+                stateRef.update(_.copy(truncationGate = None)) *>
+                  gate.complete(()).void
+              )
+            }
+          else
+            val locOpt = st.walIndex
+              .get(index.value)
+              .orElse(
+                st.walIndex
+                  .rangeLocations(index.value, st.walIndex.lastIndex)
+                  .headOption
+                  .map { case (_, segId, fileOff) =>
+                    WalLocation(segId, fileOff)
+                  }
+              )
+            locOpt match
+              case None      => F.unit
+              case Some(loc) =>
+                if loc.segmentId == st.activeLease.segmentId then
+                  val oldActive = st.activeLease
+                  val targetPath = oldActive.segment.path
+                  val keepCount =
+                    oldActive.segment.countEntriesBeforeOffset(loc.fileOffset)
+                  Deferred[F, Unit].flatMap { gate =>
+                    val work = for
+                      // 1. Remove truncated entries from index and gate readers
+                      _ <- stateRef.set(
+                        st.copy(
+                          walIndex = nextIdxState,
+                          lastCheckpointedCount = nextIdxState.size,
+                          truncationGate = Some(gate)
                         )
-                      else
-                        F.delay {
-                          val _ = JFiles.deleteIfExists(checkpointPath)
-                        }
-                  yield ()
+                      )
+                      // 2. Drain all pre-truncation in-flight readers BEFORE mutating offsets
+                      _ <- oldActive.retire(deleteFile = false)
+                      // 3. Reopen RW, truncate + zero stale bytes + msync
+                      rwSeg <- F.blocking {
+                        val opened =
+                          MmapSegment.open(targetPath, readOnly = false)
+                        opened.truncateAt(loc.fileOffset, keepCount)
+                        opened
+                      }
+                      rwLease <- SegmentLease.create[F](loc.segmentId, rwSeg)
+                      _ <- stateRef.set(
+                        st.copy(
+                          activeLease = rwLease,
+                          walIndex = nextIdxState,
+                          lastCheckpointedCount = nextIdxState.size,
+                          truncationGate = None
+                        )
+                      )
+                      _ <- F.blocking(
+                        writeCheckpointAtomicallySync(
+                          checkpointTmpPath,
+                          checkpointPath,
+                          nextIdxState.serialize
+                        )
+                      )
+                    yield ()
+                    F.guarantee(
+                      work,
+                      stateRef.update(_.copy(truncationGate = None)) *>
+                        gate.complete(()).void
+                    )
+                  }
+                else
+                  val droppedSealedIds =
+                    st.sealedOrder.filter(_ > loc.segmentId)
+                  val keptSealedOrder =
+                    st.sealedOrder.filter(_ < loc.segmentId)
+                  val keptSealedMap =
+                    keptSealedOrder
+                      .flatMap(id => st.sealedLeases.get(id).map(id -> _))
+                      .toMap
+                  val targetLeaseOpt = st.sealedLeases.get(loc.segmentId)
+                  val oldActive = st.activeLease
+
+                  targetLeaseOpt match
+                    case None =>
+                      stateRef.set(
+                        st.copy(
+                          walIndex = nextIdxState,
+                          lastCheckpointedCount = nextIdxState.size
+                        )
+                      )
+                    case Some(targetSealed) =>
+                      val keepCount = targetSealed.segment
+                        .countEntriesBeforeOffset(loc.fileOffset)
+                      val targetPath = targetSealed.segment.path
+                      Deferred[F, Unit].flatMap { gate =>
+                        val work = for
+                          // 1. Hide truncated entries & trailing segments from new readers
+                          _ <- stateRef.set(
+                            st.copy(
+                              activeLease = targetSealed,
+                              sealedLeases = keptSealedMap,
+                              sealedOrder = keptSealedOrder,
+                              walIndex = nextIdxState,
+                              lastCheckpointedCount = nextIdxState.size,
+                              truncationGate = Some(gate)
+                            )
+                          )
+                          // 2. Delete trailing segments in descending ID order + fsync walDir
+                          //    BEFORE truncating targetSealed so a crash never leaves a log gap
+                          _ <- oldActive.retire(deleteFile = true)
+                          _ <- droppedSealedIds.reverse.traverse_ { sid =>
+                            st.sealedLeases
+                              .get(sid)
+                              .traverse_(_.retire(deleteFile = true))
+                          }
+                          _ <- F.blocking(fsyncDirectory(walDir))
+                          // 3. Drain in-flight readers on targetSealed, then truncate + zero
+                          _ <- targetSealed.retire(deleteFile = false)
+                          rwSeg <- F.blocking {
+                            val opened =
+                              MmapSegment.open(targetPath, readOnly = false)
+                            opened.truncateAt(loc.fileOffset, keepCount)
+                            opened
+                          }
+                          rwLease <- SegmentLease.create[F](
+                            loc.segmentId,
+                            rwSeg
+                          )
+                          _ <- stateRef.set(
+                            st.copy(
+                              activeLease = rwLease,
+                              sealedLeases = keptSealedMap,
+                              sealedOrder = keptSealedOrder,
+                              walIndex = nextIdxState,
+                              lastCheckpointedCount = nextIdxState.size,
+                              truncationGate = None
+                            )
+                          )
+                          _ <-
+                            if nextIdxState.nonEmpty then
+                              F.blocking(
+                                writeCheckpointAtomicallySync(
+                                  checkpointTmpPath,
+                                  checkpointPath,
+                                  nextIdxState.serialize
+                                )
+                              )
+                            else
+                              F.blocking {
+                                val _ = JFiles.deleteIfExists(checkpointPath)
+                              }
+                        yield ()
+                        F.guarantee(
+                          work,
+                          stateRef.update(_.copy(truncationGate = None)) *>
+                            gate.complete(()).void
+                        )
+                      }
       }
     }
 
@@ -333,7 +489,7 @@ class MmapWalEngine[F[_]: Async] private (
             if replaceActive then
               val newId = st.nextSegmentId
               for
-                newSeg <- F.delay(
+                newSeg <- F.blocking(
                   MmapSegment
                     .create(segmentPath(newId), splitIndex, segmentSize)
                 )
@@ -357,15 +513,19 @@ class MmapWalEngine[F[_]: Async] private (
           }
           _ <- retiredActiveOpt.traverse_(_.retire(deleteFile = true))
           _ <-
+            if replaceActive || obsoleteIds.nonEmpty then
+              F.blocking(fsyncDirectory(walDir))
+            else F.unit
+          _ <-
             if nextIdxState.nonEmpty then
-              F.delay(
+              F.blocking(
                 writeCheckpointAtomicallySync(
                   checkpointTmpPath,
                   checkpointPath,
                   nextIdxState.serialize
                 )
               )
-            else F.delay { val _ = JFiles.deleteIfExists(checkpointPath) }
+            else F.blocking { val _ = JFiles.deleteIfExists(checkpointPath) }
         yield ()
       }
     }
@@ -375,9 +535,11 @@ class MmapWalEngine[F[_]: Async] private (
       for
         st <- stateRef.get
         newId = st.nextSegmentId
-        newSeg <- F.delay(
-          MmapSegment.create(segmentPath(newId), 1L, segmentSize)
-        )
+        newSeg <- F.blocking {
+          val seg = MmapSegment.create(segmentPath(newId), 1L, segmentSize)
+          fsyncDirectory(walDir)
+          seg
+        }
         newLease <- SegmentLease.create[F](newId, newSeg)
         _ <- stateRef.set(
           EngineState(
@@ -393,18 +555,25 @@ class MmapWalEngine[F[_]: Async] private (
           st.sealedLeases.get(sid).traverse_(_.retire(deleteFile = true))
         }
         _ <- st.activeLease.retire(deleteFile = true)
-        _ <- F.delay {
+        _ <- F.blocking {
           deleteStrayWalFilesExcept(walDir, newSeg.path)
+          fsyncDirectory(walDir)
           val _ = JFiles.deleteIfExists(checkpointPath)
         }
       yield ()
     }
 
   def readHardState: F[HardState] =
-    writeMutex.lock.surround(F.delay(hardState.read))
+    writeMutex.lock.surround(F.blocking(hardState.read))
 
   def writeHardState(state: HardState): F[Unit] =
-    writeMutex.lock.surround(F.delay(hardState.write(state)))
+    writeMutex.lock.surround(F.blocking(hardState.write(state)))
+
+  def updateHardState(f: HardState => HardState): F[Unit] =
+    writeMutex.lock.surround(F.blocking {
+      val current = hardState.read
+      hardState.write(f(current))
+    })
 
   /** Stream `snapshot.data` directly to a `"RSNP"` v2 `.tmp` file with header
     * and payload CRC32s, `fsync` the file, atomically rename to `.bin`, `fsync`
@@ -645,18 +814,22 @@ class MmapWalEngine[F[_]: Async] private (
     else F.unit
 
   /** Close all active/sealed segment leases (awaiting any in-flight readers)
-    * and close `MmapHardState`.
+    * and close `MmapHardState`. Idempotent.
     */
   def close: F[Unit] =
     writeMutex.lock.surround {
-      for
-        st <- stateRef.get
-        _ <- st.sealedOrder.traverse_ { sid =>
-          st.sealedLeases.get(sid).traverse_(_.retire(deleteFile = false))
-        }
-        _ <- st.activeLease.retire(deleteFile = false)
-        _ <- F.delay(hardState.close())
-      yield ()
+      stateRef.get.flatMap { st =>
+        if st.closed then F.unit
+        else
+          for
+            _ <- stateRef.set(st.copy(closed = true))
+            _ <- st.sealedOrder.traverse_ { sid =>
+              st.sealedLeases.get(sid).traverse_(_.retire(deleteFile = false))
+            }
+            _ <- st.activeLease.retire(deleteFile = false)
+            _ <- F.blocking(hardState.close())
+          yield ()
+      }
     }
 
 object MmapWalEngine:
@@ -672,7 +845,9 @@ object MmapWalEngine:
       sealedOrder: Vector[Int],
       walIndex: WalIndexState,
       nextSegmentId: Int,
-      lastCheckpointedCount: Int
+      lastCheckpointedCount: Int,
+      truncationGate: Option[Deferred[F, Unit]] = None,
+      closed: Boolean = false
   ):
     def findLease(segId: Int): Option[SegmentLease[F]] =
       if activeLease.segmentId == segId then Some(activeLease)
@@ -708,12 +883,12 @@ object MmapWalEngine:
   ): F[MmapWalEngine[F]] =
     val F = Async[F]
     for
-      _ <- F.delay {
+      _ <- F.blocking {
         val _ = JFiles.createDirectories(dataDir.resolve("wal"))
         val _ = JFiles.createDirectories(dataDir.resolve("snapshots"))
       }
       mutex <- Mutex[F]
-      hs <- F.delay(MmapHardState.open(dataDir.resolve("hard_state.bin")))
+      hs <- F.blocking(MmapHardState.open(dataDir.resolve("hard_state.bin")))
       result <- F
         .defer {
           discoverSegments(dataDir.resolve("wal")).flatMap { existingSegments =>
@@ -723,7 +898,7 @@ object MmapWalEngine:
               recoverFromWal(dataDir, mutex, hs, existingSegments, segmentSize)
           }
         }
-        .onError { case _ => F.delay(hs.close()) }
+        .onError { case _ => F.blocking(hs.close()) }
     yield result
 
   /** Resource-based lifecycle for use with `cats.effect.Resource`. */
@@ -745,7 +920,7 @@ object MmapWalEngine:
     digits.toIntOption.getOrElse(1)
 
   private def discoverSegments[F[_]: Async](walDir: JPath): F[List[JPath]] =
-    Async[F].delay {
+    Async[F].blocking {
       if JFiles.exists(walDir) then
         val listing = JFiles.list(walDir)
         try
@@ -766,9 +941,14 @@ object MmapWalEngine:
       segmentSize: Long
   ): F[MmapWalEngine[F]] =
     val F = Async[F]
-    val segPath = dataDir.resolve("wal").resolve("segment-000001.wal")
+    val walDir = dataDir.resolve("wal")
+    val segPath = walDir.resolve("segment-000001.wal")
     for
-      activeSeg <- F.delay(MmapSegment.create(segPath, 1L, segmentSize))
+      activeSeg <- F.blocking {
+        val seg = MmapSegment.create(segPath, 1L, segmentSize)
+        fsyncDirectory(walDir)
+        seg
+      }
       activeLease <- SegmentLease.create[F](1, activeSeg)
       stRef <- Ref.of[F, EngineState[F]](
         EngineState(
@@ -793,9 +973,9 @@ object MmapWalEngine:
     val checkpointPath = dataDir.resolve("index.ckpt")
 
     for
-      persistedHs <- F.delay(hs.read)
+      persistedHs <- F.blocking(hs.read)
       minProtected = persistedHs.commitIndex
-      ckptOpt <- F.delay {
+      ckptOpt <- F.blocking {
         if JFiles.exists(checkpointPath) then
           val bytes = JFiles.readAllBytes(checkpointPath)
           WalIndexState.deserializeChecked(bytes) match
@@ -805,7 +985,7 @@ object MmapWalEngine:
               None
         else None
       }
-      recovered <- F.delay {
+      recovered <- F.blocking {
         openSegmentsAtomically(segmentPaths, minProtected)
       }
       (segTriples, anyHealed) = recovered
@@ -826,7 +1006,7 @@ object MmapWalEngine:
           val freshId = segTriples.last._1 + 1
           val freshPath =
             dataDir.resolve("wal").resolve(f"segment-$freshId%06d.wal")
-          F.delay {
+          F.blocking {
             val freshSeg =
               MmapSegment.create(freshPath, discardFloor, segmentSize)
             segTriples.foreach { case (_, oldSeg, _) =>
@@ -834,20 +1014,21 @@ object MmapWalEngine:
               val _ = JFiles.deleteIfExists(oldSeg.path)
             }
             val _ = JFiles.deleteIfExists(checkpointPath)
+            fsyncDirectory(dataDir.resolve("wal"))
             Vector((freshId, freshSeg, Vector.empty[(Log, Long)]))
           }
         else F.pure(segTriples)
       _ <-
         if ckptOpt.isDefined && usableCkpt.isEmpty then
           if rebuiltIdx.nonEmpty then
-            F.delay(
+            F.blocking(
               writeCheckpointAtomicallySync(
                 dataDir.resolve("index.ckpt.tmp"),
                 checkpointPath,
                 rebuiltIdx.serialize
               )
             )
-          else F.delay { val _ = JFiles.deleteIfExists(checkpointPath) }
+          else F.blocking { val _ = JFiles.deleteIfExists(checkpointPath) }
         else F.unit
       leases <- finalTriples.traverse { case (segId, seg, _) =>
         SegmentLease.create[F](segId, seg).map(segId -> _)
@@ -1120,7 +1301,15 @@ object MmapWalEngine:
       val lastIndex = prefix.getLong(0)
       val lastTerm = prefix.getLong(8)
       val configLen = prefix.getInt(16)
-      if configLen < 0 || fileSize < 20L + configLen.toLong then
+      val filenameIdxMismatch =
+        parseSnapshotIndex(path).exists(_ != lastIndex)
+      if lastIndex < 0L || lastTerm < 0L || filenameIdxMismatch then
+        Left(
+          RaftError.StorageCorruption(
+            s"Invalid snapshot header or corrupted RSNP magic in $path (header lastIndex=$lastIndex, lastTerm=$lastTerm)"
+          )
+        )
+      else if configLen < 0 || fileSize < 20L + configLen.toLong then
         Left(
           RaftError.StorageCorruption(
             s"Truncated legacy snapshot config in $path"

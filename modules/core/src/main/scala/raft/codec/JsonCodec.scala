@@ -15,6 +15,7 @@ import raft.state.{Bytes, Log, LogType, NodeId}
 object JsonCodec extends SimpleMessageCodec[String]:
 
   val VERSION: Int = 1
+  val MaxNestingDepth: Int = 64
 
   /** UTF-8 byte-array projection of [[JsonCodec]] for binary transports. */
   val byteCodec: SimpleMessageCodec[Array[Byte]] =
@@ -28,16 +29,28 @@ object JsonCodec extends SimpleMessageCodec[String]:
     mapWire(Bytes.fromUtf8, _.utf8String)
 
   def encode(msg: RaftMessage): String = msg match
-    case AppendEntriesRequest(term, leader, prev, prevTerm, entries, commit) =>
+    case AppendEntriesRequest(
+          term,
+          leader,
+          prev,
+          prevTerm,
+          entries,
+          commit,
+          hbRound
+        ) =>
       val entriesJson = entries.map(encodeLog).mkString("[", ",", "]")
+      val roundPart =
+        if hbRound != 0L then s""","hbRound":$hbRound""" else ""
       s"""{"type":"AE_REQ","v":$VERSION,"term":$term,"leader":${quote(
           leader.value
-        )},"prev":$prev,"prevTerm":$prevTerm,"entries":$entriesJson,"commit":$commit}"""
+        )},"prev":$prev,"prevTerm":$prevTerm,"entries":$entriesJson,"commit":$commit$roundPart}"""
 
-    case AppendEntriesResponse(term, success, matchIdx, cIdx, cTerm) =>
+    case AppendEntriesResponse(term, success, matchIdx, cIdx, cTerm, hbRound) =>
       val cIdxPart = cIdx.map(i => s""","conflictIndex":$i""").getOrElse("")
       val cTermPart = cTerm.map(t => s""","conflictTerm":$t""").getOrElse("")
-      s"""{"type":"AE_RESP","v":$VERSION,"term":$term,"success":$success,"matchIndex":$matchIdx$cIdxPart$cTermPart}"""
+      val roundPart =
+        if hbRound != 0L then s""","hbRound":$hbRound""" else ""
+      s"""{"type":"AE_RESP","v":$VERSION,"term":$term,"success":$success,"matchIndex":$matchIdx$cIdxPart$cTermPart$roundPart}"""
 
     case RequestVoteRequest(
           term,
@@ -186,36 +199,46 @@ object JsonCodec extends SimpleMessageCodec[String]:
   ): Either[CodecError, RaftMessage] = msgType match
     case "AE_REQ" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         leader <- getStr(fields, "leader", msgType)
-        prev <- getLong(fields, "prev", msgType)
-        prevTerm <- getLong(fields, "prevTerm", msgType)
-        commit <- getLong(fields, "commit", msgType)
+        prev <- getNonNegLong(fields, "prev", msgType)
+        prevTerm <- getNonNegLong(fields, "prevTerm", msgType)
+        commit <- getNonNegLong(fields, "commit", msgType)
         entries <- getLogs(fields, "entries")
+        hbRound <- getNonNegLongOpt(fields, "hbRound").map(_.getOrElse(0L))
       yield AppendEntriesRequest(
         term,
         NodeId(leader),
         prev,
         prevTerm,
         entries,
-        commit
+        commit,
+        hbRound
       )
 
     case "AE_RESP" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         success <- getBool(fields, "success", msgType)
-        matchIdx <- getLong(fields, "matchIndex", msgType)
-        cIdx <- getLongOpt(fields, "conflictIndex")
-        cTerm <- getLongOpt(fields, "conflictTerm")
-      yield AppendEntriesResponse(term, success, matchIdx, cIdx, cTerm)
+        matchIdx <- getNonNegLong(fields, "matchIndex", msgType)
+        cIdx <- getNonNegLongOpt(fields, "conflictIndex")
+        cTerm <- getNonNegLongOpt(fields, "conflictTerm")
+        hbRound <- getNonNegLongOpt(fields, "hbRound").map(_.getOrElse(0L))
+      yield AppendEntriesResponse(
+        term,
+        success,
+        matchIdx,
+        cIdx,
+        cTerm,
+        hbRound
+      )
 
     case "RV_REQ" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         candidate <- getStr(fields, "candidate", msgType)
-        lastIdx <- getLong(fields, "lastIndex", msgType)
-        lastTerm <- getLong(fields, "lastTerm", msgType)
+        lastIdx <- getNonNegLong(fields, "lastIndex", msgType)
+        lastTerm <- getNonNegLong(fields, "lastTerm", msgType)
         preVote <- getBoolOpt(fields, "preVote").map(_.getOrElse(false))
         transfer <- getBoolOpt(fields, "transfer").map(_.getOrElse(false))
       yield RequestVoteRequest(
@@ -229,18 +252,18 @@ object JsonCodec extends SimpleMessageCodec[String]:
 
     case "RV_RESP" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         granted <- getBool(fields, "granted", msgType)
         preVote <- getBoolOpt(fields, "preVote").map(_.getOrElse(false))
       yield RequestVoteResponse(term, granted, preVote)
 
     case "IS_REQ" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         leader <- getStr(fields, "leader", msgType)
-        lastIdx <- getLong(fields, "lastIndex", msgType)
-        lastTerm <- getLong(fields, "lastTerm", msgType)
-        offset <- getLong(fields, "offset", msgType)
+        lastIdx <- getNonNegLong(fields, "lastIndex", msgType)
+        lastTerm <- getNonNegLong(fields, "lastTerm", msgType)
+        offset <- getNonNegLong(fields, "offset", msgType)
         dataB64 <- getStr(fields, "data", msgType)
         payload <- decodeBase64(dataB64, "data")
         done <- getBool(fields, "done", msgType)
@@ -256,20 +279,20 @@ object JsonCodec extends SimpleMessageCodec[String]:
 
     case "IS_RESP" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         success <- getBool(fields, "success", msgType)
-        matchIdx <- getLongOpt(fields, "matchIndex").map(_.getOrElse(0L))
+        matchIdx <- getNonNegLongOpt(fields, "matchIndex").map(_.getOrElse(0L))
       yield InstallSnapshotResponse(term, success, matchIdx)
 
     case "TL_REQ" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         target <- getStr(fields, "target", msgType)
       yield TransferLeadershipRequest(term, NodeId(target))
 
     case "TN_REQ" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         leader <- getStr(fields, "leader", msgType)
       yield TimeoutNowRequest(term, NodeId(leader))
 
@@ -281,32 +304,32 @@ object JsonCodec extends SimpleMessageCodec[String]:
       for
         reqId <- getStr(fields, "reqId", msgType)
         success <- getBool(fields, "success", msgType)
-        readIdx <- getLong(fields, "readIndex", msgType)
+        readIdx <- getNonNegLong(fields, "readIndex", msgType)
       yield ReadIndexResponse(reqId, success, readIdx)
 
     case "ADD_REQ" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         server <- getStr(fields, "server", msgType)
         learner <- getBoolOpt(fields, "learner").map(_.getOrElse(false))
       yield AddServerRequest(term, NodeId(server), learner)
 
     case "ADD_RESP" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         success <- getBool(fields, "success", msgType)
         hint <- getStrOpt(fields, "hint")
       yield AddServerResponse(term, success, hint.map(NodeId(_)))
 
     case "REM_REQ" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         server <- getStr(fields, "server", msgType)
       yield RemoveServerRequest(term, NodeId(server))
 
     case "REM_RESP" =>
       for
-        term <- getLong(fields, "term", msgType)
+        term <- getNonNegLong(fields, "term", msgType)
         success <- getBool(fields, "success", msgType)
         hint <- getStrOpt(fields, "hint")
       yield RemoveServerResponse(term, success, hint.map(NodeId(_)))
@@ -346,6 +369,26 @@ object JsonCodec extends SimpleMessageCodec[String]:
         raw.toLongOption.toRight(InvalidField(key, "Long", raw))
       case Some(other) => Left(InvalidField(key, "Long", other.toString))
       case None        => Left(MissingField(key, msgType))
+
+  private def getNonNegLong(
+      m: Map[String, JVal],
+      key: String,
+      msgType: String
+  ): Either[CodecError, Long] =
+    getLong(m, key, msgType).flatMap { v =>
+      if v >= 0L then Right(v)
+      else Left(InvalidField(key, "non-negative Long", v.toString))
+    }
+
+  private def getNonNegLongOpt(
+      m: Map[String, JVal],
+      key: String
+  ): Either[CodecError, Option[Long]] =
+    getLongOpt(m, key).flatMap {
+      case Some(v) if v < 0L =>
+        Left(InvalidField(key, "non-negative Long", v.toString))
+      case other => Right(other)
+    }
 
   private def getLongOpt(
       m: Map[String, JVal],
@@ -407,8 +450,8 @@ object JsonCodec extends SimpleMessageCodec[String]:
 
   private def decodeLogObj(fields: Map[String, JVal]): Either[CodecError, Log] =
     for
-      idx <- getLong(fields, "idx", "Log")
-      term <- getLong(fields, "term", "Log")
+      idx <- getNonNegLong(fields, "idx", "Log")
+      term <- getNonNegLong(fields, "term", "Log")
       typeStr <- getStr(fields, "type", "Log")
       logType <- parseLogType(typeStr)
       b64 <- getStr(fields, "data", "Log")
@@ -429,7 +472,7 @@ object JsonCodec extends SimpleMessageCodec[String]:
   private def parseJsonObject(
       input: String
   ): Either[CodecError, Map[String, JVal]] =
-    parseValue(input, 0).flatMap { case (v, nextPos) =>
+    parseValue(input, 0, depth = 0).flatMap { case (v, nextPos) =>
       val endPos = skipWs(input, nextPos)
       if endPos < input.length then
         Left(ParseError(s"Unexpected trailing characters at pos $endPos"))
@@ -462,38 +505,47 @@ object JsonCodec extends SimpleMessageCodec[String]:
 
   private def parseValue(
       s: String,
-      pos0: Int
+      pos0: Int,
+      depth: Int
   ): Either[CodecError, (JVal, Int)] =
-    val pos = skipWs(s, pos0)
-    if pos >= s.length then parseErr("Unexpected end of JSON input", pos)
+    if depth > MaxNestingDepth then
+      parseErr(s"Maximum JSON nesting depth ($MaxNestingDepth) exceeded", pos0)
     else
-      s.charAt(pos) match
-        case '{' => parseObject(s, pos)
-        case '[' => parseArray(s, pos)
-        case '"' =>
-          parseString(s, pos).map { case (str, p) => (JVal.JStr(str), p) }
-        case 't' => parseLiteral(s, pos, "true", JVal.JBool(true))
-        case 'f' => parseLiteral(s, pos, "false", JVal.JBool(false))
-        case 'n' => parseLiteral(s, pos, JsonNullToken, JVal.JNull)
-        case c if c == '-' || (c >= '0' && c <= '9') => parseNumber(s, pos)
-        case c => parseErr(s"Unexpected token '$c'", pos)
+      val pos = skipWs(s, pos0)
+      if pos >= s.length then parseErr("Unexpected end of JSON input", pos)
+      else
+        s.charAt(pos) match
+          case '{' => parseObject(s, pos, depth + 1)
+          case '[' => parseArray(s, pos, depth + 1)
+          case '"' =>
+            parseString(s, pos).map { case (str, p) => (JVal.JStr(str), p) }
+          case 't' => parseLiteral(s, pos, "true", JVal.JBool(true))
+          case 'f' => parseLiteral(s, pos, "false", JVal.JBool(false))
+          case 'n' => parseLiteral(s, pos, JsonNullToken, JVal.JNull)
+          case c if c == '-' || (c >= '0' && c <= '9') => parseNumber(s, pos)
+          case c => parseErr(s"Unexpected token '$c'", pos)
 
   private def parseObject(
       s: String,
-      pos0: Int
+      pos0: Int,
+      depth: Int
   ): Either[CodecError, (JVal.JObj, Int)] =
-    expectChar(s, pos0, '{').flatMap { afterOpen =>
-      val p = skipWs(s, afterOpen)
-      if p < s.length && s.charAt(p) == '}' then
-        Right((JVal.JObj(Map.empty), p + 1))
-      else parseObjectEntries(s, p, Map.empty)
-    }
+    if depth > MaxNestingDepth then
+      parseErr(s"Maximum JSON nesting depth ($MaxNestingDepth) exceeded", pos0)
+    else
+      expectChar(s, pos0, '{').flatMap { afterOpen =>
+        val p = skipWs(s, afterOpen)
+        if p < s.length && s.charAt(p) == '}' then
+          Right((JVal.JObj(Map.empty), p + 1))
+        else parseObjectEntries(s, p, Map.empty, depth)
+      }
 
   @tailrec
   private def parseObjectEntries(
       s: String,
       pos0: Int,
-      acc: Map[String, JVal]
+      acc: Map[String, JVal],
+      depth: Int
   ): Either[CodecError, (JVal.JObj, Int)] =
     val p = skipWs(s, pos0)
     if p >= s.length || s.charAt(p) != '"' then
@@ -505,41 +557,46 @@ object JsonCodec extends SimpleMessageCodec[String]:
           expectChar(s, aftK, ':') match
             case Left(err)          => Left(err)
             case Right(aftColonPos) =>
-              parseValue(s, aftColonPos) match
+              parseValue(s, aftColonPos, depth) match
                 case Left(err)          => Left(err)
                 case Right((v, aftVal)) =>
                   val nextAcc = acc.updated(k, v)
                   val sepPos = skipWs(s, aftVal)
                   if sepPos < s.length && s.charAt(sepPos) == ',' then
-                    parseObjectEntries(s, sepPos + 1, nextAcc)
+                    parseObjectEntries(s, sepPos + 1, nextAcc, depth)
                   else if sepPos < s.length && s.charAt(sepPos) == '}' then
                     Right((JVal.JObj(nextAcc), sepPos + 1))
                   else parseErr("Expected ',' or '}' in JSON object", sepPos)
 
   private def parseArray(
       s: String,
-      pos0: Int
+      pos0: Int,
+      depth: Int
   ): Either[CodecError, (JVal.JArr, Int)] =
-    expectChar(s, pos0, '[').flatMap { afterOpen =>
-      val p = skipWs(s, afterOpen)
-      if p < s.length && s.charAt(p) == ']' then
-        Right((JVal.JArr(Vector.empty), p + 1))
-      else parseArrayItems(s, p, Vector.empty)
-    }
+    if depth > MaxNestingDepth then
+      parseErr(s"Maximum JSON nesting depth ($MaxNestingDepth) exceeded", pos0)
+    else
+      expectChar(s, pos0, '[').flatMap { afterOpen =>
+        val p = skipWs(s, afterOpen)
+        if p < s.length && s.charAt(p) == ']' then
+          Right((JVal.JArr(Vector.empty), p + 1))
+        else parseArrayItems(s, p, Vector.empty, depth)
+      }
 
   @tailrec
   private def parseArrayItems(
       s: String,
       pos0: Int,
-      acc: Vector[JVal]
+      acc: Vector[JVal],
+      depth: Int
   ): Either[CodecError, (JVal.JArr, Int)] =
-    parseValue(s, pos0) match
+    parseValue(s, pos0, depth) match
       case Left(err)          => Left(err)
       case Right((v, aftVal)) =>
         val nextAcc = acc :+ v
         val sepPos = skipWs(s, aftVal)
         if sepPos < s.length && s.charAt(sepPos) == ',' then
-          parseArrayItems(s, sepPos + 1, nextAcc)
+          parseArrayItems(s, sepPos + 1, nextAcc, depth)
         else if sepPos < s.length && s.charAt(sepPos) == ']' then
           Right((JVal.JArr(nextAcc), sepPos + 1))
         else parseErr("Expected ',' or ']' in JSON array", sepPos)

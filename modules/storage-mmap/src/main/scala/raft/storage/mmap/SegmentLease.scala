@@ -107,7 +107,7 @@ private[mmap] final class SegmentLease[F[_]: Async] private (
       }
 
   private def closePhysically(deleteFile: Boolean): F[Unit] =
-    F.delay {
+    F.blocking {
       segment.close()
       if deleteFile then
         val _ = JFiles.deleteIfExists(segment.path)

@@ -127,14 +127,18 @@ class MmapSegment private (
         Bytes.unsafeWrap(arr)
     Log(index, term, LogType.fromOrdinal(logTypeByte), payload)
 
-  /** Append a single log entry at the current write position. */
+  /** Append a single log entry at the current write position. Flushes record
+    * bytes before updating header `entryCount` so a crash cannot expose an
+    * incremented count over unwritten data pages.
+    */
   def appendEntry(log: Log): Long =
     val pos = writeRawEntry(log)
+    force()
     mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, 16L, entryCount)
     pos
 
-  /** Append a batch of log entries sequentially, updating header `entryCount`
-    * once at the end.
+  /** Append a batch of log entries sequentially, flushing record payloads
+    * before updating header `entryCount` once at the end.
     */
   def appendBatch(entries: Seq[Log]): Vector[(Long, Long)] =
     val results = Vector.newBuilder[(Long, Long)]
@@ -142,6 +146,7 @@ class MmapSegment private (
       val pos = writeRawEntry(log)
       results += ((log.index, pos))
     }
+    force()
     mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, 16L, entryCount)
     results.result()
 
@@ -154,14 +159,19 @@ class MmapSegment private (
     val _ = (fromOffset, toOffset)
     val _ = mapped.force()
 
-  /** Truncate the segment at `offset` with `newEntryCount` valid entries and
-    * flush (`msync`).
+  /** Truncate the segment at `offset` with `newEntryCount` valid entries,
+    * flushing the reduced header count first and then zero-filling stale tail
+    * bytes so aborted records can never be resurrected or confuse recovery.
     */
   def truncateAt(offset: Long, newEntryCount: Long): Unit =
+    val oldWriteOffset = writeOffset
     writeOffset = offset
     entryCount = newEntryCount
     mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, 16L, entryCount)
     force()
+    if oldWriteOffset > offset then
+      mapped.asSlice(offset, oldWriteOffset - offset).fill(0.toByte)
+      force()
 
   /** Count physical records stored strictly before `targetOffset`
     * (`[HeaderSize, targetOffset)`), unaffected by logical
@@ -426,7 +436,11 @@ object MmapSegment:
           validWriteOff,
           validCount
         )
-        if healed then seg.truncateAt(validWriteOff, validCount)
+        if healed then
+          seg.truncateAt(validWriteOff, validCount)
+          if size > validWriteOff then
+            mapped.asSlice(validWriteOff, size - validWriteOff).fill(0.toByte)
+            seg.force()
         SegmentRecovery(seg, entriesBuilder.result(), healed)
       catch
         case t: Throwable =>

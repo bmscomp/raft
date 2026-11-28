@@ -95,26 +95,54 @@ class CompactionManager[F[_]: Async](
   /** Execute the full compaction lifecycle at the given index. */
   private def executeCompaction(lastApplied: Long): F[Unit] =
     for
-      compactionIdx <- policy.compactionIndex(lastApplied)
-      _ <- logger.info(
-        s"Starting log compaction at index=$compactionIdx"
-      )
-      termAtIdx <- logStore.termAt(LogIndex.unsafeFrom(compactionIdx))
-      term = termAtIdx.map(_.value).getOrElse(0L)
-      clusterOpt <- clusterProvider.getOrElse(Async[F].pure(None))
-      data <- stateMachine.snapshot
-      snapshot = Snapshot(compactionIdx, term, data, clusterOpt)
-      _ <- snapshotStore.save(snapshot)
-      _ <- lastSnapshotIndexRef.set(compactionIdx)
-      _ <- onCompacted.traverse_(
-        _.apply(CoreSnapshotMetadata(compactionIdx, term, clusterOpt))
-      )
-      discardIdx = math.max(1L, compactionIdx - config.retainedEntries)
-      _ <- logStore.discardBefore(LogIndex.unsafeFrom(discardIdx))
-      _ <- metrics.onSnapshotTaken(nodeId, compactionIdx)
-      _ <- logger.info(
-        s"Compaction complete: snapshot@$compactionIdx, discarded log before $discardIdx"
-      )
+      requestedIdx <- policy.compactionIndex(lastApplied)
+      // stateMachine.snapshot always captures state at `lastApplied`; tagging
+      // it with an earlier index would double-apply (requestedIdx+1..lastApplied)
+      // upon restore. Use `lastApplied` as the snapshot boundary while honoring
+      // `requestedIdx` as a conservative upper bound on log pruning.
+      snapshotIdx = lastApplied
+      _ <-
+        if snapshotIdx <= 0L then Async[F].unit
+        else
+          for
+            termFromLog <- logStore.termAt(LogIndex.unsafeFrom(snapshotIdx))
+            termOpt <- termFromLog match
+              case some @ Some(_) => Async[F].pure(some.map(_.value))
+              case None           =>
+                snapshotStore.loadLatest.map {
+                  case Some(s) if s.lastIncludedIndex == snapshotIdx =>
+                    Some(s.lastIncludedTerm)
+                  case _ => None
+                }
+            _ <- termOpt match
+              case None =>
+                logger.warn(
+                  s"Skipping compaction at index=$snapshotIdx: term unavailable in log or snapshot store"
+                )
+              case Some(term) =>
+                for
+                  _ <- logger.info(
+                    s"Starting log compaction at index=$snapshotIdx"
+                  )
+                  clusterOpt <- clusterProvider.getOrElse(Async[F].pure(None))
+                  data <- stateMachine.snapshot
+                  snapshot = Snapshot(snapshotIdx, term, data, clusterOpt)
+                  _ <- snapshotStore.save(snapshot)
+                  _ <- lastSnapshotIndexRef.set(snapshotIdx)
+                  _ <- onCompacted.traverse_(
+                    _.apply(
+                      CoreSnapshotMetadata(snapshotIdx, term, clusterOpt)
+                    )
+                  )
+                  pruneBase = math.min(snapshotIdx, requestedIdx)
+                  discardIdx = math.max(1L, pruneBase - config.retainedEntries)
+                  _ <- logStore.discardBefore(LogIndex.unsafeFrom(discardIdx))
+                  _ <- metrics.onSnapshotTaken(nodeId, snapshotIdx)
+                  _ <- logger.info(
+                    s"Compaction complete: snapshot@$snapshotIdx, discarded log before $discardIdx"
+                  )
+                yield ()
+          yield ()
     yield ()
 
 object CompactionManager:

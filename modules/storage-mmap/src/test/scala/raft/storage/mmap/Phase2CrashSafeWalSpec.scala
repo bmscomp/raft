@@ -433,5 +433,114 @@ class Phase2CrashSafeWalSpec
           all(2).payload.utf8String shouldBe "small-3"
           t2 shouldBe Some(Term.unsafeFrom(1L))
       }
+
+      "should zero stale tail bytes on truncateFrom so aborted records cannot be resurrected" in {
+        for
+          tmpDir <- IO(Files.createTempDirectory("raft-wal-trunc-zero-"))
+          e1 <- MmapWalEngine.open[IO](tmpDir, segmentSize = 4096L)
+          _ <- e1.appendEntries(
+            (1L to 6L).map(i =>
+              Log.command(i, 1L, s"aborted-$i".getBytes(StandardCharsets.UTF_8))
+            )
+          )
+          _ <- e1.writeHardState(HardState(1L, None, commitIndex = 3L))
+          _ <- e1.truncateFrom(LogIndex.unsafeFrom(4L))
+          _ <- e1.close
+
+          // Simulate unordered OS flush where header entryCount jumped back to 6 after truncateFrom(4)
+          segPath = tmpDir.resolve("wal").resolve("segment-000001.wal")
+          _ <- IO {
+            val ch = FileChannel.open(
+              segPath,
+              StandardOpenOption.READ,
+              StandardOpenOption.WRITE
+            )
+            try
+              val arena = Arena.ofShared()
+              try
+                val mapped =
+                  ch.map(FileChannel.MapMode.READ_WRITE, 0L, ch.size(), arena)
+                mapped.set(ValueLayout.JAVA_LONG_UNALIGNED, 16L, 6L)
+                val _ = mapped.force()
+              finally arena.close()
+            finally ch.close()
+          }
+
+          e2 <- MmapWalEngine.open[IO](tmpDir, segmentSize = 4096L)
+          lastIdx <- e2.lastLogIndex
+          e4 <- e2.readEntry(LogIndex.unsafeFrom(4L))
+          _ <- e2.close
+          _ <- IO(deleteRecursive(tmpDir))
+        yield
+          lastIdx shouldBe LogIndex.unsafeFrom(3L)
+          e4 shouldBe None
+      }
+
+      "should clear all entries when truncateFrom index is below firstIndex after discardBefore" in {
+        for
+          tmpDir <- IO(Files.createTempDirectory("raft-wal-trunc-below-"))
+          engine <- MmapWalEngine.open[IO](tmpDir, segmentSize = 4096L)
+          _ <- engine.appendEntries(
+            (1L to 20L).map(i =>
+              Log.command(i, 2L, s"v-$i".getBytes(StandardCharsets.UTF_8))
+            )
+          )
+          _ <- engine.discardBefore(LogIndex.unsafeFrom(10L))
+          _ <- engine.truncateFrom(LogIndex.unsafeFrom(5L))
+          emptyNow <- engine.logIsEmpty
+          lastNow <- engine.lastLogIndex
+          e15 <- engine.readEntry(LogIndex.unsafeFrom(15L))
+          _ <- engine.close
+          _ <- IO(deleteRecursive(tmpDir))
+        yield
+          emptyNow shouldBe true
+          lastNow shouldBe LogIndex.Zero
+          e15 shouldBe None
+      }
+
+      "should reject V2 snapshot with corrupted RSNP magic bytes instead of falling back to unchecksummed V1 and preserve commitIndex in StorageBackedStableStore" in {
+        for
+          tmpDir <- IO(Files.createTempDirectory("raft-snap-magic-p1-"))
+          engine <- MmapWalEngine.open[IO](tmpDir)
+          _ <- engine.saveSnapshot(
+            Snapshot[IO](
+              lastIncludedIndex = 77L,
+              lastIncludedTerm = 3L,
+              data = Stream
+                .emits("snap-body".getBytes(StandardCharsets.UTF_8))
+                .covary[IO],
+              config = None
+            )
+          )
+          snapFile = tmpDir
+            .resolve("snapshots")
+            .resolve(s"${MmapWalEngine.formatSnapshotStem(77L)}.bin")
+          // Flip 1 bit in byte 0 (RSNP magic) -> MUST fail with StorageCorruption, NOT fall back to V1!
+          _ <- IO {
+            val all = Files.readAllBytes(snapFile)
+            all(0) = (all(0) ^ 0x01).toByte
+            val _ = Files.write(snapFile, all)
+          }
+          magicCorruptAttempt <- engine.loadSnapshot.attempt
+
+          // StorageBackedStableStore.setHardState must preserve commitIndex
+          _ <- engine.writeHardState(
+            HardState(3L, Some(NodeId("n1")), commitIndex = 42L)
+          )
+          stable = new raft.storage.StorageBackedStableStore[IO](engine)
+          _ <- stable.setHardState(Term.unsafeFrom(4L), Some(NodeId("n2")))
+          hsAfter <- engine.readHardState
+
+          // MmapWalEngine.close must be idempotent
+          _ <- engine.close
+          _ <- engine.close
+          _ <- IO(deleteRecursive(tmpDir))
+        yield
+          magicCorruptAttempt.isLeft shouldBe true
+          magicCorruptAttempt.left.toOption.get shouldBe a[
+            RaftError.StorageCorruption
+          ]
+          hsAfter shouldBe HardState(4L, Some(NodeId("n2")), commitIndex = 42L)
+      }
     }
   }
